@@ -12,6 +12,7 @@ import {
 } from "./services/Discord.js";
 import { DiscordWebhookPoster } from "./services/DiscordWebhook.js";
 import { LlmRouterLive } from "./services/LlmRouter.js";
+import { Observability } from "./services/Observability.js";
 
 export interface Env {
   DB: D1Database;
@@ -54,6 +55,7 @@ const makeRuntime = (env: Env) => {
 
   const infraLayer = Layer.mergeAll(
     dbLayer,
+    Observability.layer,
     DiscordWebhookPoster.layer,
     LlmRouterLive,
     Discord.layer,
@@ -79,6 +81,9 @@ export default {
     const url = new URL(request.url);
     const runtime = makeRuntime(env);
 
+    const requestId =
+      request.headers.get("CF-Ray") ?? request.headers.get("cf-ray") ?? crypto.randomUUID();
+
     // Health
     if (request.method === "GET" && url.pathname === "/health") {
       return json(200, { ok: true });
@@ -99,7 +104,10 @@ export default {
           signatureHex: sig,
           timestamp: ts,
           body: raw,
-        }),
+        }).pipe(
+          Effect.annotateLogs({ requestId, route: "/discord/interactions" }),
+          Effect.withLogSpan("discord.verify_interaction"),
+        ),
       );
 
       if (!ok) return json(401, { error: "Invalid signature" });
@@ -119,13 +127,17 @@ export default {
     // DEV: start arena without Discord
     if (url.pathname === "/dev/arena/start" && request.method === "POST") {
       const program = Effect.gen(function* () {
+        yield* Effect.logInfo("http.dev.arena.start");
         const arena = yield* ArenaService;
         const payload = yield* parseJson<{ channelId: string; topic: string; agentIds?: string[] }>(
           request,
         ).pipe(Effect.orDie);
         const result = yield* arena.startArena(payload);
         return result;
-      });
+      }).pipe(
+        Effect.annotateLogs({ requestId, route: "/dev/arena/start" }),
+        Effect.withLogSpan("http.dev.arena.start"),
+      );
 
       const result = await runtime.runPromise(program);
       ctx.waitUntil(env.ARENA_QUEUE.send(result.firstJob));
@@ -174,6 +186,7 @@ export default {
         autoArchiveDurationMinutesNum as DiscordAutoArchiveDurationMinutes;
 
       const program = Effect.gen(function* () {
+        yield* Effect.logInfo("http.dev.room.create");
         const discord = yield* Discord;
         const { db } = yield* Db;
         const arena = yield* ArenaService;
@@ -226,13 +239,19 @@ export default {
         return { roomId: result.roomId, threadId, firstJob: result.firstJob } as const;
       });
 
-      const result = await runtime.runPromise(program);
+      const result = await runtime.runPromise(
+        program.pipe(
+          Effect.annotateLogs({ requestId, route: "/dev/room/create", parentChannelId }),
+          Effect.withLogSpan("http.dev.room.create"),
+        ),
+      );
       ctx.waitUntil(env.ARENA_QUEUE.send(result.firstJob));
       return json(200, { roomId: result.roomId, threadId: result.threadId });
     }
 
     if (url.pathname === "/dev/arena/stop" && request.method === "POST") {
       const program = Effect.gen(function* () {
+        yield* Effect.logInfo("http.dev.arena.stop");
         const arena = yield* ArenaService;
         const payload = yield* parseJson<{ roomId?: number; arenaId?: number }>(request).pipe(
           Effect.orDie,
@@ -242,8 +261,11 @@ export default {
           return yield* Effect.dieMessage("Missing roomId");
         }
         yield* arena.stopArena(roomId);
-        return { ok: true };
-      });
+        return { ok: true, roomId };
+      }).pipe(
+        Effect.annotateLogs({ requestId, route: "/dev/arena/stop" }),
+        Effect.withLogSpan("http.dev.arena.stop"),
+      );
 
       return json(200, await runtime.runPromise(program));
     }
@@ -258,10 +280,25 @@ export default {
       try {
         const job = message.body as RoomTurnJob;
 
+        const annotations = {
+          queue: batch.queue,
+          queueMessageId: message.id,
+          attempts: message.attempts,
+          roomId: job.roomId,
+          turnNumber: job.turnNumber,
+        };
+
         const program = Effect.gen(function* () {
+          yield* Effect.logInfo("queue.turn");
           const arena = yield* ArenaService;
-          return yield* arena.processTurn(job);
-        });
+          const next = yield* arena.processTurn(job);
+          if (next) {
+            yield* Effect.logInfo("queue.turn.next").pipe(
+              Effect.annotateLogs({ nextTurnNumber: next.turnNumber }),
+            );
+          }
+          return next;
+        }).pipe(Effect.annotateLogs(annotations), Effect.withLogSpan("queue.turn"));
 
         const next = await runtime.runPromise(program);
         if (next) {
@@ -270,6 +307,7 @@ export default {
           // Persist an enqueue marker so a redelivered message (e.g., crash between send+ack)
           // doesn't re-enqueue duplicates.
           const markEnqueued = Effect.gen(function* () {
+            yield* Effect.logDebug("queue.mark_enqueued");
             const { db } = yield* Db;
             yield* Effect.tryPromise({
               try: () =>
@@ -282,7 +320,7 @@ export default {
                   .run(),
               catch: () => null,
             });
-          });
+          }).pipe(Effect.annotateLogs(annotations), Effect.withLogSpan("queue.mark_enqueued"));
 
           await runtime.runPromise(markEnqueued);
         }

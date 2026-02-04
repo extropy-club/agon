@@ -250,21 +250,42 @@ export class ArenaService extends Context.Tag("@agon/ArenaService")<
       });
 
       const processTurn = Effect.fn("ArenaService.processTurn")(function* (job: RoomTurnJob) {
+        yield* Effect.logInfo("arena.turn.start").pipe(
+          Effect.annotateLogs({ roomId: job.roomId, turnNumber: job.turnNumber }),
+        );
+
         const room = yield* dbTry(() =>
           db.select().from(rooms).where(eq(rooms.id, job.roomId)).get(),
         );
         if (!room) return yield* RoomNotFound.make({ roomId: job.roomId });
         if (room.status !== "active") return null;
 
+        yield* Effect.logDebug("arena.turn.room_loaded").pipe(
+          Effect.annotateLogs({
+            threadId: room.threadId,
+            parentChannelId: room.parentChannelId,
+            currentTurnNumber: room.currentTurnNumber,
+          }),
+        );
+
         // idempotency
         // - normal case: currentTurnNumber + 1 == job.turnNumber
         // - retry case: currentTurnNumber == job.turnNumber (turn was processed but enqueue/ack may have failed)
         if (room.currentTurnNumber === job.turnNumber) {
+          // This is a redelivery after the turn already advanced in D1, likely due to
+          // a crash between enqueue+ack.
           const nextTurnNumber = job.turnNumber + 1;
-          if (room.lastEnqueuedTurnNumber >= nextTurnNumber) return null;
+          if (room.lastEnqueuedTurnNumber >= nextTurnNumber) {
+            yield* Effect.logDebug("arena.turn.redelivery_already_enqueued");
+            return null;
+          }
+          yield* Effect.logInfo("arena.turn.redelivery_reenqueue_next");
           return { roomId: room.id, turnNumber: nextTurnNumber } as const;
         }
-        if (room.currentTurnNumber + 1 !== job.turnNumber) return null;
+        if (room.currentTurnNumber + 1 !== job.turnNumber) {
+          yield* Effect.logDebug("arena.turn.idempotent_drop");
+          return null;
+        }
 
         const agent = yield* dbTry(() =>
           db.select().from(agents).where(eq(agents.id, room.currentTurnAgentId)).get(),
@@ -289,7 +310,16 @@ export class ArenaService extends Context.Tag("@agon/ArenaService")<
         // because Discord is the source of truth for room history.
         const discordMessages = yield* discord
           .fetchRecentMessages(room.threadId, historyLimit)
-          .pipe(Effect.catchTag("MissingDiscordConfig", () => Effect.succeed(null)));
+          .pipe(
+            Effect.catchTag("MissingDiscordConfig", () => Effect.succeed(null)),
+            Effect.withLogSpan("discord.sync"),
+          );
+
+        yield* Effect.logDebug("discord.sync.fetched").pipe(
+          Effect.annotateLogs({
+            discordFetched: discordMessages ? discordMessages.length : 0,
+          }),
+        );
 
         if (discordMessages) {
           const agentNameToId = new Map(
@@ -302,6 +332,10 @@ export class ArenaService extends Context.Tag("@agon/ArenaService")<
             .map((m) => ({ m, createdAtMs: Date.parse(m.timestamp) }))
             .filter((x) => Number.isFinite(x.createdAtMs))
             .sort((a, b) => a.createdAtMs - b.createdAtMs);
+
+          yield* Effect.logDebug("discord.sync.upsert").pipe(
+            Effect.annotateLogs({ discordUpserted: ordered.length }),
+          );
 
           for (const { m, createdAtMs } of ordered) {
             const isWebhookMessage = m.webhook_id !== undefined;
@@ -388,6 +422,10 @@ export class ArenaService extends Context.Tag("@agon/ArenaService")<
           })
           .slice(-historyLimit);
 
+        yield* Effect.logDebug("prompt.built").pipe(
+          Effect.annotateLogs({ promptMessages: promptHistory.length }),
+        );
+
         const prompt: Prompt.RawInput = [
           {
             role: "system",
@@ -425,15 +463,28 @@ export class ArenaService extends Context.Tag("@agon/ArenaService")<
           // queue retry: reuse persisted content and skip LLM call
           reply = existingReply.content;
           replyCreatedAtMs = existingReply.createdAtMs;
+          yield* Effect.logDebug("llm.generate.skip_existing").pipe(
+            Effect.annotateLogs({ replyChars: reply.length }),
+          );
         } else {
           // thinking delay (basic anti-spam)
           yield* Effect.sleep("3 seconds");
 
-          reply = yield* llmRouter.generate({
-            provider: agent.llmProvider,
-            model: agent.llmModel,
-            prompt,
-          });
+          reply = yield* llmRouter
+            .generate({
+              provider: agent.llmProvider,
+              model: agent.llmModel,
+              prompt,
+            })
+            .pipe(Effect.withLogSpan("llm.generate"));
+
+          yield* Effect.logInfo("llm.generate.ok").pipe(
+            Effect.annotateLogs({
+              llmProvider: agent.llmProvider,
+              llmModel: agent.llmModel,
+              replyChars: reply.length,
+            }),
+          );
 
           const now = yield* nowMs;
           replyCreatedAtMs = now;
@@ -527,13 +578,20 @@ export class ArenaService extends Context.Tag("@agon/ArenaService")<
         }
 
         if (webhook && !(alreadyPostedToDiscord || alreadyPostedInDiscordThread)) {
-          yield* webhookPoster.post({
-            webhook: { id: webhook.webhookId, token: webhook.webhookToken },
-            threadId: room.threadId,
-            content: reply,
-            username: agent.name,
-            ...(agent.avatarUrl ? { avatarUrl: agent.avatarUrl } : {}),
-          });
+          yield* webhookPoster
+            .post({
+              webhook: { id: webhook.webhookId, token: webhook.webhookToken },
+              threadId: room.threadId,
+              content: reply,
+              username: agent.name,
+              ...(agent.avatarUrl ? { avatarUrl: agent.avatarUrl } : {}),
+            })
+            .pipe(Effect.withLogSpan("discord.webhook.post"));
+          yield* Effect.logInfo("discord.webhook.posted");
+        } else if (webhook) {
+          yield* Effect.logDebug("discord.webhook.skip_duplicate");
+        } else {
+          yield* Effect.logDebug("discord.webhook.skip_missing");
         }
 
         const shouldStop = reply.toLowerCase().includes("goodbye") || job.turnNumber >= maxTurns;
