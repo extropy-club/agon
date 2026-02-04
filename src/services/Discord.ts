@@ -106,7 +106,14 @@ export class Discord extends Context.Tag("@agon/Discord")<
     Effect.gen(function* () {
       const botToken = yield* Config.option(Config.redacted("DISCORD_BOT_TOKEN"));
 
-      const authHeader = (token: Redacted.Redacted) => `Bot ${Redacted.value(token)}`;
+      const sanitizeToken = (s: string) =>
+        s
+          .trim()
+          .replace(/^"(.*)"$/, "$1")
+          .replace(/^'(.*)'$/, "$1");
+
+      const authHeader = (token: Redacted.Redacted) =>
+        `Bot ${sanitizeToken(Redacted.value(token))}`;
 
       const createWebhook = (channelId: string) =>
         requireBotToken(botToken).pipe(

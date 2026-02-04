@@ -51,27 +51,36 @@ export class LlmRouter extends Context.Tag("@agon/LlmRouter")<
         Schedule.intersect(Schedule.recurs(2)),
       );
 
+      const sanitizeToken = (s: string) =>
+        s
+          .trim()
+          .replace(/^"(.*)"$/, "$1")
+          .replace(/^'(.*)'$/, "$1");
+
+      const sanitizeRedacted = (r: Redacted.Redacted) =>
+        Redacted.make(sanitizeToken(Redacted.value(r)));
+
       const requireApiKey = (provider: LlmProvider) => {
         switch (provider) {
           case "openai":
             return Option.isNone(openAiApiKey)
               ? Effect.fail(MissingLlmApiKey.make({ provider, envVar: "OPENAI_API_KEY" }))
-              : Effect.succeed(openAiApiKey.value);
+              : Effect.succeed(sanitizeRedacted(openAiApiKey.value));
 
           case "anthropic":
             return Option.isNone(anthropicApiKey)
               ? Effect.fail(MissingLlmApiKey.make({ provider, envVar: "ANTHROPIC_API_KEY" }))
-              : Effect.succeed(anthropicApiKey.value);
+              : Effect.succeed(sanitizeRedacted(anthropicApiKey.value));
 
           case "gemini":
             return Option.isNone(googleApiKey)
               ? Effect.fail(MissingLlmApiKey.make({ provider, envVar: "GOOGLE_AI_API_KEY" }))
-              : Effect.succeed(googleApiKey.value);
+              : Effect.succeed(sanitizeRedacted(googleApiKey.value));
 
           case "openrouter":
             return Option.isNone(openRouterApiKey)
               ? Effect.fail(MissingLlmApiKey.make({ provider, envVar: "OPENROUTER_API_KEY" }))
-              : Effect.succeed(openRouterApiKey.value);
+              : Effect.succeed(sanitizeRedacted(openRouterApiKey.value));
         }
       };
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { existsSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { spawn } from "node:child_process";
 import process from "node:process";
 
@@ -28,19 +28,21 @@ if (!currentOk && caFile) {
   process.env.SSL_CERT_FILE = caFile;
 }
 
-// Bootstrap .dev.vars from the current environment (vault) if the file doesn't exist.
-// This avoids passing secrets on the command line via `--var`.
-if (!existsSync(".dev.vars")) {
-  const quote = (s) =>
-    `"${String(s)
-      .replaceAll("\\", "\\\\")
-      .replaceAll('"', '\\"')
-      .replaceAll("\r", "")
-      .replaceAll("\n", "")}"`;
+// Ensure `.dev.vars` matches the current environment (vault).
+//
+// We keep secrets out of argv (no `--var ...`) and avoid quoting, because on some
+// setups quotes can leak into the final env value (breaking Discord/OpenRouter auth).
+{
+  const stripQuotes = (s) =>
+    String(s)
+      .trim()
+      .replace(/^"(.*)"$/, "$1")
+      .replace(/^'(.*)'$/, "$1");
 
-  const devAdminToken = process.env.AGON_DEV_ADMIN_TOKEN ?? "devtoken";
+  const sanitize = (s) => stripQuotes(String(s).replaceAll("\r", "").replaceAll("\n", "").trim());
 
   const keys = [
+    "ADMIN_TOKEN",
     "DISCORD_BOT_TOKEN",
     "DISCORD_PUBLIC_KEY",
     "OPENROUTER_API_KEY",
@@ -51,15 +53,40 @@ if (!existsSync(".dev.vars")) {
     "GOOGLE_AI_API_KEY",
   ];
 
-  const lines = [`ADMIN_TOKEN=${quote(devAdminToken)}`];
-
-  for (const key of keys) {
-    const val = process.env[key];
-    if (typeof val === "string" && val.length > 0) {
-      lines.push(`${key}=${quote(val)}`);
+  // Start from existing .dev.vars so we don't delete values when the vault isn't exporting them.
+  const existing = new Map();
+  if (existsSync(".dev.vars")) {
+    const txt = readFileSync(".dev.vars", "utf8");
+    for (const rawLine of txt.split("\n")) {
+      const line = rawLine.trim();
+      if (!line || line.startsWith("#")) continue;
+      const idx = line.indexOf("=");
+      if (idx <= 0) continue;
+      const k = line.slice(0, idx).trim();
+      const v = line.slice(idx + 1);
+      existing.set(k, sanitize(v));
     }
   }
 
+  const devAdminToken = sanitize(
+    process.env.AGON_DEV_ADMIN_TOKEN ?? existing.get("ADMIN_TOKEN") ?? "devtoken",
+  );
+  existing.set("ADMIN_TOKEN", devAdminToken);
+
+  for (const key of keys) {
+    if (key === "ADMIN_TOKEN") continue;
+    const envVal = process.env[key];
+    if (typeof envVal === "string" && envVal.length > 0) {
+      existing.set(key, sanitize(envVal));
+    }
+  }
+
+  const lines = [];
+  for (const [k, v] of existing.entries()) {
+    lines.push(`${k}=${v}`);
+  }
+
+  // Always write (0600) so changes in the vault env take effect immediately.
   writeFileSync(".dev.vars", `${lines.join("\n")}\n`, { mode: 0o600 });
 }
 
