@@ -1,33 +1,14 @@
 export const API_BASE = "/admin";
 
-const getAdminToken = (): string | null => {
-  const envToken = import.meta.env.VITE_ADMIN_TOKEN;
-  if (typeof envToken === "string" && envToken.trim().length > 0) {
-    return envToken.trim();
-  }
-
-  // Back-compat fallback (e.g. if someone sets it manually in devtools).
-  try {
-    return localStorage.getItem("agon.adminToken");
-  } catch {
-    return null;
-  }
-};
-
 export async function apiFetch(path: string, options?: RequestInit) {
-  const token = getAdminToken();
-
   const headers = new Headers(options?.headers);
   if (!headers.has("Content-Type") && options?.body) {
     headers.set("Content-Type", "application/json");
   }
 
-  if (token && !headers.has("Authorization")) {
-    headers.set("Authorization", `Bearer ${token}`);
-  }
-
   const res = await fetch(`${API_BASE}${path}`, {
     ...options,
+    credentials: "same-origin",
     headers,
   });
 
@@ -38,6 +19,26 @@ export async function apiFetch(path: string, options?: RequestInit) {
 
   if (res.status === 204) return null;
   return res.json();
+}
+
+export type AuthUser = {
+  login: string;
+  avatar_url: string;
+  sub: number;
+};
+
+export async function authMe(): Promise<AuthUser | null> {
+  try {
+    const res = await fetch("/auth/me", { credentials: "same-origin" });
+    if (!res.ok) return null;
+    return res.json();
+  } catch {
+    return null;
+  }
+}
+
+export async function authLogout(): Promise<void> {
+  await fetch("/auth/logout", { method: "POST", credentials: "same-origin" });
 }
 
 export type Agent = {

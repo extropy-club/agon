@@ -6,8 +6,12 @@ export default defineConfig({
   server: {
     port: 3000,
     proxy: {
-      // Proxy admin API calls to the local wrangler dev server.
+      // Proxy worker API calls to the local wrangler dev server.
       "/admin": {
+        target: "http://localhost:8787",
+        changeOrigin: true,
+      },
+      "/auth": {
         target: "http://localhost:8787",
         changeOrigin: true,
       },

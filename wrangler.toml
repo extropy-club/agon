@@ -31,3 +31,7 @@ CF_D1_NAME = "agon-db"
 
 [dev]
 port = 8787
+
+[assets]
+directory = "./packages/admin/dist"
+binding = "ASSETS"

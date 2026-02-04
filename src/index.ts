@@ -22,6 +22,7 @@ import { DiscordWebhookPoster } from "./services/DiscordWebhook.js";
 import { LlmRouterLive } from "./services/LlmRouter.js";
 import { Observability } from "./services/Observability.js";
 import { TurnEventService } from "./services/TurnEventService.js";
+import { signJwt, verifyJwt } from "./lib/jwt.js";
 
 export interface Env {
   DB: D1Database;
@@ -51,6 +52,15 @@ export interface Env {
 
   // Admin API auth
   ADMIN_TOKEN?: string;
+
+  // GitHub OAuth + session JWT
+  GITHUB_CLIENT_ID?: string;
+  GITHUB_CLIENT_SECRET?: string;
+  JWT_SECRET?: string;
+  AUTH_ALLOWED_USERS?: string; // comma-separated GitHub logins
+
+  // Cloudflare Workers static assets binding (admin UI)
+  ASSETS?: Fetcher;
 }
 
 const json = (status: number, body: unknown) =>
@@ -60,6 +70,45 @@ const json = (status: number, body: unknown) =>
   });
 
 const text = (status: number, body: string) => new Response(body, { status });
+
+const isLocalhost = (hostname: string) =>
+  hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1";
+
+const getCookie = (request: Request, name: string): string | undefined => {
+  const header = request.headers.get("cookie");
+  if (!header) return undefined;
+
+  // Simple cookie parsing (sufficient for our use-case).
+  for (const part of header.split(";")) {
+    const [k, ...rest] = part.trim().split("=");
+    if (k === name) return rest.join("=");
+  }
+  return undefined;
+};
+
+type CookieOptions = {
+  httpOnly?: boolean;
+  secure?: boolean;
+  sameSite?: "Lax" | "Strict" | "None";
+  path?: string;
+  maxAge?: number;
+};
+
+const serializeCookie = (name: string, value: string, options: CookieOptions): string => {
+  const parts: string[] = [`${name}=${value}`];
+  if (options.maxAge !== undefined) parts.push(`Max-Age=${options.maxAge}`);
+  if (options.path) parts.push(`Path=${options.path}`);
+  if (options.httpOnly) parts.push("HttpOnly");
+  if (options.secure) parts.push("Secure");
+  if (options.sameSite) parts.push(`SameSite=${options.sameSite}`);
+  return parts.join("; ");
+};
+
+const redirect = (location: string, cookies: string[] = []) => {
+  const headers = new Headers({ Location: location });
+  for (const c of cookies) headers.append("Set-Cookie", c);
+  return new Response(null, { status: 302, headers });
+};
 
 const makeConfigLayer = (env: Env) => {
   const map = new Map<string, string>();
@@ -73,6 +122,10 @@ const makeConfigLayer = (env: Env) => {
   // so `Object.entries(env)` may miss them. We explicitly copy the ones we use.
   const secretKeys = [
     "ADMIN_TOKEN",
+    "GITHUB_CLIENT_ID",
+    "GITHUB_CLIENT_SECRET",
+    "JWT_SECRET",
+    "AUTH_ALLOWED_USERS",
     "DISCORD_PUBLIC_KEY",
     "DISCORD_BOT_TOKEN",
     "DISCORD_BOT_USER_ID",
@@ -160,21 +213,62 @@ export class AdminQueueError extends Schema.TaggedError<AdminQueueError>()("Admi
 
 const requireAdmin = (request: Request) =>
   Effect.gen(function* () {
-    const opt = yield* Config.option(Config.redacted("ADMIN_TOKEN")).pipe(
-      Effect.catchAll(() => Effect.succeed(Option.none())),
-    );
-
-    if (Option.isNone(opt)) {
-      return yield* Effect.fail(AdminMissingConfig.make({ key: "ADMIN_TOKEN" }));
-    }
-
+    // 1) Bearer token (programmatic access)
     const auth = request.headers.get("authorization") ?? "";
     const match = auth.match(/^Bearer\s+(.+)$/i);
-    if (!match) return yield* Effect.fail(AdminUnauthorized.make({}));
+    if (match) {
+      const opt = yield* Config.option(Config.redacted("ADMIN_TOKEN")).pipe(
+        Effect.catchAll(() => Effect.succeed(Option.none())),
+      );
 
-    if (Redacted.value(opt.value) !== match[1]) {
-      return yield* Effect.fail(AdminUnauthorized.make({}));
+      if (Option.isNone(opt)) {
+        return yield* Effect.fail(AdminMissingConfig.make({ key: "ADMIN_TOKEN" }));
+      }
+
+      if (Redacted.value(opt.value) !== match[1]) {
+        return yield* Effect.fail(AdminUnauthorized.make({}));
+      }
+
+      return;
     }
+
+    // 2) Session cookie (GitHub OAuth)
+    const session = getCookie(request, "session");
+    if (session) {
+      const jwtOpt = yield* Config.option(Config.redacted("JWT_SECRET")).pipe(
+        Effect.catchAll(() => Effect.succeed(Option.none())),
+      );
+
+      if (Option.isNone(jwtOpt)) {
+        return yield* Effect.fail(AdminMissingConfig.make({ key: "JWT_SECRET" }));
+      }
+
+      const payload = (yield* Effect.tryPromise({
+        try: () => verifyJwt(session, Redacted.value(jwtOpt.value)),
+        catch: () => Promise.resolve(null),
+      })) as (Record<string, unknown> & { login?: string }) | null;
+
+      if (!payload) {
+        return yield* Effect.fail(AdminUnauthorized.make({}));
+      }
+
+      const allowOpt = yield* Config.option(Config.string("AUTH_ALLOWED_USERS")).pipe(
+        Effect.catchAll(() => Effect.succeed(Option.none())),
+      );
+
+      if (Option.isSome(allowOpt) && allowOpt.value.trim().length > 0) {
+        const allowed = allowOpt.value.split(",").map((s) => s.trim().toLowerCase());
+        const login = payload.login;
+        if (typeof login !== "string" || !allowed.includes(login.toLowerCase())) {
+          return yield* Effect.fail(AdminUnauthorized.make({}));
+        }
+      }
+
+      return;
+    }
+
+    // 3) Nothing
+    return yield* Effect.fail(AdminUnauthorized.make({}));
   });
 
 const decodeBody = <A>(request: Request, schema: Schema.Schema<A>) =>
@@ -203,6 +297,213 @@ export default {
 
     const requestId =
       request.headers.get("CF-Ray") ?? request.headers.get("cf-ray") ?? crypto.randomUUID();
+
+    // Auth (GitHub OAuth)
+    if (url.pathname === "/auth/login" && request.method === "GET") {
+      if (!env.GITHUB_CLIENT_ID) {
+        return json(500, { error: "Missing GITHUB_CLIENT_ID" });
+      }
+
+      const state = crypto.randomUUID();
+      const secure = !isLocalhost(url.hostname);
+
+      const stateCookie = serializeCookie("oauth_state", state, {
+        httpOnly: true,
+        secure,
+        sameSite: "Lax",
+        path: "/auth/callback",
+        maxAge: 60 * 5,
+      });
+
+      const redirectUri = new URL("/auth/callback", request.url).toString();
+      const authorizeUrl = new URL("https://github.com/login/oauth/authorize");
+      authorizeUrl.searchParams.set("client_id", env.GITHUB_CLIENT_ID);
+      authorizeUrl.searchParams.set("redirect_uri", redirectUri);
+      authorizeUrl.searchParams.set("state", state);
+      authorizeUrl.searchParams.set("scope", "read:user");
+
+      return redirect(authorizeUrl.toString(), [stateCookie]);
+    }
+
+    if (url.pathname === "/auth/callback" && request.method === "GET") {
+      const code = url.searchParams.get("code") ?? "";
+      const state = url.searchParams.get("state") ?? "";
+
+      const secure = !isLocalhost(url.hostname);
+      const clearStateCookie = serializeCookie("oauth_state", "", {
+        httpOnly: true,
+        secure,
+        sameSite: "Lax",
+        path: "/auth/callback",
+        maxAge: 0,
+      });
+
+      const cookieState = getCookie(request, "oauth_state") ?? "";
+      if (!code || !state || !cookieState || cookieState !== state) {
+        const headers = new Headers({ "Content-Type": "application/json" });
+        headers.append("Set-Cookie", clearStateCookie);
+        return new Response(JSON.stringify({ error: "Invalid state" }, null, 2), {
+          status: 400,
+          headers,
+        });
+      }
+
+      if (!env.GITHUB_CLIENT_ID) {
+        const headers = new Headers({ "Content-Type": "application/json" });
+        headers.append("Set-Cookie", clearStateCookie);
+        return new Response(JSON.stringify({ error: "Missing GITHUB_CLIENT_ID" }, null, 2), {
+          status: 500,
+          headers,
+        });
+      }
+
+      if (!env.GITHUB_CLIENT_SECRET) {
+        const headers = new Headers({ "Content-Type": "application/json" });
+        headers.append("Set-Cookie", clearStateCookie);
+        return new Response(JSON.stringify({ error: "Missing GITHUB_CLIENT_SECRET" }, null, 2), {
+          status: 500,
+          headers,
+        });
+      }
+
+      if (!env.JWT_SECRET) {
+        const headers = new Headers({ "Content-Type": "application/json" });
+        headers.append("Set-Cookie", clearStateCookie);
+        return new Response(JSON.stringify({ error: "Missing JWT_SECRET" }, null, 2), {
+          status: 500,
+          headers,
+        });
+      }
+
+      // Exchange code → access token
+      const tokenResp = await fetch("https://github.com/login/oauth/access_token", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded",
+          Accept: "application/json",
+        },
+        body: new URLSearchParams({
+          client_id: env.GITHUB_CLIENT_ID,
+          client_secret: env.GITHUB_CLIENT_SECRET,
+          code,
+        }).toString(),
+      });
+
+      const tokenJson = (await tokenResp.json().catch(() => null)) as {
+        access_token?: string;
+        error?: string;
+        error_description?: string;
+      } | null;
+
+      const accessToken = tokenJson?.access_token;
+      if (!tokenResp.ok || !accessToken) {
+        const headers = new Headers({ "Content-Type": "application/json" });
+        headers.append("Set-Cookie", clearStateCookie);
+        return new Response(
+          JSON.stringify(
+            {
+              error: "Failed to exchange code",
+              details: tokenJson,
+            },
+            null,
+            2,
+          ),
+          { status: 502, headers },
+        );
+      }
+
+      // Fetch user
+      const userResp = await fetch("https://api.github.com/user", {
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          Accept: "application/vnd.github+json",
+          "User-Agent": "agon",
+        },
+      });
+
+      const userJson = (await userResp.json().catch(() => null)) as {
+        id: number;
+        login: string;
+        avatar_url: string;
+      } | null;
+
+      if (!userResp.ok || !userJson?.login || userJson.id === undefined) {
+        const headers = new Headers({ "Content-Type": "application/json" });
+        headers.append("Set-Cookie", clearStateCookie);
+        return new Response(
+          JSON.stringify({ error: "Failed to fetch user", details: userJson }, null, 2),
+          { status: 502, headers },
+        );
+      }
+
+      // Optional allowlist
+      const allowRaw = env.AUTH_ALLOWED_USERS?.trim() ?? "";
+      if (allowRaw.length > 0) {
+        const allow = allowRaw
+          .split(",")
+          .map((s) => s.trim().toLowerCase())
+          .filter(Boolean);
+
+        if (!allow.includes(userJson.login.toLowerCase())) {
+          const headers = new Headers({ "Content-Type": "application/json" });
+          headers.append("Set-Cookie", clearStateCookie);
+          return new Response(JSON.stringify({ error: "Forbidden" }, null, 2), {
+            status: 403,
+            headers,
+          });
+        }
+      }
+
+      const now = Math.floor(Date.now() / 1000);
+      const payload = {
+        sub: String(userJson.id),
+        login: userJson.login,
+        avatar_url: userJson.avatar_url,
+        exp: now + 60 * 60 * 24 * 7,
+      };
+
+      const jwt = await signJwt(payload, env.JWT_SECRET);
+
+      const sessionCookie = serializeCookie("session", jwt, {
+        httpOnly: true,
+        secure,
+        sameSite: "Lax",
+        path: "/",
+        maxAge: 60 * 60 * 24 * 7,
+      });
+
+      return redirect("/", [clearStateCookie, sessionCookie]);
+    }
+
+    if (url.pathname === "/auth/me" && request.method === "GET") {
+      const token = getCookie(request, "session");
+      if (!token) return json(401, { error: "Unauthorized" });
+      if (!env.JWT_SECRET) return json(500, { error: "Missing JWT_SECRET" });
+
+      const payload = await verifyJwt(token, env.JWT_SECRET);
+      if (!payload) return json(401, { error: "Unauthorized" });
+
+      return json(200, {
+        login: payload.login,
+        avatar_url: payload.avatar_url,
+        sub: payload.sub,
+      });
+    }
+
+    if (url.pathname === "/auth/logout" && request.method === "POST") {
+      const secure = !isLocalhost(url.hostname);
+      const clearSessionCookie = serializeCookie("session", "", {
+        httpOnly: true,
+        secure,
+        sameSite: "Lax",
+        path: "/",
+        maxAge: 0,
+      });
+
+      const headers = new Headers({ "Content-Type": "application/json" });
+      headers.append("Set-Cookie", clearSessionCookie);
+      return new Response(JSON.stringify({ ok: true }, null, 2), { status: 200, headers });
+    }
 
     // Admin API
     if (url.pathname.startsWith("/admin")) {
@@ -1182,6 +1483,15 @@ export default {
       );
 
       return json(200, await runtime.runPromise(program));
+    }
+
+    // Static assets + SPA fallback (admin UI)
+    if (env.ASSETS) {
+      const asset = await env.ASSETS.fetch(request);
+      if (asset.status !== 404) return asset;
+
+      // SPA fallback: serve admin UI for unmatched routes
+      return env.ASSETS.fetch(new Request(new URL("/index.html", request.url)));
     }
 
     return text(404, "Not Found");
