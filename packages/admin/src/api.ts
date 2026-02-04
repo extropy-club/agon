@@ -48,6 +48,12 @@ export type Agent = {
   readonly systemPrompt: string;
   readonly llmProvider: "openai" | "anthropic" | "gemini" | "openrouter";
   readonly llmModel: string;
+
+  // Optional per-agent generation params (null => provider defaults)
+  readonly temperature: string | null;
+  readonly maxTokens: number | null;
+  readonly thinkingLevel: "low" | "medium" | "high" | null;
+  readonly thinkingBudgetTokens: number | null;
 };
 
 export type Room = {
@@ -87,7 +93,7 @@ export type AdminSetting = {
   readonly label: string;
   readonly sensitive: boolean;
   readonly configured: boolean;
-  readonly source: "db" | "env" | null;
+  readonly source: "db" | "db_invalid" | "env" | null;
   readonly maskedValue: string | null;
   readonly updatedAtMs: number | null;
 };

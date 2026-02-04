@@ -441,7 +441,7 @@ export class Discord extends Context.Tag("@agon/Discord")<
 
       const getGuilds: () => Effect.Effect<Array<DiscordGuild>, DiscordApiError> = () =>
         requireBotToken(botToken).pipe(
-          Effect.map((token) => `Bearer ${sanitizeToken(Redacted.value(token))}`),
+          Effect.map(authHeader),
           Effect.mapError((e) =>
             DiscordApiError.make({
               endpoint: "/users/@me/guilds",

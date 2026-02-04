@@ -242,15 +242,14 @@ const requireAdmin = (request: Request) =>
         Effect.catchAll(() => Effect.succeed(Option.none())),
       );
 
-      if (Option.isNone(opt)) {
-        return yield* Effect.fail(AdminMissingConfig.make({ key: "ADMIN_TOKEN" }));
+      // When ADMIN_TOKEN is configured, validate the Bearer token.
+      // When it's NOT configured, fall through to cookie/session auth below.
+      if (Option.isSome(opt)) {
+        if (Redacted.value(opt.value) !== match[1]) {
+          return yield* Effect.fail(AdminUnauthorized.make({}));
+        }
+        return;
       }
-
-      if (Redacted.value(opt.value) !== match[1]) {
-        return yield* Effect.fail(AdminUnauthorized.make({}));
-      }
-
-      return;
     }
 
     // 2) Session cookie (GitHub OAuth)
@@ -531,6 +530,7 @@ export default {
       const segments = url.pathname.split("/").filter(Boolean);
 
       const AgentProviderSchema = Schema.Literal("openai", "anthropic", "gemini", "openrouter");
+      const ThinkingLevelSchema = Schema.Literal("low", "medium", "high");
 
       const AgentCreateSchema = Schema.Struct({
         id: Schema.optional(Schema.String),
@@ -539,6 +539,10 @@ export default {
         systemPrompt: Schema.String,
         llmProvider: Schema.optional(AgentProviderSchema),
         llmModel: Schema.optional(Schema.String),
+        temperature: Schema.optional(Schema.String),
+        maxTokens: Schema.optional(Schema.NullOr(Schema.Number)),
+        thinkingLevel: Schema.optional(Schema.NullOr(ThinkingLevelSchema)),
+        thinkingBudgetTokens: Schema.optional(Schema.NullOr(Schema.Number)),
       });
 
       const AgentUpdateSchema = Schema.Struct({
@@ -547,6 +551,10 @@ export default {
         systemPrompt: Schema.optional(Schema.String),
         llmProvider: Schema.optional(AgentProviderSchema),
         llmModel: Schema.optional(Schema.String),
+        temperature: Schema.optional(Schema.String),
+        maxTokens: Schema.optional(Schema.NullOr(Schema.Number)),
+        thinkingLevel: Schema.optional(Schema.NullOr(ThinkingLevelSchema)),
+        thinkingBudgetTokens: Schema.optional(Schema.NullOr(Schema.Number)),
       });
 
       const CreateRoomSchema = Schema.Struct({
@@ -570,8 +578,8 @@ export default {
 
         const maskSensitive = (value: string) => {
           const v = value.trim();
-          const last4 = v.slice(-4);
-          return `...${last4}`;
+          if (v.length < 8) return "••••••••";
+          return `...${v.slice(-4)}`;
         };
 
         // /admin/discord/guilds
@@ -616,8 +624,21 @@ export default {
                   catch: (e) => e,
                 }).pipe(Effect.catchAll(() => Effect.succeed(null as string | null)));
 
-                const maskedValue =
-                  decrypted === null ? null : def.sensitive ? maskSensitive(decrypted) : decrypted;
+                if (decrypted === null) {
+                  // DB row exists but decryption failed — don't claim it's configured
+                  // (runtime will fall back to env via Settings.getSetting)
+                  return {
+                    key: def.key,
+                    label: def.label,
+                    sensitive: def.sensitive,
+                    configured: false,
+                    source: "db_invalid" as const,
+                    maskedValue: null,
+                    updatedAtMs: row.updatedAtMs,
+                  };
+                }
+
+                const maskedValue = def.sensitive ? maskSensitive(decrypted) : decrypted;
 
                 return {
                   key: def.key,
@@ -680,7 +701,12 @@ export default {
 
         // /admin/settings/:key
         if (segments.length === 3 && segments[1] === "settings") {
-          const key = decodeURIComponent(segments[2] ?? "");
+          let key: string;
+          try {
+            key = decodeURIComponent(segments[2] ?? "");
+          } catch {
+            return json(400, { error: "Malformed key encoding" });
+          }
           const known = KNOWN_SETTINGS.find((s) => s.key === key);
           if (!known) return json(404, { error: "Not Found" });
 
@@ -767,8 +793,61 @@ export default {
             const id = body.id ? body.id : slugify(body.name);
             if (!id) return json(400, { error: "Invalid id" });
 
+            const provider = body.llmProvider ?? "openai";
+
             const avatarUrl = body.avatarUrl?.trim();
             const avatarUrlOrNull = avatarUrl && avatarUrl.length > 0 ? avatarUrl : null;
+
+            const temperatureRaw = body.temperature?.trim();
+            const temperatureOrNull =
+              temperatureRaw && temperatureRaw.length > 0 ? temperatureRaw : null;
+
+            if (temperatureOrNull !== null) {
+              const t = Number.parseFloat(temperatureOrNull);
+              if (!Number.isFinite(t) || t < 0.0 || t > 2.0) {
+                return yield* Effect.fail(
+                  AdminBadRequest.make({
+                    message: "temperature must be a number between 0.0 and 2.0",
+                  }),
+                );
+              }
+            }
+
+            const validatePositiveInt = (n: number, label: string) => {
+              if (!Number.isFinite(n) || n <= 0 || !Number.isInteger(n)) {
+                return AdminBadRequest.make({ message: `${label} must be an integer > 0` });
+              }
+              return null;
+            };
+
+            if (body.maxTokens != null) {
+              const err = validatePositiveInt(body.maxTokens, "maxTokens");
+              if (err) return yield* Effect.fail(err);
+            }
+
+            if (body.thinkingBudgetTokens != null) {
+              const err = validatePositiveInt(body.thinkingBudgetTokens, "thinkingBudgetTokens");
+              if (err) return yield* Effect.fail(err);
+            }
+
+            if (
+              body.thinkingLevel != null &&
+              !(provider === "openai" || provider === "anthropic")
+            ) {
+              return yield* Effect.fail(
+                AdminBadRequest.make({
+                  message: "thinkingLevel is only supported for OpenAI and Anthropic",
+                }),
+              );
+            }
+
+            if (body.thinkingBudgetTokens != null && provider !== "anthropic") {
+              return yield* Effect.fail(
+                AdminBadRequest.make({
+                  message: "thinkingBudgetTokens is only supported for Anthropic",
+                }),
+              );
+            }
 
             yield* dbTry(() =>
               db
@@ -778,8 +857,12 @@ export default {
                   name: body.name,
                   avatarUrl: avatarUrlOrNull,
                   systemPrompt: body.systemPrompt,
-                  llmProvider: body.llmProvider ?? "openai",
+                  llmProvider: provider,
                   llmModel: body.llmModel ?? "gpt-4o-mini",
+                  temperature: temperatureOrNull,
+                  maxTokens: body.maxTokens ?? null,
+                  thinkingLevel: body.thinkingLevel ?? null,
+                  thinkingBudgetTokens: body.thinkingBudgetTokens ?? null,
                 })
                 .onConflictDoUpdate({
                   target: agents.id,
@@ -787,8 +870,12 @@ export default {
                     name: body.name,
                     avatarUrl: avatarUrlOrNull,
                     systemPrompt: body.systemPrompt,
-                    llmProvider: body.llmProvider ?? "openai",
+                    llmProvider: provider,
                     llmModel: body.llmModel ?? "gpt-4o-mini",
+                    temperature: temperatureOrNull,
+                    maxTokens: body.maxTokens ?? null,
+                    thinkingLevel: body.thinkingLevel ?? null,
+                    thinkingBudgetTokens: body.thinkingBudgetTokens ?? null,
                   },
                 })
                 .run(),
@@ -827,6 +914,63 @@ export default {
               return yield* Effect.fail(AdminNotFound.make({ resource: "agent", id: agentId }));
             }
 
+            const provider = body.llmProvider ?? existing.llmProvider;
+
+            const temperatureTrimmed = body.temperature?.trim();
+            const temperatureOrNull =
+              body.temperature !== undefined
+                ? temperatureTrimmed && temperatureTrimmed.length > 0
+                  ? temperatureTrimmed
+                  : null
+                : undefined;
+
+            if (temperatureOrNull !== undefined && temperatureOrNull !== null) {
+              const t = Number.parseFloat(temperatureOrNull);
+              if (!Number.isFinite(t) || t < 0.0 || t > 2.0) {
+                return yield* Effect.fail(
+                  AdminBadRequest.make({
+                    message: "temperature must be a number between 0.0 and 2.0",
+                  }),
+                );
+              }
+            }
+
+            const validatePositiveInt = (n: number, label: string) => {
+              if (!Number.isFinite(n) || n <= 0 || !Number.isInteger(n)) {
+                return AdminBadRequest.make({ message: `${label} must be an integer > 0` });
+              }
+              return null;
+            };
+
+            if (body.maxTokens != null) {
+              const err = validatePositiveInt(body.maxTokens, "maxTokens");
+              if (err) return yield* Effect.fail(err);
+            }
+
+            if (body.thinkingBudgetTokens != null) {
+              const err = validatePositiveInt(body.thinkingBudgetTokens, "thinkingBudgetTokens");
+              if (err) return yield* Effect.fail(err);
+            }
+
+            if (
+              body.thinkingLevel != null &&
+              !(provider === "openai" || provider === "anthropic")
+            ) {
+              return yield* Effect.fail(
+                AdminBadRequest.make({
+                  message: "thinkingLevel is only supported for OpenAI and Anthropic",
+                }),
+              );
+            }
+
+            if (body.thinkingBudgetTokens != null && provider !== "anthropic") {
+              return yield* Effect.fail(
+                AdminBadRequest.make({
+                  message: "thinkingBudgetTokens is only supported for Anthropic",
+                }),
+              );
+            }
+
             yield* dbTry(() =>
               db
                 .update(agents)
@@ -840,6 +984,21 @@ export default {
                   ...(body.systemPrompt !== undefined ? { systemPrompt: body.systemPrompt } : {}),
                   ...(body.llmProvider !== undefined ? { llmProvider: body.llmProvider } : {}),
                   ...(body.llmModel !== undefined ? { llmModel: body.llmModel } : {}),
+                  ...(body.temperature !== undefined ? { temperature: temperatureOrNull } : {}),
+                  ...(body.maxTokens !== undefined ? { maxTokens: body.maxTokens } : {}),
+                  ...(body.thinkingLevel !== undefined
+                    ? { thinkingLevel: body.thinkingLevel }
+                    : {}),
+                  ...(body.thinkingBudgetTokens !== undefined
+                    ? { thinkingBudgetTokens: body.thinkingBudgetTokens }
+                    : {}),
+                  ...(body.llmProvider !== undefined &&
+                  (body.llmProvider === "gemini" || body.llmProvider === "openrouter")
+                    ? { thinkingLevel: null, thinkingBudgetTokens: null }
+                    : {}),
+                  ...(body.llmProvider !== undefined && body.llmProvider === "openai"
+                    ? { thinkingBudgetTokens: null }
+                    : {}),
                 })
                 .where(eq(agents.id, agentId))
                 .run(),

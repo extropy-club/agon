@@ -852,6 +852,12 @@ export class ArenaService extends Context.Tag("@agon/ArenaService")<
                   provider: agent.llmProvider,
                   model: agent.llmModel,
                   prompt,
+                  ...(agent.temperature ? { temperature: parseFloat(agent.temperature) } : {}),
+                  ...(agent.maxTokens != null ? { maxTokens: agent.maxTokens } : {}),
+                  ...(agent.thinkingLevel != null ? { thinkingLevel: agent.thinkingLevel } : {}),
+                  ...(agent.thinkingBudgetTokens != null
+                    ? { thinkingBudgetTokens: agent.thinkingBudgetTokens }
+                    : {}),
                 }),
                 { maxRetries: 3, isRetryable: isRetryableLlmError },
               ).pipe(Effect.withLogSpan("llm.generate"), Effect.either);

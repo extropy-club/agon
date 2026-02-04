@@ -5,6 +5,8 @@ const badgeLabel = (s: AdminSetting) => {
   switch (s.source) {
     case "db":
       return "Configured (DB)";
+    case "db_invalid":
+      return "DB (decrypt failed)";
     case "env":
       return "Configured (env)";
     default:
@@ -16,6 +18,8 @@ const badgeClass = (s: AdminSetting) => {
   switch (s.source) {
     case "db":
       return "badge-config-db";
+    case "db_invalid":
+      return "badge-config-none";
     case "env":
       return "badge-config-env";
     default:

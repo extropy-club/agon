@@ -218,8 +218,8 @@ export class LlmRouter extends Context.Tag("@agon/LlmRouter")<
         // OpenRouter: use direct chat completions API
         if (args.provider === "openrouter") {
           return yield* openRouterGenerate(args.model, args.prompt, apiKey, {
-            temperature: args.temperature,
-            maxTokens: args.maxTokens,
+            ...(args.temperature !== undefined ? { temperature: args.temperature } : {}),
+            ...(args.maxTokens !== undefined ? { maxTokens: args.maxTokens } : {}),
           }).pipe(
             Effect.timeout("30 seconds"),
             Effect.mapError((cause) => LlmCallFailed.make({ provider: args.provider, cause })),
@@ -232,7 +232,107 @@ export class LlmRouter extends Context.Tag("@agon/LlmRouter")<
         );
         const modelLayer = Model.make(args.provider, languageModelLayer);
 
-        return yield* LanguageModel.generateText({ prompt: args.prompt }).pipe(
+        const base = LanguageModel.generateText({ prompt: args.prompt });
+
+        const withGoogleConfigOverride = <A, E, R>(
+          self: Effect.Effect<A, E, R>,
+          overrides: GoogleLanguageModel.Config.Service,
+        ): Effect.Effect<A, E, R> =>
+          Effect.flatMap(GoogleLanguageModel.Config.getOrUndefined, (current) => {
+            const cur = (current ?? {}) as unknown as Record<string, unknown>;
+            const next = { ...cur, ...(overrides as unknown as Record<string, unknown>) };
+
+            // Merge nested generationConfig when present on both sides.
+            if ("generationConfig" in overrides) {
+              const curGen = cur["generationConfig"] as Record<string, unknown> | undefined;
+              const overrideGen = (overrides as unknown as Record<string, unknown>)[
+                "generationConfig"
+              ] as Record<string, unknown> | undefined;
+              if (overrideGen) {
+                next["generationConfig"] = { ...curGen, ...overrideGen };
+              }
+            }
+
+            return Effect.provideService(self, GoogleLanguageModel.Config, next as never);
+          });
+
+        const withOverrides = (() => {
+          switch (args.provider) {
+            case "openai": {
+              const isOModel = args.model.toLowerCase().startsWith("o");
+
+              const overrides = {
+                ...(args.temperature !== undefined && { temperature: args.temperature }),
+                ...(args.maxTokens !== undefined && { max_output_tokens: args.maxTokens }),
+                ...(isOModel &&
+                  args.thinkingLevel !== undefined && {
+                    reasoning_effort: args.thinkingLevel,
+                  }),
+              };
+
+              return base.pipe(
+                OpenAiLanguageModel.withConfigOverride(
+                  overrides as OpenAiLanguageModel.Config.Service,
+                ),
+              );
+            }
+
+            case "anthropic": {
+              const budgetFromLevel = (level: "low" | "medium" | "high"): number => {
+                switch (level) {
+                  case "low":
+                    return 1024;
+                  case "medium":
+                    return 2048;
+                  case "high":
+                    return 4096;
+                }
+              };
+
+              const thinkingBudget =
+                args.thinkingBudgetTokens !== undefined
+                  ? args.thinkingBudgetTokens
+                  : args.thinkingLevel !== undefined
+                    ? budgetFromLevel(args.thinkingLevel)
+                    : undefined;
+
+              const overrides = {
+                ...(args.temperature !== undefined && { temperature: args.temperature }),
+                ...(args.maxTokens !== undefined && { max_tokens: args.maxTokens }),
+                ...(thinkingBudget !== undefined && {
+                  thinking: { type: "enabled", budget_tokens: thinkingBudget },
+                }),
+              };
+
+              return base.pipe(
+                AnthropicLanguageModel.withConfigOverride(
+                  overrides as AnthropicLanguageModel.Config.Service,
+                ),
+              );
+            }
+
+            case "gemini": {
+              const generationConfig = {
+                ...(args.temperature !== undefined && { temperature: args.temperature }),
+                ...(args.maxTokens !== undefined && { maxOutputTokens: args.maxTokens }),
+              };
+
+              if (Object.keys(generationConfig).length === 0) return base;
+
+              const overrides: GoogleLanguageModel.Config.Service = {
+                toolConfig: {},
+                generationConfig,
+              };
+
+              return withGoogleConfigOverride(base, overrides);
+            }
+
+            default:
+              return base;
+          }
+        })();
+
+        return yield* withOverrides.pipe(
           Effect.provide(modelLayer),
           Effect.map((r) => r.text.trim()),
           Effect.timeout("30 seconds"),

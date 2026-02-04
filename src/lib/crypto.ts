@@ -61,7 +61,8 @@ export async function decrypt(encrypted: string, secret: string): Promise<string
   const key = await deriveKey(secret);
   const bytes = base64DecodeToBytes(encrypted);
 
-  if (bytes.length < 13) {
+  // AES-GCM: 12 bytes IV + 16 bytes auth tag = 28 bytes minimum (empty plaintext)
+  if (bytes.length < 28) {
     throw new Error("Invalid encrypted payload");
   }
 
