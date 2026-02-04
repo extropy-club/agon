@@ -12,6 +12,7 @@
     "dev:admin": "node scripts/admin-dev.mjs",
     "dev:all": "concurrently -n worker,admin -c blue,magenta \"npm run dev\" \"npm run dev:admin\"",
     "deploy": "wrangler deploy",
+    "discord:register-commands": "node scripts/discord/registerCommands.mjs",
     "db:generate": "drizzle-kit generate",
     "db:migrate": "wrangler d1 migrations apply agon-db",
     "db:studio": "drizzle-kit studio",

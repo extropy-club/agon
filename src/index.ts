@@ -1,4 +1,5 @@
 import { asc, desc, eq, sql } from "drizzle-orm";
+import type { APIInteraction } from "discord-api-types/v10";
 import * as ConfigProvider from "effect/ConfigProvider";
 import { Config, Effect, Layer, Option, Redacted, Schema } from "effect";
 import * as ManagedRuntime from "effect/ManagedRuntime";
@@ -568,7 +569,7 @@ export default {
           return json(200, { roomId, events: rows });
         }
 
-        // /admin/rooms/:id/pause | /admin/rooms/:id/resume
+        // /admin/rooms/:id/unlock | /admin/rooms/:id/pause | /admin/rooms/:id/resume | /admin/rooms/:id/kick
         if (segments.length === 4 && segments[1] === "rooms") {
           const roomId = Number(segments[2]);
           if (!Number.isFinite(roomId)) return json(400, { error: "Invalid room id" });
@@ -576,6 +577,36 @@ export default {
           if (request.method !== "POST") return json(405, { error: "Method not allowed" });
 
           const action = segments[3];
+
+          if (action === "unlock") {
+            const discord = yield* Discord;
+
+            const room = yield* dbTry(() =>
+              db.select().from(rooms).where(eq(rooms.id, roomId)).get(),
+            );
+            if (!room) {
+              return yield* Effect.fail(
+                AdminNotFound.make({ resource: "room", id: String(roomId) }),
+              );
+            }
+
+            const threadId = room.threadId;
+
+            return yield* discord.unlockThread(threadId).pipe(
+              Effect.tap(() =>
+                Effect.logInfo("admin.room.unlock_thread.success").pipe(
+                  Effect.annotateLogs({ roomId, threadId }),
+                ),
+              ),
+              Effect.as(json(200, { success: true, roomId, threadId })),
+              Effect.catchAll((e) =>
+                Effect.logError("admin.room.unlock_thread.failed").pipe(
+                  Effect.annotateLogs({ roomId, threadId, error: String(e) }),
+                  Effect.as(json(502, { success: false, roomId, threadId, error: e })),
+                ),
+              ),
+            );
+          }
 
           if (action === "pause") {
             const room = yield* dbTry(() =>
@@ -755,10 +786,21 @@ export default {
       return json(200, { ok: true });
     }
 
-    // Discord interactions (PONG only for now; commands later)
+    // Discord interactions (slash commands)
     if (url.pathname === "/discord/interactions" && request.method === "POST") {
       const publicKey = env.DISCORD_PUBLIC_KEY;
       if (!publicKey) return json(500, { error: "Missing DISCORD_PUBLIC_KEY" });
+
+      const respond = (content: string) =>
+        json(200, {
+          // CHANNEL_MESSAGE_WITH_SOURCE
+          type: 4,
+          data: {
+            content,
+            // EPHEMERAL
+            flags: 64,
+          },
+        });
 
       const sig = request.headers.get("X-Signature-Ed25519") ?? "";
       const ts = request.headers.get("X-Signature-Timestamp") ?? "";
@@ -778,16 +820,221 @@ export default {
 
       if (!ok) return json(401, { error: "Invalid signature" });
 
-      const body = (await request.json()) as { type: number };
-      if (body.type === 1) {
+      const interaction = (await request.json()) as APIInteraction;
+
+      // PING -> PONG
+      if (interaction.type === 1) {
         return json(200, { type: 1 });
       }
 
-      // TODO: implement /arena commands
-      return json(200, {
-        type: 4,
-        data: { content: "Agon: interaction received (not implemented yet)." },
+      // APPLICATION_COMMAND
+      if (interaction.type !== 2) {
+        return respond("Agon: unsupported interaction type.");
+      }
+
+      const threadId = (interaction as unknown as { channel_id?: unknown }).channel_id;
+      const commandName = (interaction as unknown as { data?: { name?: unknown } }).data?.name;
+
+      if (typeof threadId !== "string" || typeof commandName !== "string") {
+        return respond("Agon: malformed command payload.");
+      }
+
+      type SlashResult = {
+        readonly content: string;
+        readonly enqueue?: RoomTurnJob;
+        readonly background?: Effect.Effect<void, never, never>;
+      };
+      type InteractionDbError = { readonly _tag: "InteractionDbError"; readonly cause: unknown };
+
+      const reply = (content: string, enqueue?: RoomTurnJob): SlashResult =>
+        enqueue ? { content, enqueue } : { content };
+
+      const replyBg = (
+        content: string,
+        background: Effect.Effect<void, never, never>,
+      ): SlashResult => ({
+        content,
+        background,
       });
+
+      const withBackground = (
+        result: SlashResult,
+        background: Effect.Effect<void, never, never>,
+      ): SlashResult => ({ ...result, background });
+
+      const dbTryInteraction = <A>(thunk: () => Promise<A>) =>
+        Effect.tryPromise({
+          try: thunk,
+          catch: (cause): InteractionDbError => ({ _tag: "InteractionDbError", cause }),
+        });
+
+      const program = Effect.gen(function* () {
+        const { db } = yield* Db;
+        const discord = yield* Discord;
+
+        const room = yield* dbTryInteraction(() =>
+          db.select().from(rooms).where(eq(rooms.threadId, threadId)).get(),
+        );
+
+        if (!room) {
+          return reply(
+            "Agon: no room found for this thread. Please run the command inside an Agon room thread.",
+          );
+        }
+
+        const roomId = room.id;
+        const name = commandName.toLowerCase();
+
+        const loadRoom = () =>
+          dbTryInteraction(() => db.select().from(rooms).where(eq(rooms.id, roomId)).get());
+
+        const enqueueNextTurn = Effect.fn("DiscordSlash.enqueueNextTurn")(() =>
+          Effect.gen(function* () {
+            const fresh = yield* loadRoom();
+            if (!fresh) {
+              return reply("Agon: room not found (it may have been deleted).");
+            }
+
+            const nextTurnNumber = fresh.currentTurnNumber + 1;
+
+            if (fresh.lastEnqueuedTurnNumber >= nextTurnNumber) {
+              return reply(`Agon: turn #${nextTurnNumber} is already enqueued.`);
+            }
+
+            yield* dbTryInteraction(() =>
+              db
+                .update(rooms)
+                .set({
+                  lastEnqueuedTurnNumber: sql`max(${rooms.lastEnqueuedTurnNumber}, ${nextTurnNumber})`,
+                })
+                .where(eq(rooms.id, roomId))
+                .run(),
+            );
+
+            return reply(`Agon: enqueued next turn (#${nextTurnNumber}).`, {
+              roomId,
+              turnNumber: nextTurnNumber,
+            });
+          }),
+        );
+
+        switch (name) {
+          case "next": {
+            const fresh = yield* loadRoom();
+            if (!fresh) {
+              return reply("Agon: room not found (it may have been deleted).");
+            }
+            if (fresh.status !== "active") {
+              return reply("Agon: room is paused. Use /continue to resume.");
+            }
+            return yield* enqueueNextTurn();
+          }
+
+          case "stop": {
+            yield* dbTryInteraction(() =>
+              db.update(rooms).set({ status: "paused" }).where(eq(rooms.id, roomId)).run(),
+            );
+
+            // Best-effort: unlock thread (in the background to avoid Discord's 3s interaction timeout)
+            const background = discord
+              .unlockThread(threadId)
+              .pipe(
+                Effect.catchAll((e) =>
+                  Effect.logWarning("discord.thread.unlock.failed").pipe(
+                    Effect.annotateLogs({ requestId, roomId, threadId, error: String(e) }),
+                    Effect.asVoid,
+                  ),
+                ),
+              );
+
+            return replyBg("Agon: room paused and thread unlocked.", background);
+          }
+
+          case "audience": {
+            // Stop the auto-loop by pausing the room; unlock the thread so humans can speak.
+            yield* dbTryInteraction(() =>
+              db.update(rooms).set({ status: "paused" }).where(eq(rooms.id, roomId)).run(),
+            );
+
+            const background = discord
+              .unlockThread(threadId)
+              .pipe(
+                Effect.catchAll((e) =>
+                  Effect.logWarning("discord.thread.unlock.failed").pipe(
+                    Effect.annotateLogs({ requestId, roomId, threadId, error: String(e) }),
+                    Effect.asVoid,
+                  ),
+                ),
+              );
+
+            return replyBg(
+              "Agon: audience slot opened (room paused, thread unlocked). Use /continue to resume.",
+              background,
+            );
+          }
+
+          case "continue": {
+            // Resume the loop and close the audience slot.
+            yield* dbTryInteraction(() =>
+              db.update(rooms).set({ status: "active" }).where(eq(rooms.id, roomId)).run(),
+            );
+
+            // Best-effort: lock thread in the background (the turn handler also locks during processing)
+            const background = discord
+              .lockThread(threadId)
+              .pipe(
+                Effect.catchAll((e) =>
+                  Effect.logWarning("discord.thread.lock.failed").pipe(
+                    Effect.annotateLogs({ requestId, roomId, threadId, error: String(e) }),
+                    Effect.asVoid,
+                  ),
+                ),
+              );
+
+            const enqueued = yield* enqueueNextTurn();
+            return withBackground(enqueued, background);
+          }
+
+          default:
+            return reply(
+              `Agon: unknown command: /${commandName}. Available: /next, /stop, /audience, /continue.`,
+            );
+        }
+      }).pipe(
+        Effect.annotateLogs({ requestId, route: "/discord/interactions", threadId, commandName }),
+        Effect.withLogSpan("discord.slash_command"),
+      );
+
+      const result = await runtime.runPromise(
+        program.pipe(
+          Effect.catchAll((e) =>
+            Effect.gen(function* () {
+              yield* Effect.logError("discord.slash_command.db_error").pipe(
+                Effect.annotateLogs({
+                  requestId,
+                  threadId,
+                  commandName,
+                  cause: String((e as InteractionDbError).cause),
+                }),
+              );
+
+              return reply("Agon: failed to handle command. Please try again or contact an admin.");
+            }),
+          ),
+        ),
+      );
+
+      const response = respond(result.content);
+
+      if (result.enqueue) {
+        ctx.waitUntil(env.ARENA_QUEUE.send(result.enqueue));
+      }
+
+      if (result.background) {
+        ctx.waitUntil(Effect.runPromise(result.background));
+      }
+
+      return response;
     }
 
     // DEV: start arena without Discord
