@@ -1,9 +1,10 @@
 import { buildPrompt } from "../lib/promptBuilder.js";
+import { retryWithBackoff } from "../lib/retry.js";
 import { and, asc, desc, eq, lt, or, sql } from "drizzle-orm";
-import { Config, Context, Effect, Layer, Schema } from "effect";
+import { Config, Context, Effect, Either, Layer, Schema } from "effect";
 import { Db, nowMs } from "../d1/db.js";
 import { agents, discordChannels, messages, roomAgents, rooms } from "../d1/schema.js";
-import { Discord, DiscordApiError, MissingDiscordConfig } from "./Discord.js";
+import { Discord, DiscordApiError, type DiscordError, MissingDiscordConfig } from "./Discord.js";
 import { DiscordWebhookPostFailed, DiscordWebhookPoster } from "./DiscordWebhook.js";
 import { type LlmRouterError, LlmRouter } from "./LlmRouter.js";
 import { TurnEventService } from "./TurnEventService.js";
@@ -46,6 +47,69 @@ const errorLabel = (e: unknown): string => {
     if (typeof t === "string") return t;
   }
   return String(e);
+};
+
+const turnFailedNotification = "⚠️ Turn failed after retries. Please use /kick to restart.";
+
+const isRetryableDiscordError = (e: DiscordError): boolean => {
+  switch (e._tag) {
+    case "MissingDiscordConfig":
+      return false;
+    case "DiscordApiError":
+      return e.status === 0 || e.status === 429 || e.status >= 500;
+  }
+};
+
+const isRetryableDiscordWebhookError = (e: DiscordWebhookPostFailed): boolean =>
+  e.status === 0 || e.status === 429 || e.status >= 500;
+
+const isRetryableLlmError = (e: LlmRouterError): boolean => {
+  switch (e._tag) {
+    case "MissingLlmApiKey":
+      return false;
+
+    case "LlmCallFailed": {
+      const s = String(e.cause).toLowerCase();
+
+      // auth / config
+      if (
+        s.includes(" 401") ||
+        s.includes("401") ||
+        s.includes(" 403") ||
+        s.includes("403") ||
+        s.includes("unauthorized") ||
+        s.includes("forbidden") ||
+        s.includes("invalid api key") ||
+        s.includes("authentication")
+      ) {
+        return false;
+      }
+
+      // validation / prompt issues
+      if (
+        s.includes(" 400") ||
+        s.includes("400") ||
+        s.includes("bad request") ||
+        s.includes("invalid prompt") ||
+        s.includes("validation")
+      ) {
+        return false;
+      }
+
+      // not found
+      if (s.includes("404") || s.includes("not found")) {
+        return false;
+      }
+
+      // retryable
+      if (s.includes(" 429") || s.includes("429") || s.includes("rate limit")) return true;
+      if (s.includes("timeout") || s.includes("timed out")) return true;
+      if (/\b5\d\d\b/.test(s)) return true;
+
+      // default: treat unknown defects as transient (network, provider hiccups)
+      return true;
+    }
+  }
 };
 
 const defaultAgents: ReadonlyArray<{
@@ -367,468 +431,598 @@ export class ArenaService extends Context.Tag("@agon/ArenaService")<
       });
 
       const processTurn = Effect.fn("ArenaService.processTurn")((job: RoomTurnJob) =>
-        Effect.gen(function* () {
-          yield* Effect.logInfo("arena.turn.start").pipe(
-            Effect.annotateLogs({ roomId: job.roomId, turnNumber: job.turnNumber }),
-          );
+        Effect.scoped(
+          Effect.gen(function* () {
+            yield* Effect.logInfo("arena.turn.start").pipe(
+              Effect.annotateLogs({ roomId: job.roomId, turnNumber: job.turnNumber }),
+            );
 
-          const room = yield* dbTry(() =>
-            db.select().from(rooms).where(eq(rooms.id, job.roomId)).get(),
-          );
-          if (!room) return yield* RoomNotFound.make({ roomId: job.roomId });
-          if (room.status !== "active") return null;
+            const room = yield* dbTry(() =>
+              db.select().from(rooms).where(eq(rooms.id, job.roomId)).get(),
+            );
+            if (!room) return yield* RoomNotFound.make({ roomId: job.roomId });
+            if (room.status !== "active") return null;
 
-          yield* Effect.logDebug("arena.turn.room_loaded").pipe(
-            Effect.annotateLogs({
-              threadId: room.threadId,
-              parentChannelId: room.parentChannelId,
-              currentTurnNumber: room.currentTurnNumber,
-            }),
-          );
+            yield* Effect.logDebug("arena.turn.room_loaded").pipe(
+              Effect.annotateLogs({
+                threadId: room.threadId,
+                parentChannelId: room.parentChannelId,
+                currentTurnNumber: room.currentTurnNumber,
+              }),
+            );
 
-          // idempotency
-          // - normal case: currentTurnNumber + 1 == job.turnNumber
-          // - retry case: currentTurnNumber == job.turnNumber (turn was processed but enqueue/ack may have failed)
-          if (room.currentTurnNumber === job.turnNumber) {
-            // This is a redelivery after the turn already advanced in D1, likely due to
-            // a crash between enqueue+ack.
-            const nextTurnNumber = job.turnNumber + 1;
-            if (room.lastEnqueuedTurnNumber >= nextTurnNumber) {
-              yield* Effect.logDebug("arena.turn.redelivery_already_enqueued");
+            // idempotency
+            // - normal case: currentTurnNumber + 1 == job.turnNumber
+            // - retry case: currentTurnNumber == job.turnNumber (turn was processed but enqueue/ack may have failed)
+            if (room.currentTurnNumber === job.turnNumber) {
+              // This is a redelivery after the turn already advanced in D1, likely due to
+              // a crash between enqueue+ack.
+              const nextTurnNumber = job.turnNumber + 1;
+              if (room.lastEnqueuedTurnNumber >= nextTurnNumber) {
+                yield* Effect.logDebug("arena.turn.redelivery_already_enqueued");
+                return null;
+              }
+              yield* Effect.logInfo("arena.turn.redelivery_reenqueue_next");
+              return { roomId: room.id, turnNumber: nextTurnNumber } as const;
+            }
+            if (room.currentTurnNumber + 1 !== job.turnNumber) {
+              yield* Effect.logDebug("arena.turn.idempotent_drop");
               return null;
             }
-            yield* Effect.logInfo("arena.turn.redelivery_reenqueue_next");
-            return { roomId: room.id, turnNumber: nextTurnNumber } as const;
-          }
-          if (room.currentTurnNumber + 1 !== job.turnNumber) {
-            yield* Effect.logDebug("arena.turn.idempotent_drop");
-            return null;
-          }
 
-          const agent = yield* dbTry(() =>
-            db.select().from(agents).where(eq(agents.id, room.currentTurnAgentId)).get(),
-          );
-          if (!agent) return yield* AgentNotFound.make({ agentId: room.currentTurnAgentId });
+            const agent = yield* dbTry(() =>
+              db.select().from(agents).where(eq(agents.id, room.currentTurnAgentId)).get(),
+            );
+            if (!agent) return yield* AgentNotFound.make({ agentId: room.currentTurnAgentId });
 
-          yield* turnEvents.write({
-            roomId: room.id,
-            turnNumber: job.turnNumber,
-            phase: "start",
-            status: "info",
-            data: { agentId: agent.id, threadId: room.threadId },
-          });
+            yield* turnEvents.write({
+              roomId: room.id,
+              turnNumber: job.turnNumber,
+              phase: "start",
+              status: "info",
+              data: { agentId: agent.id, threadId: room.threadId },
+            });
 
-          // webhook info (used for both sync classification and posting)
-          const webhook = yield* dbTry(() =>
-            db
-              .select()
-              .from(discordChannels)
-              .where(eq(discordChannels.channelId, room.parentChannelId))
-              .get(),
-          );
+            const notifyFinalFailure = (
+              source: string,
+              error: unknown,
+            ): Effect.Effect<void, never> =>
+              discord.postMessage(room.threadId, turnFailedNotification).pipe(
+                (eff) =>
+                  retryWithBackoff(eff, { maxRetries: 3, isRetryable: isRetryableDiscordError }),
+                Effect.tap(() =>
+                  turnEvents.write({
+                    roomId: room.id,
+                    turnNumber: job.turnNumber,
+                    phase: "final_failure_notify",
+                    status: "ok",
+                    data: { source },
+                  }),
+                ),
+                Effect.catchAll((notifyErr) =>
+                  turnEvents
+                    .write({
+                      roomId: room.id,
+                      turnNumber: job.turnNumber,
+                      phase: "final_failure_notify",
+                      status: "fail",
+                      data: {
+                        source,
+                        error: errorLabel(notifyErr),
+                        originalError: errorLabel(error),
+                      },
+                    })
+                    .pipe(Effect.asVoid),
+                ),
+                Effect.asVoid,
+              );
 
-          // Sync recent Discord thread history into D1.
-          //
-          // If DISCORD_BOT_TOKEN is missing, Discord.fetchRecentMessages fails with
-          // MissingDiscordConfig — we intentionally skip sync and keep using D1-only history.
-          //
-          // Any other Discord API failure should fail the turn (and let the queue retry),
-          // because Discord is the source of truth for room history.
-          const discordMessages = yield* discord
-            .fetchRecentMessages(room.threadId, historyLimit)
-            .pipe(
-              Effect.tap((msgs) =>
-                turnEvents.write({
+            // webhook info (used for both sync classification and posting)
+            const webhook = yield* dbTry(() =>
+              db
+                .select()
+                .from(discordChannels)
+                .where(eq(discordChannels.channelId, room.parentChannelId))
+                .get(),
+            );
+
+            const logThreadWarning = (action: "lock" | "unlock") => (e: unknown) =>
+              Effect.logWarning(`discord.thread.${action}.failed`).pipe(
+                Effect.annotateLogs({
+                  error: errorLabel(e),
                   roomId: room.id,
+                  threadId: room.threadId,
                   turnNumber: job.turnNumber,
-                  phase: "discord_sync",
-                  status: "ok",
-                  data: { fetched: msgs.length },
                 }),
-              ),
-              Effect.catchTag("MissingDiscordConfig", () =>
-                turnEvents
-                  .write({
+                Effect.asVoid,
+              );
+
+            // Lock the thread for the duration of agent processing.
+            //
+            // Errors are logged but must not fail the turn.
+            yield* Effect.acquireRelease(
+              retryWithBackoff(discord.lockThread(room.threadId), {
+                maxRetries: 3,
+                isRetryable: isRetryableDiscordError,
+              }).pipe(Effect.catchAll(logThreadWarning("lock")), Effect.as(room.threadId)),
+              (threadId) =>
+                retryWithBackoff(discord.unlockThread(threadId), {
+                  maxRetries: 3,
+                  isRetryable: isRetryableDiscordError,
+                }).pipe(Effect.catchAll(logThreadWarning("unlock")), Effect.asVoid),
+            );
+
+            // Sync recent Discord thread history into D1.
+            //
+            // If DISCORD_BOT_TOKEN is missing, Discord.fetchRecentMessages fails with
+            // MissingDiscordConfig — we intentionally skip sync and keep using D1-only history.
+            //
+            // Any other Discord API failure should fail the turn (and let the queue retry),
+            // because Discord is the source of truth for room history.
+            const discordMessages = yield* discord
+              .fetchRecentMessages(room.threadId, historyLimit)
+              .pipe(
+                Effect.tap((msgs) =>
+                  turnEvents.write({
                     roomId: room.id,
                     turnNumber: job.turnNumber,
                     phase: "discord_sync",
-                    status: "info",
-                    data: { skipped: true },
-                  })
-                  .pipe(Effect.as(null)),
-              ),
-              Effect.tapError((e) =>
-                turnEvents.write({
-                  roomId: room.id,
-                  turnNumber: job.turnNumber,
-                  phase: "discord_sync",
-                  status: "fail",
-                  data: {
-                    error: errorLabel(e),
-                  },
-                }),
-              ),
-              Effect.withLogSpan("discord.sync"),
-            );
-
-          yield* Effect.logDebug("discord.sync.fetched").pipe(
-            Effect.annotateLogs({
-              discordFetched: discordMessages ? discordMessages.length : 0,
-            }),
-          );
-
-          if (discordMessages) {
-            const agentNameToId = new Map(
-              (yield* dbTry(() =>
-                db.select({ id: agents.id, name: agents.name }).from(agents).all(),
-              )).map((a) => [a.name, a.id] as const),
-            );
-
-            const ordered = discordMessages
-              .map((m) => ({ m, createdAtMs: Date.parse(m.timestamp) }))
-              .filter((x) => Number.isFinite(x.createdAtMs))
-              .sort((a, b) => a.createdAtMs - b.createdAtMs);
-
-            yield* Effect.logDebug("discord.sync.upsert").pipe(
-              Effect.annotateLogs({ discordUpserted: ordered.length }),
-            );
-
-            const needsBotUserId = ordered.some(
-              ({ m }) => m.webhook_id === undefined && m.author.bot === true,
-            );
-            const botUserId = needsBotUserId
-              ? yield* discord
-                  .getBotUserId()
-                  .pipe(Effect.catchTag("MissingDiscordConfig", () => Effect.succeed(null)))
-              : null;
-
-            for (const { m, createdAtMs } of ordered) {
-              const isWebhookMessage = m.webhook_id !== undefined;
-              const isNotification =
-                !isWebhookMessage && botUserId !== null && m.author.id === botUserId;
-              const isModerator = isNotification && isModeratorMessage(m.content);
-
-              const authorType = isWebhookMessage
-                ? ("agent" as const)
-                : isModerator
-                  ? ("moderator" as const)
-                  : isNotification
-                    ? ("notification" as const)
-                    : ("audience" as const);
-
-              const authorAgentId =
-                authorType === "agent" ? agentNameToId.get(m.author.username) : undefined;
-
-              yield* dbTry(() =>
-                db
-                  .insert(messages)
-                  .values({
-                    roomId: room.id,
-                    discordMessageId: m.id,
-                    threadId: room.threadId,
-                    authorType,
-                    authorAgentId: authorAgentId ?? null,
-                    content: m.content,
-                    createdAtMs,
-                  })
-                  .onConflictDoUpdate({
-                    target: messages.discordMessageId,
-                    set: {
+                    status: "ok",
+                    data: { fetched: msgs.length },
+                  }),
+                ),
+                Effect.catchTag("MissingDiscordConfig", () =>
+                  turnEvents
+                    .write({
                       roomId: room.id,
+                      turnNumber: job.turnNumber,
+                      phase: "discord_sync",
+                      status: "info",
+                      data: { skipped: true },
+                    })
+                    .pipe(Effect.as(null)),
+                ),
+                Effect.tapError((e) =>
+                  turnEvents.write({
+                    roomId: room.id,
+                    turnNumber: job.turnNumber,
+                    phase: "discord_sync",
+                    status: "fail",
+                    data: {
+                      error: errorLabel(e),
+                    },
+                  }),
+                ),
+                Effect.withLogSpan("discord.sync"),
+              );
+
+            yield* Effect.logDebug("discord.sync.fetched").pipe(
+              Effect.annotateLogs({
+                discordFetched: discordMessages ? discordMessages.length : 0,
+              }),
+            );
+
+            if (discordMessages) {
+              const agentNameToId = new Map(
+                (yield* dbTry(() =>
+                  db.select({ id: agents.id, name: agents.name }).from(agents).all(),
+                )).map((a) => [a.name, a.id] as const),
+              );
+
+              const ordered = discordMessages
+                .map((m) => ({ m, createdAtMs: Date.parse(m.timestamp) }))
+                .filter((x) => Number.isFinite(x.createdAtMs))
+                .sort((a, b) => a.createdAtMs - b.createdAtMs);
+
+              yield* Effect.logDebug("discord.sync.upsert").pipe(
+                Effect.annotateLogs({ discordUpserted: ordered.length }),
+              );
+
+              const needsBotUserId = ordered.some(
+                ({ m }) => m.webhook_id === undefined && m.author.bot === true,
+              );
+              const botUserId = needsBotUserId
+                ? yield* discord
+                    .getBotUserId()
+                    .pipe(Effect.catchTag("MissingDiscordConfig", () => Effect.succeed(null)))
+                : null;
+
+              for (const { m, createdAtMs } of ordered) {
+                const isWebhookMessage = m.webhook_id !== undefined;
+                const isNotification =
+                  !isWebhookMessage && botUserId !== null && m.author.id === botUserId;
+                const isModerator = isNotification && isModeratorMessage(m.content);
+
+                const authorType = isWebhookMessage
+                  ? ("agent" as const)
+                  : isModerator
+                    ? ("moderator" as const)
+                    : isNotification
+                      ? ("notification" as const)
+                      : ("audience" as const);
+
+                const authorAgentId =
+                  authorType === "agent" ? agentNameToId.get(m.author.username) : undefined;
+
+                yield* dbTry(() =>
+                  db
+                    .insert(messages)
+                    .values({
+                      roomId: room.id,
+                      discordMessageId: m.id,
                       threadId: room.threadId,
                       authorType,
                       authorAgentId: authorAgentId ?? null,
                       content: m.content,
                       createdAtMs,
-                    },
-                  })
-                  .run(),
-              );
+                    })
+                    .onConflictDoUpdate({
+                      target: messages.discordMessageId,
+                      set: {
+                        roomId: room.id,
+                        threadId: room.threadId,
+                        authorType,
+                        authorAgentId: authorAgentId ?? null,
+                        content: m.content,
+                        createdAtMs,
+                      },
+                    })
+                    .run(),
+                );
+              }
             }
-          }
 
-          // bounded history (timestamp-based due to sync inserts)
-          // We intentionally load more than `historyLimit` so that we can filter out
-          // notifications + local-turn duplicates without losing context.
-          const rawHistoryLimit = Math.max(historyLimit * 3, 60);
-          const rawHistory = yield* dbTry(() =>
-            db
-              .select()
-              .from(messages)
-              .where(eq(messages.roomId, room.id))
-              .orderBy(desc(messages.createdAtMs), desc(messages.id))
-              .limit(rawHistoryLimit)
-              .all(),
-          );
-
-          const nonLocalAgentMessages = rawHistory.filter(
-            (m) => m.authorType === "agent" && !m.discordMessageId.startsWith("local-turn:"),
-          );
-
-          const localTurnDedupeWindowMs = 30 * 60 * 1000;
-          const localTurnDedupeAllowEarlyMs = 30 * 1000;
-
-          const promptHistory = rawHistory
-            .slice()
-            .reverse()
-            .filter((m) => m.authorType !== "notification")
-            .filter((m) => {
-              // Prefer synced Discord webhook messages over their local-turn duplicates, but
-              // keep local-turn messages when we don't have a synced copy yet.
-              if (m.authorType !== "agent") return true;
-              if (!m.discordMessageId.startsWith("local-turn:")) return true;
-
-              const isDuplicate = nonLocalAgentMessages.some((x) => {
-                if (x.content !== m.content) return false;
-                const dt = x.createdAtMs - m.createdAtMs;
-                if (dt < -localTurnDedupeAllowEarlyMs) return false;
-                if (dt > localTurnDedupeWindowMs) return false;
-                if (m.authorAgentId && x.authorAgentId && x.authorAgentId !== m.authorAgentId) {
-                  return false;
-                }
-                return true;
-              });
-
-              return !isDuplicate;
-            })
-            .slice(-historyLimit);
-
-          yield* Effect.logDebug("prompt.built").pipe(
-            Effect.annotateLogs({ promptMessages: promptHistory.length }),
-          );
-
-          const agentNameById = new Map(
-            (yield* dbTry(() =>
-              db.select({ id: agents.id, name: agents.name }).from(agents).all(),
-            )).map((a) => [a.id, a.name] as const),
-          );
-
-          const getAgentName = (agentId: string | null | undefined): string =>
-            (agentId ? agentNameById.get(agentId) : undefined) ?? "Unknown";
-
-          const getNonAgentName = (
-            m: { readonly authorType: string } & Record<string, unknown>,
-          ): string => {
-            const explicit = m["authorName"];
-            if (typeof explicit === "string" && explicit.trim().length > 0) return explicit;
-            if (m.authorType === "audience") return "Audience";
-            if (m.authorType === "moderator") return "Moderator";
-            return "Unknown";
-          };
-
-          const prompt = buildPrompt(
-            { title: room.title, topic: room.topic },
-            { systemPrompt: agent.systemPrompt },
-            promptHistory.map((m) => ({
-              authorType: m.authorType,
-              authorName:
-                m.authorType === "agent" ? getAgentName(m.authorAgentId) : getNonAgentName(m),
-              content: m.content,
-            })),
-          );
-
-          // deterministic id to make turn replay idempotent
-          const discordMessageId = `local-turn:${room.id}:${job.turnNumber}`;
-
-          const existingReply = yield* dbTry(() =>
-            db
-              .select({ content: messages.content, createdAtMs: messages.createdAtMs })
-              .from(messages)
-              .where(eq(messages.discordMessageId, discordMessageId))
-              .get(),
-          );
-
-          let reply: string;
-          let replyCreatedAtMs: number;
-
-          if (existingReply) {
-            // queue retry: reuse persisted content and skip LLM call
-            reply = existingReply.content;
-            replyCreatedAtMs = existingReply.createdAtMs;
-            yield* Effect.logDebug("llm.generate.skip_existing").pipe(
-              Effect.annotateLogs({ replyChars: reply.length }),
-            );
-          } else {
-            // thinking delay (basic anti-spam)
-            yield* Effect.sleep("3 seconds");
-
-            yield* turnEvents.write({
-              roomId: room.id,
-              turnNumber: job.turnNumber,
-              phase: "llm_start",
-              status: "info",
-              data: { llmProvider: agent.llmProvider, llmModel: agent.llmModel },
-            });
-
-            reply = yield* llmRouter
-              .generate({
-                provider: agent.llmProvider,
-                model: agent.llmModel,
-                prompt,
-              })
-              .pipe(
-                Effect.tap((r) =>
-                  turnEvents.write({
-                    roomId: room.id,
-                    turnNumber: job.turnNumber,
-                    phase: "llm_ok",
-                    status: "ok",
-                    data: { replyChars: r.length },
-                  }),
-                ),
-                Effect.tapError((e) =>
-                  turnEvents.write({
-                    roomId: room.id,
-                    turnNumber: job.turnNumber,
-                    phase: "llm_fail",
-                    status: "fail",
-                    data: { error: errorLabel(e) },
-                  }),
-                ),
-                Effect.withLogSpan("llm.generate"),
-              );
-
-            yield* Effect.logInfo("llm.generate.ok").pipe(
-              Effect.annotateLogs({
-                llmProvider: agent.llmProvider,
-                llmModel: agent.llmModel,
-                replyChars: reply.length,
-              }),
-            );
-
-            const now = yield* nowMs;
-            replyCreatedAtMs = now;
-            yield* dbTry(() =>
+            // bounded history (timestamp-based due to sync inserts)
+            // We intentionally load more than `historyLimit` so that we can filter out
+            // notifications + local-turn duplicates without losing context.
+            const rawHistoryLimit = Math.max(historyLimit * 3, 60);
+            const rawHistory = yield* dbTry(() =>
               db
-                .insert(messages)
-                .values({
-                  roomId: room.id,
-                  discordMessageId,
-                  threadId: room.threadId,
-                  authorType: "agent",
-                  authorAgentId: agent.id,
-                  content: reply,
-                  createdAtMs: now,
-                })
-                .onConflictDoNothing({ target: messages.discordMessageId })
-                .run(),
-            );
-
-            // Trim history to avoid unbounded growth
-            yield* dbTry(async () => {
-              const countRow = await db
-                .select({ c: sql<number>`count(*)` })
-                .from(messages)
-                .where(eq(messages.roomId, room.id))
-                .get();
-
-              const count = countRow ? Number(countRow.c) : 0;
-              const maxKeep = Math.max(historyLimit * 3, 60);
-              if (count <= maxKeep) return;
-
-              const cutoff = await db
-                .select({ id: messages.id, createdAtMs: messages.createdAtMs })
+                .select()
                 .from(messages)
                 .where(eq(messages.roomId, room.id))
                 .orderBy(desc(messages.createdAtMs), desc(messages.id))
-                .offset(maxKeep)
-                .limit(1)
-                .get();
+                .limit(rawHistoryLimit)
+                .all(),
+            );
 
-              if (!cutoff) return;
+            const nonLocalAgentMessages = rawHistory.filter(
+              (m) => m.authorType === "agent" && !m.discordMessageId.startsWith("local-turn:"),
+            );
 
-              await db
-                .delete(messages)
-                .where(
-                  and(
-                    eq(messages.roomId, room.id),
-                    or(
-                      lt(messages.createdAtMs, cutoff.createdAtMs),
-                      and(eq(messages.createdAtMs, cutoff.createdAtMs), lt(messages.id, cutoff.id)),
+            const localTurnDedupeWindowMs = 30 * 60 * 1000;
+            const localTurnDedupeAllowEarlyMs = 30 * 1000;
+
+            const promptHistory = rawHistory
+              .slice()
+              .reverse()
+              .filter((m) => m.authorType !== "notification")
+              .filter((m) => {
+                // Prefer synced Discord webhook messages over their local-turn duplicates, but
+                // keep local-turn messages when we don't have a synced copy yet.
+                if (m.authorType !== "agent") return true;
+                if (!m.discordMessageId.startsWith("local-turn:")) return true;
+
+                const isDuplicate = nonLocalAgentMessages.some((x) => {
+                  if (x.content !== m.content) return false;
+                  const dt = x.createdAtMs - m.createdAtMs;
+                  if (dt < -localTurnDedupeAllowEarlyMs) return false;
+                  if (dt > localTurnDedupeWindowMs) return false;
+                  if (m.authorAgentId && x.authorAgentId && x.authorAgentId !== m.authorAgentId) {
+                    return false;
+                  }
+                  return true;
+                });
+
+                return !isDuplicate;
+              })
+              .slice(-historyLimit);
+
+            yield* Effect.logDebug("prompt.built").pipe(
+              Effect.annotateLogs({ promptMessages: promptHistory.length }),
+            );
+
+            const agentNameById = new Map(
+              (yield* dbTry(() =>
+                db.select({ id: agents.id, name: agents.name }).from(agents).all(),
+              )).map((a) => [a.id, a.name] as const),
+            );
+
+            const getAgentName = (agentId: string | null | undefined): string =>
+              (agentId ? agentNameById.get(agentId) : undefined) ?? "Unknown";
+
+            const getNonAgentName = (
+              m: { readonly authorType: string } & Record<string, unknown>,
+            ): string => {
+              const explicit = m["authorName"];
+              if (typeof explicit === "string" && explicit.trim().length > 0) return explicit;
+              if (m.authorType === "audience") return "Audience";
+              if (m.authorType === "moderator") return "Moderator";
+              return "Unknown";
+            };
+
+            const prompt = buildPrompt(
+              { title: room.title, topic: room.topic },
+              { systemPrompt: agent.systemPrompt },
+              promptHistory.map((m) => ({
+                authorType: m.authorType,
+                authorName:
+                  m.authorType === "agent" ? getAgentName(m.authorAgentId) : getNonAgentName(m),
+                content: m.content,
+              })),
+            );
+
+            // deterministic id to make turn replay idempotent
+            const discordMessageId = `local-turn:${room.id}:${job.turnNumber}`;
+
+            const existingReply = yield* dbTry(() =>
+              db
+                .select({ content: messages.content, createdAtMs: messages.createdAtMs })
+                .from(messages)
+                .where(eq(messages.discordMessageId, discordMessageId))
+                .get(),
+            );
+
+            let reply: string;
+            let replyCreatedAtMs: number;
+
+            if (existingReply) {
+              // queue retry: reuse persisted content and skip LLM call
+              reply = existingReply.content;
+              replyCreatedAtMs = existingReply.createdAtMs;
+              yield* Effect.logDebug("llm.generate.skip_existing").pipe(
+                Effect.annotateLogs({ replyChars: reply.length }),
+              );
+            } else {
+              // thinking delay (basic anti-spam)
+              yield* Effect.sleep("3 seconds");
+
+              yield* turnEvents.write({
+                roomId: room.id,
+                turnNumber: job.turnNumber,
+                phase: "llm_start",
+                status: "info",
+                data: { llmProvider: agent.llmProvider, llmModel: agent.llmModel },
+              });
+
+              const llmResult = yield* retryWithBackoff(
+                llmRouter.generate({
+                  provider: agent.llmProvider,
+                  model: agent.llmModel,
+                  prompt,
+                }),
+                { maxRetries: 3, isRetryable: isRetryableLlmError },
+              ).pipe(Effect.withLogSpan("llm.generate"), Effect.either);
+
+              if (Either.isLeft(llmResult)) {
+                const e = llmResult.left;
+
+                yield* turnEvents.write({
+                  roomId: room.id,
+                  turnNumber: job.turnNumber,
+                  phase: "llm_fail",
+                  status: "fail",
+                  data: { error: errorLabel(e) },
+                });
+
+                yield* notifyFinalFailure("llm", e);
+
+                // Return normally so the queue does not keep retrying forever.
+                // The operator can restart via /kick.
+                yield* turnEvents.write({
+                  roomId: room.id,
+                  turnNumber: job.turnNumber,
+                  phase: "finish",
+                  status: "fail",
+                  data: { error: errorLabel(e), source: "llm" },
+                });
+
+                return null;
+              }
+
+              reply = llmResult.right;
+
+              yield* turnEvents.write({
+                roomId: room.id,
+                turnNumber: job.turnNumber,
+                phase: "llm_ok",
+                status: "ok",
+                data: { replyChars: reply.length },
+              });
+
+              yield* Effect.logInfo("llm.generate.ok").pipe(
+                Effect.annotateLogs({
+                  llmProvider: agent.llmProvider,
+                  llmModel: agent.llmModel,
+                  replyChars: reply.length,
+                }),
+              );
+
+              const now = yield* nowMs;
+              replyCreatedAtMs = now;
+              yield* dbTry(() =>
+                db
+                  .insert(messages)
+                  .values({
+                    roomId: room.id,
+                    discordMessageId,
+                    threadId: room.threadId,
+                    authorType: "agent",
+                    authorAgentId: agent.id,
+                    content: reply,
+                    createdAtMs: now,
+                  })
+                  .onConflictDoNothing({ target: messages.discordMessageId })
+                  .run(),
+              );
+
+              // Trim history to avoid unbounded growth
+              yield* dbTry(async () => {
+                const countRow = await db
+                  .select({ c: sql<number>`count(*)` })
+                  .from(messages)
+                  .where(eq(messages.roomId, room.id))
+                  .get();
+
+                const count = countRow ? Number(countRow.c) : 0;
+                const maxKeep = Math.max(historyLimit * 3, 60);
+                if (count <= maxKeep) return;
+
+                const cutoff = await db
+                  .select({ id: messages.id, createdAtMs: messages.createdAtMs })
+                  .from(messages)
+                  .where(eq(messages.roomId, room.id))
+                  .orderBy(desc(messages.createdAtMs), desc(messages.id))
+                  .offset(maxKeep)
+                  .limit(1)
+                  .get();
+
+                if (!cutoff) return;
+
+                await db
+                  .delete(messages)
+                  .where(
+                    and(
+                      eq(messages.roomId, room.id),
+                      or(
+                        lt(messages.createdAtMs, cutoff.createdAtMs),
+                        and(
+                          eq(messages.createdAtMs, cutoff.createdAtMs),
+                          lt(messages.id, cutoff.id),
+                        ),
+                      ),
                     ),
-                  ),
-                )
-                .run();
-            });
-          }
+                  )
+                  .run();
+              });
+            }
 
-          // Post to Discord if we have a webhook for this room's parent channel.
-          //
-          // When the queue retries a turn after we already successfully posted, we need to avoid
-          // duplicating the Discord message.
-          let alreadyPostedToDiscord = false;
-          let alreadyPostedInDiscordThread = false;
+            // Post to Discord if we have a webhook for this room's parent channel.
+            //
+            // When the queue retries a turn after we already successfully posted, we need to avoid
+            // duplicating the Discord message.
+            let alreadyPostedToDiscord = false;
+            let alreadyPostedInDiscordThread = false;
 
-          if (existingReply) {
-            alreadyPostedToDiscord = rawHistory.some((m) => {
-              if (m.authorType !== "agent") return false;
-              if (m.discordMessageId.startsWith("local-turn:")) return false;
-              if (m.content !== reply) return false;
-              const dt = m.createdAtMs - replyCreatedAtMs;
-              if (dt < -localTurnDedupeAllowEarlyMs) return false;
-              if (dt > localTurnDedupeWindowMs) return false;
-              if (m.authorAgentId !== agent.id) return false;
-              return true;
-            });
-
-            alreadyPostedInDiscordThread =
-              !alreadyPostedToDiscord &&
-              !!discordMessages &&
-              discordMessages.some((m) => {
-                if (m.webhook_id === undefined) return false;
+            if (existingReply) {
+              alreadyPostedToDiscord = rawHistory.some((m) => {
+                if (m.authorType !== "agent") return false;
+                if (m.discordMessageId.startsWith("local-turn:")) return false;
                 if (m.content !== reply) return false;
-                if (m.author.username !== agent.name) return false;
-                const createdAtMs = Date.parse(m.timestamp);
-                if (!Number.isFinite(createdAtMs)) return false;
-                const dt = createdAtMs - replyCreatedAtMs;
+                const dt = m.createdAtMs - replyCreatedAtMs;
                 if (dt < -localTurnDedupeAllowEarlyMs) return false;
                 if (dt > localTurnDedupeWindowMs) return false;
+                if (m.authorAgentId !== agent.id) return false;
                 return true;
               });
-          }
 
-          if (webhook && !(alreadyPostedToDiscord || alreadyPostedInDiscordThread)) {
-            yield* webhookPoster
-              .post({
-                webhook: { id: webhook.webhookId, token: webhook.webhookToken },
-                threadId: room.threadId,
-                content: reply,
-                username: agent.name,
-                ...(agent.avatarUrl ? { avatarUrl: agent.avatarUrl } : {}),
-              })
-              .pipe(
-                Effect.tap(() =>
-                  turnEvents.write({
-                    roomId: room.id,
-                    turnNumber: job.turnNumber,
-                    phase: "webhook_post_ok",
-                    status: "ok",
-                  }),
-                ),
-                Effect.tapError((e) =>
-                  turnEvents.write({
-                    roomId: room.id,
-                    turnNumber: job.turnNumber,
-                    phase: "webhook_post_fail",
-                    status: "fail",
-                    data: { error: errorLabel(e) },
-                  }),
-                ),
-                Effect.withLogSpan("discord.webhook.post"),
+              alreadyPostedInDiscordThread =
+                !alreadyPostedToDiscord &&
+                !!discordMessages &&
+                discordMessages.some((m) => {
+                  if (m.webhook_id === undefined) return false;
+                  if (m.content !== reply) return false;
+                  if (m.author.username !== agent.name) return false;
+                  const createdAtMs = Date.parse(m.timestamp);
+                  if (!Number.isFinite(createdAtMs)) return false;
+                  const dt = createdAtMs - replyCreatedAtMs;
+                  if (dt < -localTurnDedupeAllowEarlyMs) return false;
+                  if (dt > localTurnDedupeWindowMs) return false;
+                  return true;
+                });
+            }
+
+            if (webhook && !(alreadyPostedToDiscord || alreadyPostedInDiscordThread)) {
+              const postResult = yield* retryWithBackoff(
+                webhookPoster.post({
+                  webhook: { id: webhook.webhookId, token: webhook.webhookToken },
+                  threadId: room.threadId,
+                  content: reply,
+                  username: agent.name,
+                  ...(agent.avatarUrl ? { avatarUrl: agent.avatarUrl } : {}),
+                }),
+                { maxRetries: 3, isRetryable: isRetryableDiscordWebhookError },
+              ).pipe(Effect.withLogSpan("discord.webhook.post"), Effect.either);
+
+              if (Either.isLeft(postResult)) {
+                const e = postResult.left;
+
+                yield* turnEvents.write({
+                  roomId: room.id,
+                  turnNumber: job.turnNumber,
+                  phase: "webhook_post_fail",
+                  status: "fail",
+                  data: { error: errorLabel(e) },
+                });
+
+                yield* notifyFinalFailure("webhook_post", e);
+
+                yield* turnEvents.write({
+                  roomId: room.id,
+                  turnNumber: job.turnNumber,
+                  phase: "finish",
+                  status: "fail",
+                  data: { error: errorLabel(e), source: "webhook_post" },
+                });
+
+                return null;
+              }
+
+              yield* turnEvents.write({
+                roomId: room.id,
+                turnNumber: job.turnNumber,
+                phase: "webhook_post_ok",
+                status: "ok",
+              });
+
+              yield* Effect.logInfo("discord.webhook.posted");
+            } else if (webhook) {
+              yield* Effect.logDebug("discord.webhook.skip_duplicate");
+            } else {
+              yield* Effect.logDebug("discord.webhook.skip_missing");
+            }
+
+            const shouldStop =
+              reply.toLowerCase().includes("goodbye") || job.turnNumber >= maxTurns;
+            if (shouldStop) {
+              yield* dbTry(() =>
+                db
+                  .update(rooms)
+                  .set({ status: "paused", currentTurnNumber: job.turnNumber })
+                  .where(eq(rooms.id, room.id))
+                  .run(),
               );
-            yield* Effect.logInfo("discord.webhook.posted");
-          } else if (webhook) {
-            yield* Effect.logDebug("discord.webhook.skip_duplicate");
-          } else {
-            yield* Effect.logDebug("discord.webhook.skip_missing");
-          }
 
-          const shouldStop = reply.toLowerCase().includes("goodbye") || job.turnNumber >= maxTurns;
-          if (shouldStop) {
+              yield* turnEvents.write({
+                roomId: room.id,
+                turnNumber: job.turnNumber,
+                phase: "finish",
+                status: "ok",
+                data: { stopped: true },
+              });
+
+              return null;
+            }
+
+            const participants = yield* dbTry(() =>
+              db
+                .select()
+                .from(roomAgents)
+                .where(eq(roomAgents.roomId, room.id))
+                .orderBy(asc(roomAgents.turnOrder))
+                .all(),
+            );
+
+            const idx = Math.max(
+              0,
+              participants.findIndex((p) => p.agentId === agent.id),
+            );
+            const next = participants[(idx + 1) % participants.length];
+
             yield* dbTry(() =>
               db
                 .update(rooms)
-                .set({ status: "paused", currentTurnNumber: job.turnNumber })
+                .set({ currentTurnNumber: job.turnNumber, currentTurnAgentId: next.agentId })
                 .where(eq(rooms.id, room.id))
                 .run(),
             );
@@ -838,53 +1032,20 @@ export class ArenaService extends Context.Tag("@agon/ArenaService")<
               turnNumber: job.turnNumber,
               phase: "finish",
               status: "ok",
-              data: { stopped: true },
+              data: { nextTurnNumber: job.turnNumber + 1, nextAgentId: next.agentId },
             });
 
-            return null;
-          }
-
-          const participants = yield* dbTry(() =>
-            db
-              .select()
-              .from(roomAgents)
-              .where(eq(roomAgents.roomId, room.id))
-              .orderBy(asc(roomAgents.turnOrder))
-              .all(),
-          );
-
-          const idx = Math.max(
-            0,
-            participants.findIndex((p) => p.agentId === agent.id),
-          );
-          const next = participants[(idx + 1) % participants.length];
-
-          yield* dbTry(() =>
-            db
-              .update(rooms)
-              .set({ currentTurnNumber: job.turnNumber, currentTurnAgentId: next.agentId })
-              .where(eq(rooms.id, room.id))
-              .run(),
-          );
-
-          yield* turnEvents.write({
-            roomId: room.id,
-            turnNumber: job.turnNumber,
-            phase: "finish",
-            status: "ok",
-            data: { nextTurnNumber: job.turnNumber + 1, nextAgentId: next.agentId },
-          });
-
-          return { roomId: room.id, turnNumber: job.turnNumber + 1 } as const;
-        }).pipe(
-          Effect.tapError((e) =>
-            turnEvents.write({
-              roomId: job.roomId,
-              turnNumber: job.turnNumber,
-              phase: "finish",
-              status: "fail",
-              data: { error: errorLabel(e) },
-            }),
+            return { roomId: room.id, turnNumber: job.turnNumber + 1 } as const;
+          }).pipe(
+            Effect.tapError((e) =>
+              turnEvents.write({
+                roomId: job.roomId,
+                turnNumber: job.turnNumber,
+                phase: "finish",
+                status: "fail",
+                data: { error: errorLabel(e) },
+              }),
+            ),
           ),
         ),
       );

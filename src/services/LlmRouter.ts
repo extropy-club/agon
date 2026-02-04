@@ -5,7 +5,7 @@ import { AnthropicClient, AnthropicLanguageModel } from "@effect/ai-anthropic";
 import { GoogleClient, GoogleLanguageModel } from "@effect/ai-google";
 import { OpenAiClient, OpenAiLanguageModel } from "@effect/ai-openai";
 import * as FetchHttpClient from "@effect/platform/FetchHttpClient";
-import { Config, Context, Effect, Layer, Option, Redacted, Schedule, Schema } from "effect";
+import { Config, Context, Effect, Layer, Option, Redacted, Schema } from "effect";
 
 export const LlmProviderSchema = Schema.Literal("openai", "anthropic", "gemini", "openrouter");
 export type LlmProvider = typeof LlmProviderSchema.Type;
@@ -43,11 +43,6 @@ export class LlmRouter extends Context.Tag("@agon/LlmRouter")<
 
       const openRouterHttpReferer = yield* Config.option(Config.string("OPENROUTER_HTTP_REFERER"));
       const openRouterTitle = yield* Config.option(Config.string("OPENROUTER_TITLE"));
-
-      const retryPolicy = Schedule.exponential("200 millis").pipe(
-        Schedule.jittered,
-        Schedule.intersect(Schedule.recurs(2)),
-      );
 
       const sanitizeToken = (s: string) =>
         s
@@ -203,7 +198,6 @@ export class LlmRouter extends Context.Tag("@agon/LlmRouter")<
         if (args.provider === "openrouter") {
           return yield* openRouterGenerate(args.model, args.prompt, apiKey).pipe(
             Effect.timeout("30 seconds"),
-            Effect.retry(retryPolicy),
             Effect.mapError((cause) => LlmCallFailed.make({ provider: args.provider, cause })),
           );
         }
@@ -218,7 +212,6 @@ export class LlmRouter extends Context.Tag("@agon/LlmRouter")<
           Effect.provide(modelLayer),
           Effect.map((r) => r.text.trim()),
           Effect.timeout("30 seconds"),
-          Effect.retry(retryPolicy),
           Effect.mapError((cause) => LlmCallFailed.make({ provider: args.provider, cause })),
         );
       });

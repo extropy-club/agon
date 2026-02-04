@@ -121,6 +121,18 @@ export class Discord extends Context.Tag("@agon/Discord")<
      * Prefers DISCORD_BOT_USER_ID config when provided, otherwise fetches /users/@me.
      */
     readonly getBotUserId: () => Effect.Effect<string, DiscordError>;
+
+    /**
+     * Lock a thread to prevent non-bot users from sending messages.
+     *
+     * Requires the bot to have the MANAGE_THREADS permission in the parent channel.
+     */
+    readonly lockThread: (threadId: string) => Effect.Effect<void, DiscordError>;
+
+    /**
+     * Unlock a previously locked thread.
+     */
+    readonly unlockThread: (threadId: string) => Effect.Effect<void, DiscordError>;
   }
 >() {
   static readonly layer = Layer.effect(
@@ -250,6 +262,27 @@ export class Discord extends Context.Tag("@agon/Discord")<
           Effect.mapError((e) => e as DiscordError),
         );
 
+      const setThreadLocked = (threadId: string, locked: boolean) =>
+        requireBotToken(botToken).pipe(
+          Effect.map(authHeader),
+          Effect.flatMap((Authorization) =>
+            requestJson<DiscordChannel>(`/channels/${threadId}`, {
+              method: "PATCH",
+              headers: {
+                Authorization,
+                "Content-Type": "application/json",
+              },
+              body: JSON.stringify({ locked }),
+            }),
+          ),
+          Effect.asVoid,
+          Effect.mapError((e) => e as DiscordError),
+        );
+
+      const lockThread = (threadId: string) => setThreadLocked(threadId, true);
+
+      const unlockThread = (threadId: string) => setThreadLocked(threadId, false);
+
       const postMessage = (channelId: string, content: string) =>
         requireBotToken(botToken).pipe(
           Effect.map(authHeader),
@@ -286,6 +319,8 @@ export class Discord extends Context.Tag("@agon/Discord")<
         createOrFetchWebhook,
         createPublicThread,
         fetchChannelName,
+        lockThread,
+        unlockThread,
         postMessage,
         fetchRecentMessages,
         getBotUserId,

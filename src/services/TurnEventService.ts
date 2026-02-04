@@ -10,6 +10,7 @@ export type TurnEventPhase =
   | "llm_fail"
   | "webhook_post_ok"
   | "webhook_post_fail"
+  | "final_failure_notify"
   | "finish";
 
 export type TurnEventStatus = "info" | "ok" | "fail";
