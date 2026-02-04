@@ -9,6 +9,12 @@ export const agents = sqliteTable("agents", {
     .notNull()
     .default("openai"),
   llmModel: text("llm_model").notNull().default("gpt-4o-mini"),
+
+  // Optional per-agent generation params (null => provider defaults)
+  temperature: text("temperature"),
+  maxTokens: integer("max_tokens"),
+  thinkingLevel: text("thinking_level", { enum: ["low", "medium", "high"] }),
+  thinkingBudgetTokens: integer("thinking_budget_tokens"),
 });
 
 export const rooms = sqliteTable("rooms", {
@@ -77,4 +83,10 @@ export const roomTurnEvents = sqliteTable("room_turn_events", {
   status: text("status").notNull(),
   createdAtMs: integer("created_at_ms").notNull(),
   dataJson: text("data_json"),
+});
+
+export const settings = sqliteTable("settings", {
+  key: text("key").primaryKey(),
+  value: text("value").notNull(),
+  updatedAtMs: integer("updated_at_ms").notNull(),
 });

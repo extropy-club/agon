@@ -1,0 +1,74 @@
+// Minimal AES-256-GCM helpers for Cloudflare Workers (Web Crypto API).
+//
+// Encrypted payload format: base64(iv + ciphertext + tag)
+// - iv: 12 bytes (96-bit) random
+// - ciphertext: variable
+// - tag: appended by Web Crypto to ciphertext (16 bytes for AES-GCM)
+
+const textEncoder = new TextEncoder();
+const textDecoder = new TextDecoder();
+
+// tsgo's lib set does not always include DOM's `KeyUsage`.
+type KeyUsage =
+  | "encrypt"
+  | "decrypt"
+  | "sign"
+  | "verify"
+  | "deriveKey"
+  | "deriveBits"
+  | "wrapKey"
+  | "unwrapKey";
+
+const base64Encode = (bytes: Uint8Array): string => {
+  let binary = "";
+  for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+  return btoa(binary);
+};
+
+const base64DecodeToBytes = (s: string): Uint8Array => {
+  const binary = atob(s);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+};
+
+export async function deriveKey(secret: string): Promise<CryptoKey> {
+  // Derive 32 bytes from the secret. We use SHA-256 to keep things simple.
+  const digest = await crypto.subtle.digest("SHA-256", textEncoder.encode(secret));
+
+  return crypto.subtle.importKey("raw", digest, { name: "AES-GCM" }, false, [
+    "encrypt",
+    "decrypt",
+  ] as KeyUsage[]);
+}
+
+export async function encrypt(plaintext: string, secret: string): Promise<string> {
+  const key = await deriveKey(secret);
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const encoded = textEncoder.encode(plaintext);
+
+  const ciphertext = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, encoded);
+  const cipherBytes = new Uint8Array(ciphertext);
+
+  const out = new Uint8Array(iv.length + cipherBytes.length);
+  out.set(iv, 0);
+  out.set(cipherBytes, iv.length);
+
+  return base64Encode(out);
+}
+
+export async function decrypt(encrypted: string, secret: string): Promise<string> {
+  const key = await deriveKey(secret);
+  const bytes = base64DecodeToBytes(encrypted);
+
+  if (bytes.length < 13) {
+    throw new Error("Invalid encrypted payload");
+  }
+
+  const iv = bytes.slice(0, 12);
+  const cipherBytes = bytes.slice(12);
+
+  const plaintext = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, cipherBytes);
+
+  return textDecoder.decode(plaintext);
+}

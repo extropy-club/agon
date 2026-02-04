@@ -5,7 +5,8 @@ import { AnthropicClient, AnthropicLanguageModel } from "@effect/ai-anthropic";
 import { GoogleClient, GoogleLanguageModel } from "@effect/ai-google";
 import { OpenAiClient, OpenAiLanguageModel } from "@effect/ai-openai";
 import * as FetchHttpClient from "@effect/platform/FetchHttpClient";
-import { Config, Context, Effect, Layer, Option, Redacted, Schema } from "effect";
+import { Context, Effect, Layer, Option, Redacted, Schema } from "effect";
+import { Settings } from "./Settings.js";
 
 export const LlmProviderSchema = Schema.Literal("openai", "anthropic", "gemini", "openrouter");
 export type LlmProvider = typeof LlmProviderSchema.Type;
@@ -35,14 +36,20 @@ export class LlmRouter extends Context.Tag("@agon/LlmRouter")<
   static readonly layer = Layer.effect(
     LlmRouter,
     Effect.gen(function* () {
-      // NOTE: we read API keys as optional so the app can boot even when only one provider is used.
-      const openAiApiKey = yield* Config.option(Config.redacted("OPENAI_API_KEY"));
-      const anthropicApiKey = yield* Config.option(Config.redacted("ANTHROPIC_API_KEY"));
-      const googleApiKey = yield* Config.option(Config.redacted("GOOGLE_AI_API_KEY"));
-      const openRouterApiKey = yield* Config.option(Config.redacted("OPENROUTER_API_KEY"));
+      const settings = yield* Settings;
 
-      const openRouterHttpReferer = yield* Config.option(Config.string("OPENROUTER_HTTP_REFERER"));
-      const openRouterTitle = yield* Config.option(Config.string("OPENROUTER_TITLE"));
+      // NOTE: we read API keys as optional so the app can boot even when only one provider is used.
+      const openAiApiKey = yield* settings.getSetting("OPENAI_API_KEY");
+      const anthropicApiKey = yield* settings.getSetting("ANTHROPIC_API_KEY");
+      const googleApiKey = yield* settings.getSetting("GOOGLE_AI_API_KEY");
+      const openRouterApiKey = yield* settings.getSetting("OPENROUTER_API_KEY");
+
+      const openRouterHttpReferer = yield* settings
+        .getSetting("OPENROUTER_HTTP_REFERER")
+        .pipe(Effect.map(Option.map((r) => Redacted.value(r))));
+      const openRouterTitle = yield* settings
+        .getSetting("OPENROUTER_TITLE")
+        .pipe(Effect.map(Option.map((r) => Redacted.value(r))));
 
       const sanitizeToken = (s: string) =>
         s

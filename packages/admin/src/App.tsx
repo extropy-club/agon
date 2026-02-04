@@ -8,6 +8,8 @@ const Rooms = lazy(() => import("./pages/Rooms"));
 const RoomDetail = lazy(() => import("./pages/RoomDetail"));
 const RoomComposer = lazy(() => import("./pages/RoomComposer"));
 const Metrics = lazy(() => import("./pages/Metrics"));
+const Settings = lazy(() => import("./pages/Settings"));
+const Guilds = lazy(() => import("./pages/Guilds"));
 
 function App(props: RouteSectionProps) {
   const [user] = createResource(authMe);
@@ -35,6 +37,12 @@ function App(props: RouteSectionProps) {
               <A href="/metrics" activeClass="active">
                 Metrics
               </A>
+              <A href="/settings" activeClass="active">
+                Settings
+              </A>
+              <A href="/guilds" activeClass="active">
+                Discord Servers
+              </A>
 
               <button class="logout-btn" onClick={() => authLogout().then(() => location.reload())}>
                 Logout
@@ -57,6 +65,8 @@ export default function AppRouter() {
       <Route path="/rooms/:id" component={RoomDetail} />
       <Route path="/agents" component={Agents} />
       <Route path="/metrics" component={Metrics} />
+      <Route path="/settings" component={Settings} />
+      <Route path="/guilds" component={Guilds} />
     </Route>
   );
 }

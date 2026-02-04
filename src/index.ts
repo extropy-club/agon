@@ -11,6 +11,7 @@ import {
   roomAgents,
   rooms,
   roomTurnEvents,
+  settings,
 } from "./d1/schema.js";
 import { ArenaService, type RoomTurnJob, type TurnJob } from "./services/ArenaService.js";
 import {
@@ -21,7 +22,9 @@ import {
 import { DiscordWebhookPoster } from "./services/DiscordWebhook.js";
 import { LlmRouterLive } from "./services/LlmRouter.js";
 import { Observability } from "./services/Observability.js";
+import { Settings } from "./services/Settings.js";
 import { TurnEventService } from "./services/TurnEventService.js";
+import { decrypt } from "./lib/crypto.js";
 import { signJwt, verifyJwt } from "./lib/jwt.js";
 
 export interface Env {
@@ -29,6 +32,8 @@ export interface Env {
   ARENA_QUEUE: Queue<RoomTurnJob>;
 
   // Optional runtime config (usually provided via .dev.vars / wrangler secrets)
+  ENCRYPTION_KEY?: string;
+
   DISCORD_PUBLIC_KEY?: string;
   DISCORD_BOT_TOKEN?: string;
   DISCORD_BOT_USER_ID?: string;
@@ -62,6 +67,16 @@ export interface Env {
   // Cloudflare Workers static assets binding (admin UI)
   ASSETS?: Fetcher;
 }
+
+const KNOWN_SETTINGS = [
+  { key: "OPENAI_API_KEY", label: "OpenAI API Key", sensitive: true },
+  { key: "OPENROUTER_API_KEY", label: "OpenRouter API Key", sensitive: true },
+  { key: "ANTHROPIC_API_KEY", label: "Anthropic API Key", sensitive: true },
+  { key: "GOOGLE_AI_API_KEY", label: "Google AI API Key", sensitive: true },
+  { key: "DISCORD_BOT_TOKEN", label: "Discord Bot Token", sensitive: true },
+  { key: "OPENROUTER_HTTP_REFERER", label: "OpenRouter HTTP Referer", sensitive: false },
+  { key: "OPENROUTER_TITLE", label: "OpenRouter Title", sensitive: false },
+] as const;
 
 const json = (status: number, body: unknown) =>
   new Response(JSON.stringify(body, null, 2), {
@@ -121,6 +136,7 @@ const makeConfigLayer = (env: Env) => {
   // IMPORTANT: secrets can be defined as non-enumerable properties on `env`,
   // so `Object.entries(env)` may miss them. We explicitly copy the ones we use.
   const secretKeys = [
+    "ENCRYPTION_KEY",
     "ADMIN_TOKEN",
     "GITHUB_CLIENT_ID",
     "GITHUB_CLIENT_SECRET",
@@ -157,13 +173,18 @@ const makeConfigLayer = (env: Env) => {
 
 const makeRuntime = (env: Env) => {
   const dbLayer = Db.layer(env.DB);
+  const settingsLayer = Settings.layer.pipe(Layer.provide(dbLayer));
+
+  const llmRouterLayer = LlmRouterLive.pipe(Layer.provide(settingsLayer));
+  const discordLayer = Discord.layer.pipe(Layer.provide(settingsLayer));
 
   const infraLayer = Layer.mergeAll(
     dbLayer,
+    settingsLayer,
     Observability.layer,
     DiscordWebhookPoster.layer,
-    LlmRouterLive,
-    Discord.layer,
+    llmRouterLayer,
+    discordLayer,
     TurnEventService.layer.pipe(Layer.provide(dbLayer)),
   );
 
@@ -545,6 +566,147 @@ export default {
       const program = Effect.gen(function* () {
         yield* requireAdmin(request);
         const { db } = yield* Db;
+        const settingsService = yield* Settings;
+
+        const maskSensitive = (value: string) => {
+          const v = value.trim();
+          const last4 = v.slice(-4);
+          return `...${last4}`;
+        };
+
+        // /admin/discord/guilds
+        if (segments[1] === "discord" && segments[2] === "guilds" && request.method === "GET") {
+          const discord = yield* Discord;
+
+          return yield* discord.getGuilds().pipe(
+            Effect.map((guilds) => json(200, { guilds })),
+            Effect.catchTag("DiscordApiError", (e) =>
+              Effect.succeed(
+                json(502, {
+                  error: "Discord API error",
+                  endpoint: e.endpoint,
+                  status: e.status,
+                  body: e.body,
+                  requestId,
+                }),
+              ),
+            ),
+          );
+        }
+
+        // /admin/settings
+        if (segments.length === 2 && segments[1] === "settings") {
+          if (request.method !== "GET") {
+            return json(405, { error: "Method not allowed" });
+          }
+
+          const encryptionKey = yield* Config.redacted("ENCRYPTION_KEY");
+          const secret = Redacted.value(encryptionKey);
+
+          const rows = yield* dbTry(() => db.select().from(settings).all());
+          const byKey = new Map(rows.map((r) => [r.key, r] as const));
+
+          const settingsResponse = yield* Effect.forEach(KNOWN_SETTINGS, (def) =>
+            Effect.gen(function* () {
+              const row = byKey.get(def.key);
+
+              if (row) {
+                const decrypted = yield* Effect.tryPromise({
+                  try: () => decrypt(row.value, secret),
+                  catch: (e) => e,
+                }).pipe(Effect.catchAll(() => Effect.succeed(null as string | null)));
+
+                const maskedValue =
+                  decrypted === null ? null : def.sensitive ? maskSensitive(decrypted) : decrypted;
+
+                return {
+                  key: def.key,
+                  label: def.label,
+                  sensitive: def.sensitive,
+                  configured: true,
+                  source: "db" as const,
+                  maskedValue,
+                  updatedAtMs: row.updatedAtMs,
+                };
+              }
+
+              // Not in DB -> check env (existence + masked preview for sensitive only)
+              if (def.sensitive) {
+                const envOpt = yield* Config.option(Config.redacted(def.key)).pipe(
+                  Effect.catchAll(() => Effect.succeed(Option.none())),
+                );
+                if (Option.isSome(envOpt)) {
+                  return {
+                    key: def.key,
+                    label: def.label,
+                    sensitive: def.sensitive,
+                    configured: true,
+                    source: "env" as const,
+                    maskedValue: maskSensitive(Redacted.value(envOpt.value)),
+                    updatedAtMs: null,
+                  };
+                }
+              } else {
+                const envOpt = yield* Config.option(Config.string(def.key)).pipe(
+                  Effect.catchAll(() => Effect.succeed(Option.none())),
+                );
+                if (Option.isSome(envOpt)) {
+                  return {
+                    key: def.key,
+                    label: def.label,
+                    sensitive: def.sensitive,
+                    configured: true,
+                    source: "env" as const,
+                    maskedValue: null,
+                    updatedAtMs: null,
+                  };
+                }
+              }
+
+              return {
+                key: def.key,
+                label: def.label,
+                sensitive: def.sensitive,
+                configured: false,
+                source: null,
+                maskedValue: null,
+                updatedAtMs: null,
+              };
+            }),
+          );
+
+          return json(200, { settings: settingsResponse });
+        }
+
+        // /admin/settings/:key
+        if (segments.length === 3 && segments[1] === "settings") {
+          const key = decodeURIComponent(segments[2] ?? "");
+          const known = KNOWN_SETTINGS.find((s) => s.key === key);
+          if (!known) return json(404, { error: "Not Found" });
+
+          if (request.method === "PUT") {
+            const body = yield* decodeBody(request, Schema.Struct({ value: Schema.String }));
+
+            const value = body.value.trim();
+            if (value.length === 0) {
+              return yield* Effect.fail(
+                AdminBadRequest.make({ message: "Value must be non-empty" }),
+              );
+            }
+
+            yield* settingsService
+              .setSetting(key, value)
+              .pipe(Effect.mapError((cause) => AdminDbError.make({ cause })));
+            return json(200, { ok: true });
+          }
+
+          if (request.method === "DELETE") {
+            yield* dbTry(() => db.delete(settings).where(eq(settings.key, key)).run());
+            return json(200, { ok: true });
+          }
+
+          return json(405, { error: "Method not allowed" });
+        }
 
         // /admin/meta
         if (segments.length === 2 && segments[1] === "meta") {

@@ -65,6 +65,9 @@ Must pass before claiming work is done.
 cat > .dev.vars <<'EOF'
 ADMIN_TOKEN=devtoken
 
+# Settings encryption key (required for storing settings in D1)
+ENCRYPTION_KEY=dev-encryption-key
+
 # Discord (required for thread sync + webhook posting)
 DISCORD_BOT_TOKEN=...
 

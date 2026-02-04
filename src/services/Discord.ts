@@ -1,4 +1,5 @@
 import { Config, Context, Duration, Effect, Layer, Option, Redacted, Schema } from "effect";
+import { Settings } from "./Settings.js";
 
 export class MissingDiscordConfig extends Schema.TaggedError<MissingDiscordConfig>()(
   "MissingDiscordConfig",
@@ -47,7 +48,9 @@ export type DiscordAutoArchiveDurationMinutes = 60 | 1440 | 4320 | 10080;
 
 const DISCORD_API = "https://discord.com/api/v10";
 
-const requireBotToken = (botToken: Option.Option<Redacted.Redacted>) =>
+const requireBotToken = (
+  botToken: Option.Option<Redacted.Redacted>,
+): Effect.Effect<Redacted.Redacted, MissingDiscordConfig> =>
   Option.match(botToken, {
     onNone: () => Effect.fail(MissingDiscordConfig.make({ key: "DISCORD_BOT_TOKEN" })),
     onSome: (token) => Effect.succeed(token),
@@ -236,6 +239,11 @@ export class Discord extends Context.Tag("@agon/Discord")<
      */
     readonly getBotUserId: () => Effect.Effect<string, DiscordError>;
 
+    readonly getGuilds: () => Effect.Effect<
+      Array<{ id: string; name: string; icon: string | null; owner: boolean }>,
+      DiscordApiError
+    >;
+
     /**
      * Lock a thread to prevent non-bot users from sending messages.
      *
@@ -252,7 +260,8 @@ export class Discord extends Context.Tag("@agon/Discord")<
   static readonly layer = Layer.effect(
     Discord,
     Effect.gen(function* () {
-      const botToken = yield* Config.option(Config.redacted("DISCORD_BOT_TOKEN"));
+      const settings = yield* Settings;
+      const botToken = yield* settings.getSetting("DISCORD_BOT_TOKEN");
       const configuredBotUserId = yield* Config.option(Config.string("DISCORD_BOT_USER_ID"));
 
       // Cache within the worker isolate (module instance) to avoid repeated Discord API calls.
@@ -428,6 +437,70 @@ export class Discord extends Context.Tag("@agon/Discord")<
           Effect.mapError((e) => e as DiscordError),
         );
 
+      type DiscordGuild = { id: string; name: string; icon: string | null; owner: boolean };
+
+      const getGuilds: () => Effect.Effect<Array<DiscordGuild>, DiscordApiError> = () =>
+        requireBotToken(botToken).pipe(
+          Effect.map((token) => `Bearer ${sanitizeToken(Redacted.value(token))}`),
+          Effect.mapError((e) =>
+            DiscordApiError.make({
+              endpoint: "/users/@me/guilds",
+              status: 0,
+              body: `Missing ${e.key}`,
+            }),
+          ),
+          Effect.flatMap((Authorization) =>
+            Effect.tryPromise({
+              try: async () => {
+                const endpoint = "/users/@me/guilds";
+                const res = await fetch(`${DISCORD_API}${endpoint}`, {
+                  method: "GET",
+                  headers: { Authorization },
+                });
+
+                const body = await res.text();
+
+                if (!res.ok) {
+                  throw { status: res.status, body };
+                }
+
+                if (body.trim().length === 0) return [];
+
+                const parsed: unknown = JSON.parse(body);
+                if (!Array.isArray(parsed)) return [];
+
+                return parsed
+                  .map((g): DiscordGuild | null => {
+                    if (typeof g !== "object" || g === null) return null;
+                    const rec = g as Record<string, unknown>;
+
+                    const id = typeof rec.id === "string" ? rec.id : "";
+                    const name = typeof rec.name === "string" ? rec.name : "";
+                    const iconRaw = rec.icon;
+                    const icon =
+                      iconRaw === null ? null : typeof iconRaw === "string" ? iconRaw : null;
+                    const owner = rec.owner === true;
+
+                    if (!id || !name) return null;
+                    return { id, name, icon, owner };
+                  })
+                  .filter((x): x is DiscordGuild => x !== null);
+              },
+              catch: (e) => {
+                const rec =
+                  typeof e === "object" && e !== null ? (e as Record<string, unknown>) : {};
+                const status = "status" in rec ? Number(rec.status) : 0;
+                const body = "body" in rec ? String(rec.body) : String(e);
+                return DiscordApiError.make({
+                  endpoint: "/users/@me/guilds",
+                  status: Number.isFinite(status) ? status : 0,
+                  body,
+                });
+              },
+            }),
+          ),
+        );
+
       return Discord.of({
         createWebhook,
         createOrFetchWebhook,
@@ -438,6 +511,7 @@ export class Discord extends Context.Tag("@agon/Discord")<
         postMessage,
         fetchRecentMessages,
         getBotUserId,
+        getGuilds,
       });
     }),
   );

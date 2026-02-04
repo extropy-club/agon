@@ -82,6 +82,16 @@ export type RoomTurnEvent = {
   readonly dataJson: string | null;
 };
 
+export type AdminSetting = {
+  readonly key: string;
+  readonly label: string;
+  readonly sensitive: boolean;
+  readonly configured: boolean;
+  readonly source: "db" | "env" | null;
+  readonly maskedValue: string | null;
+  readonly updatedAtMs: number | null;
+};
+
 export const agentsApi = {
   list: async (): Promise<readonly Agent[]> => {
     const res = (await apiFetch("/agents")) as { agents: readonly Agent[] };
@@ -160,5 +170,35 @@ export const roomsApi = {
       events: readonly RoomTurnEvent[];
     };
     return res.events;
+  },
+};
+
+export const settingsApi = {
+  list: async (): Promise<readonly AdminSetting[]> => {
+    const res = (await apiFetch("/settings")) as { settings: readonly AdminSetting[] };
+    return res.settings;
+  },
+  set: async (key: string, value: string): Promise<void> => {
+    await apiFetch(`/settings/${encodeURIComponent(key)}`, {
+      method: "PUT",
+      body: JSON.stringify({ value }),
+    });
+  },
+  remove: async (key: string): Promise<void> => {
+    await apiFetch(`/settings/${encodeURIComponent(key)}`, { method: "DELETE" });
+  },
+};
+
+export type DiscordGuild = {
+  readonly id: string;
+  readonly name: string;
+  readonly icon: string | null;
+  readonly owner: boolean;
+};
+
+export const discordApi = {
+  guilds: async (): Promise<readonly DiscordGuild[]> => {
+    const res = (await apiFetch("/discord/guilds")) as { guilds: DiscordGuild[] };
+    return res.guilds;
   },
 };
