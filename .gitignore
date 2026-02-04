@@ -5,6 +5,13 @@ pnpm-lock.yaml
 dist/
 .wrangler/
 .dev.vars
+
+# dotenv (Vite / local tooling)
+.env
+.env.*
+!**/.env.example
+packages/admin/.env
+
 local.db
 local.db-journal
 *.local

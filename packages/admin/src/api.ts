@@ -1,6 +1,12 @@
 export const API_BASE = "/admin";
 
 const getAdminToken = (): string | null => {
+  const envToken = import.meta.env.VITE_ADMIN_TOKEN;
+  if (typeof envToken === "string" && envToken.trim().length > 0) {
+    return envToken.trim();
+  }
+
+  // Back-compat fallback (e.g. if someone sets it manually in devtools).
   try {
     return localStorage.getItem("agon.adminToken");
   } catch {

@@ -59,6 +59,27 @@ Must pass before claiming work is done.
 
 ## Dev (one command)
 
+1. Set the worker admin token (Wrangler loads this from `.dev.vars`):
+
+```bash
+cat > .dev.vars <<'EOF'
+ADMIN_TOKEN=devtoken
+EOF
+```
+
+2. Set the admin UI token (Vite loads this from `packages/admin/.env`):
+
+```bash
+cp packages/admin/.env.example packages/admin/.env
+# edit if needed
+```
+
+NOTE: `VITE_*` env vars are exposed to the browser bundle by design. Only use
+`VITE_ADMIN_TOKEN` for local dev or when the admin UI is strictly internal / behind
+Cloudflare Access. `packages/admin/.env` is gitignored to prevent accidental commits.
+
+3. Run everything:
+
 ```bash
 npm run dev:all
 ```
