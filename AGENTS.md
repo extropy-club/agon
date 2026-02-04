@@ -57,6 +57,11 @@ npm run gate          # typecheck → lint → format:check
 
 Must pass before claiming work is done.
 
+## Toolchain Notes
+
+- `npm run typecheck` uses `tsgo` (TypeScript-Go) rather than `tsc`.
+- Ensure `tsgo` is available on your PATH (in the author's Nix setup it typically lives at `/run/current-system/sw/bin/tsgo`).
+
 ## Landing the Plane
 
 Work is NOT complete until `git push` succeeds:
