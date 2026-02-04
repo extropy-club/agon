@@ -45,7 +45,7 @@ export type Agent = {
   readonly name: string;
   readonly avatarUrl: string | null;
   readonly systemPrompt: string;
-  readonly llmProvider: "openai" | "anthropic" | "gemini";
+  readonly llmProvider: "openai" | "anthropic" | "gemini" | "openrouter";
   readonly llmModel: string;
 };
 

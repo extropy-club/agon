@@ -64,6 +64,19 @@ Must pass before claiming work is done.
 ```bash
 cat > .dev.vars <<'EOF'
 ADMIN_TOKEN=devtoken
+
+# Discord (required for thread sync + webhook posting)
+DISCORD_BOT_TOKEN=...
+
+# LLM (pick one)
+OPENROUTER_API_KEY=...
+# OPENAI_API_KEY=...
+# ANTHROPIC_API_KEY=...
+# GOOGLE_AI_API_KEY=...
+
+# OpenRouter extras (recommended)
+OPENROUTER_HTTP_REFERER=http://localhost:3000
+OPENROUTER_TITLE=Agon
 EOF
 ```
 

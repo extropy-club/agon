@@ -85,6 +85,7 @@ export default function Agents() {
                 value={editingAgent()?.llmProvider || "openai"}
               >
                 <option value="openai">OpenAI</option>
+                <option value="openrouter">OpenRouter</option>
                 <option value="anthropic">Anthropic</option>
                 <option value="gemini">Gemini</option>
               </select>

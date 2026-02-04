@@ -30,6 +30,9 @@ export interface Env {
 
   // LLM providers
   OPENAI_API_KEY?: string;
+  OPENROUTER_API_KEY?: string;
+  OPENROUTER_HTTP_REFERER?: string;
+  OPENROUTER_TITLE?: string;
   ANTHROPIC_API_KEY?: string;
   GOOGLE_AI_API_KEY?: string;
 
@@ -63,6 +66,9 @@ const makeConfigLayer = (env: Env) => {
     "DISCORD_PUBLIC_KEY",
     "DISCORD_BOT_TOKEN",
     "OPENAI_API_KEY",
+    "OPENROUTER_API_KEY",
+    "OPENROUTER_HTTP_REFERER",
+    "OPENROUTER_TITLE",
     "ANTHROPIC_API_KEY",
     "GOOGLE_AI_API_KEY",
     "LOG_LEVEL",
@@ -190,7 +196,7 @@ export default {
     if (url.pathname.startsWith("/admin")) {
       const segments = url.pathname.split("/").filter(Boolean);
 
-      const AgentProviderSchema = Schema.Literal("openai", "anthropic", "gemini");
+      const AgentProviderSchema = Schema.Literal("openai", "anthropic", "gemini", "openrouter");
 
       const AgentCreateSchema = Schema.Struct({
         id: Schema.optional(Schema.String),

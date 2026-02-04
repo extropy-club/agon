@@ -5,7 +5,7 @@ export const agents = sqliteTable("agents", {
   name: text("name").notNull(),
   avatarUrl: text("avatar_url"),
   systemPrompt: text("system_prompt").notNull(),
-  llmProvider: text("llm_provider", { enum: ["openai", "anthropic", "gemini"] })
+  llmProvider: text("llm_provider", { enum: ["openai", "anthropic", "gemini", "openrouter"] })
     .notNull()
     .default("openai"),
   llmModel: text("llm_model").notNull().default("gpt-4o-mini"),

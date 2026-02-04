@@ -5,9 +5,11 @@ import { AnthropicClient, AnthropicLanguageModel } from "@effect/ai-anthropic";
 import { GoogleClient, GoogleLanguageModel } from "@effect/ai-google";
 import { OpenAiClient, OpenAiLanguageModel } from "@effect/ai-openai";
 import * as FetchHttpClient from "@effect/platform/FetchHttpClient";
+import * as HttpClient from "@effect/platform/HttpClient";
+import * as HttpClientRequest from "@effect/platform/HttpClientRequest";
 import { Config, Context, Effect, Layer, Option, Redacted, Schedule, Schema } from "effect";
 
-export const LlmProviderSchema = Schema.Literal("openai", "anthropic", "gemini");
+export const LlmProviderSchema = Schema.Literal("openai", "anthropic", "gemini", "openrouter");
 export type LlmProvider = typeof LlmProviderSchema.Type;
 
 export class MissingLlmApiKey extends Schema.TaggedError<MissingLlmApiKey>()("MissingLlmApiKey", {
@@ -39,6 +41,10 @@ export class LlmRouter extends Context.Tag("@agon/LlmRouter")<
       const openAiApiKey = yield* Config.option(Config.redacted("OPENAI_API_KEY"));
       const anthropicApiKey = yield* Config.option(Config.redacted("ANTHROPIC_API_KEY"));
       const googleApiKey = yield* Config.option(Config.redacted("GOOGLE_AI_API_KEY"));
+      const openRouterApiKey = yield* Config.option(Config.redacted("OPENROUTER_API_KEY"));
+
+      const openRouterHttpReferer = yield* Config.option(Config.string("OPENROUTER_HTTP_REFERER"));
+      const openRouterTitle = yield* Config.option(Config.string("OPENROUTER_TITLE"));
 
       const retryPolicy = Schedule.exponential("200 millis").pipe(
         Schedule.jittered,
@@ -61,6 +67,11 @@ export class LlmRouter extends Context.Tag("@agon/LlmRouter")<
             return Option.isNone(googleApiKey)
               ? Effect.fail(MissingLlmApiKey.make({ provider, envVar: "GOOGLE_AI_API_KEY" }))
               : Effect.succeed(googleApiKey.value);
+
+          case "openrouter":
+            return Option.isNone(openRouterApiKey)
+              ? Effect.fail(MissingLlmApiKey.make({ provider, envVar: "OPENROUTER_API_KEY" }))
+              : Effect.succeed(openRouterApiKey.value);
         }
       };
 
@@ -73,6 +84,40 @@ export class LlmRouter extends Context.Tag("@agon/LlmRouter")<
           case "openai":
             return OpenAiLanguageModel.layer({ model }).pipe(
               Layer.provide(OpenAiClient.layer({ apiKey: apiKey as Redacted.Redacted })),
+            );
+
+          case "openrouter":
+            return OpenAiLanguageModel.layer({ model }).pipe(
+              Layer.provide(
+                OpenAiClient.layer({
+                  apiKey: apiKey as Redacted.Redacted,
+                  apiUrl: "https://openrouter.ai/api/v1",
+                  transformClient: (client) =>
+                    client.pipe(
+                      HttpClient.mapRequest((req) => {
+                        let next = req;
+
+                        if (Option.isSome(openRouterHttpReferer)) {
+                          next = HttpClientRequest.setHeader(
+                            next,
+                            "HTTP-Referer",
+                            openRouterHttpReferer.value,
+                          );
+                        }
+
+                        if (Option.isSome(openRouterTitle)) {
+                          next = HttpClientRequest.setHeader(
+                            next,
+                            "X-Title",
+                            openRouterTitle.value,
+                          );
+                        }
+
+                        return next;
+                      }),
+                    ),
+                }),
+              ),
             );
 
           case "anthropic":
