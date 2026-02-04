@@ -9,7 +9,7 @@
   "scripts": {
     "prepare": "effect-language-service patch",
     "dev": "node scripts/wrangler-dev.mjs",
-    "dev:admin": "npm -w @agon/admin run dev",
+    "dev:admin": "node scripts/admin-dev.mjs",
     "dev:all": "concurrently -n worker,admin -c blue,magenta \"npm run dev\" \"npm run dev:admin\"",
     "deploy": "wrangler deploy",
     "db:generate": "drizzle-kit generate",
