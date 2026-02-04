@@ -140,6 +140,11 @@ th {
   color: #991b1b;
 }
 
+.badge-audience_slot {
+  background-color: #e0f2fe;
+  color: #075985;
+}
+
 .badge-ok {
   background-color: #dcfce7;
   color: #166534;

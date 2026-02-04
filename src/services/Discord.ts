@@ -1,4 +1,4 @@
-import { Config, Context, Effect, Layer, Option, Redacted, Schema } from "effect";
+import { Config, Context, Duration, Effect, Layer, Option, Redacted, Schema } from "effect";
 
 export class MissingDiscordConfig extends Schema.TaggedError<MissingDiscordConfig>()(
   "MissingDiscordConfig",
@@ -13,7 +13,14 @@ export class DiscordApiError extends Schema.TaggedError<DiscordApiError>()("Disc
   body: Schema.String,
 }) {}
 
-export type DiscordError = MissingDiscordConfig | DiscordApiError;
+export class DiscordRateLimited extends Schema.TaggedError<DiscordRateLimited>()(
+  "DiscordRateLimited",
+  {
+    retryAfterMs: Schema.Number,
+  },
+) {}
+
+export type DiscordError = MissingDiscordConfig | DiscordApiError | DiscordRateLimited;
 
 export type DiscordWebhook = {
   readonly id: string;
@@ -46,15 +53,81 @@ const requireBotToken = (botToken: Option.Option<Redacted.Redacted>) =>
     onSome: (token) => Effect.succeed(token),
   });
 
-const requestJson = <A>(endpoint: string, init: RequestInit): Effect.Effect<A, DiscordApiError> =>
+const parseSecondsHeaderMs = (raw: string | null): number | null => {
+  if (raw === null) return null;
+  const n = Number.parseFloat(raw);
+  if (!Number.isFinite(n)) return null;
+  return Math.max(0, Math.ceil(n * 1000));
+};
+
+const parseRateLimitRemaining = (raw: string | null): number | null => {
+  if (raw === null) return null;
+  const n = Number.parseInt(raw, 10);
+  return Number.isFinite(n) ? n : null;
+};
+
+const parseRetryAfterMsFromBody = (body: string): number | null => {
+  if (body.trim().length === 0) return null;
+  try {
+    const parsed: unknown = JSON.parse(body);
+    if (typeof parsed !== "object" || parsed === null) return null;
+    const rec = parsed as Record<string, unknown>;
+    const ra = rec["retry_after"];
+    if (typeof ra !== "number" || !Number.isFinite(ra)) return null;
+
+    // Discord documents retry_after in seconds.
+    return Math.max(0, Math.ceil(ra * 1000));
+  } catch {
+    return null;
+  }
+};
+
+type DiscordRequestResult<A> =
+  | {
+      readonly _tag: "Ok";
+      readonly value: A;
+      readonly remaining: number | null;
+      readonly resetAfterMs: number | null;
+    }
+  | { readonly _tag: "RateLimited"; readonly retryAfterMs: number }
+  | { readonly _tag: "Error"; readonly status: number; readonly body: string };
+
+const requestJson = <A>(
+  endpoint: string,
+  init: RequestInit,
+): Effect.Effect<A, DiscordApiError | DiscordRateLimited> =>
   Effect.tryPromise({
     try: async () => {
       const res = await fetch(`${DISCORD_API}${endpoint}`, init);
       const body = await res.text();
-      if (!res.ok) {
-        throw { status: res.status, body };
+
+      const remaining = parseRateLimitRemaining(res.headers.get("X-RateLimit-Remaining"));
+      const resetAfterMs = parseSecondsHeaderMs(res.headers.get("X-RateLimit-Reset-After"));
+
+      const retryAfterMs =
+        parseSecondsHeaderMs(res.headers.get("Retry-After")) ??
+        parseRetryAfterMsFromBody(body) ??
+        resetAfterMs ??
+        1000;
+
+      if (res.status === 429) {
+        return { _tag: "RateLimited", retryAfterMs } as const;
       }
-      return body.length === 0 ? (undefined as A) : (JSON.parse(body) as A);
+
+      if (!res.ok) {
+        return { _tag: "Error", status: res.status, body } as const;
+      }
+
+      if (body.length === 0) {
+        return { _tag: "Ok", value: undefined as A, remaining, resetAfterMs } as const;
+      }
+
+      try {
+        const parsed = JSON.parse(body) as A;
+        return { _tag: "Ok", value: parsed, remaining, resetAfterMs } as const;
+      } catch {
+        return { _tag: "Error", status: res.status, body } as const;
+      }
     },
     catch: (e) => {
       const rec = typeof e === "object" && e !== null ? (e as Record<string, unknown>) : undefined;
@@ -62,7 +135,48 @@ const requestJson = <A>(endpoint: string, init: RequestInit): Effect.Effect<A, D
       const body = rec && "body" in rec ? String(rec.body) : String(e);
       return DiscordApiError.make({ endpoint, status, body });
     },
-  });
+  }).pipe(
+    // Widen error type so downstream combinators can emit rate limit errors.
+    Effect.mapError((e): DiscordApiError | DiscordRateLimited => e),
+    Effect.flatMap(
+      (result: DiscordRequestResult<A>): Effect.Effect<A, DiscordApiError | DiscordRateLimited> => {
+        switch (result._tag) {
+          case "RateLimited":
+            return Effect.fail<DiscordApiError | DiscordRateLimited>(
+              DiscordRateLimited.make({ retryAfterMs: result.retryAfterMs }),
+            );
+
+          case "Error":
+            return Effect.fail<DiscordApiError | DiscordRateLimited>(
+              DiscordApiError.make({ endpoint, status: result.status, body: result.body }),
+            );
+
+          case "Ok": {
+            if (result.remaining === 0 && result.resetAfterMs !== null && result.resetAfterMs > 0) {
+              const waitMs = result.resetAfterMs ?? 0;
+              return Effect.gen(function* () {
+                yield* Effect.logWarning("discord.rate_limit.bucket_exhausted").pipe(
+                  Effect.annotateLogs({ endpoint, retryAfterMs: waitMs }),
+                );
+                yield* Effect.sleep(Duration.millis(waitMs));
+                return result.value;
+              });
+            }
+
+            return Effect.succeed(result.value);
+          }
+        }
+      },
+    ),
+    Effect.tapError((e) => {
+      if (e._tag === "DiscordRateLimited") {
+        return Effect.logWarning("discord.rate_limited").pipe(
+          Effect.annotateLogs({ endpoint, retryAfterMs: e.retryAfterMs }),
+        );
+      }
+      return Effect.succeed(void 0);
+    }),
+  );
 
 type DiscordWebhookListItem = {
   readonly id: string;

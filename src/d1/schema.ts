@@ -13,7 +13,7 @@ export const agents = sqliteTable("agents", {
 
 export const rooms = sqliteTable("rooms", {
   id: integer("id").primaryKey({ autoIncrement: true }),
-  status: text("status", { enum: ["active", "paused"] }).notNull(),
+  status: text("status", { enum: ["active", "paused", "audience_slot"] }).notNull(),
   topic: text("topic").notNull(),
   title: text("title").notNull().default(""),
   parentChannelId: text("parent_channel_id").notNull(),

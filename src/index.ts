@@ -12,7 +12,7 @@ import {
   rooms,
   roomTurnEvents,
 } from "./d1/schema.js";
-import { ArenaService, type RoomTurnJob } from "./services/ArenaService.js";
+import { ArenaService, type RoomTurnJob, type TurnJob } from "./services/ArenaService.js";
 import {
   Discord,
   type DiscordAutoArchiveDurationMinutes,
@@ -641,7 +641,7 @@ export default {
             const nextTurnNumber = room.currentTurnNumber + 1;
 
             if (room.lastEnqueuedTurnNumber < nextTurnNumber) {
-              const job = { roomId, turnNumber: nextTurnNumber } as const;
+              const job: TurnJob = { type: "turn", roomId, turnNumber: nextTurnNumber };
               yield* Effect.tryPromise({
                 try: () => env.ARENA_QUEUE.send(job),
                 catch: (cause) => AdminQueueError.make({ cause }),
@@ -706,7 +706,7 @@ export default {
               });
             }
 
-            const job = { roomId, turnNumber: nextTurnNumber } as const;
+            const job: TurnJob = { type: "turn", roomId, turnNumber: nextTurnNumber };
 
             yield* Effect.tryPromise({
               try: () => env.ARENA_QUEUE.send(job),
@@ -912,6 +912,7 @@ export default {
             );
 
             return reply(`Agon: enqueued next turn (#${nextTurnNumber}).`, {
+              type: "turn",
               roomId,
               turnNumber: nextTurnNumber,
             });
@@ -1189,58 +1190,146 @@ export default {
   async queue(batch: MessageBatch<RoomTurnJob>, env: Env, _ctx: ExecutionContext): Promise<void> {
     const runtime = makeRuntime(env);
 
+    const normalizeJob = (raw: unknown): RoomTurnJob => {
+      if (typeof raw === "object" && raw !== null && "type" in raw) {
+        return raw as RoomTurnJob;
+      }
+      const r = raw as { readonly roomId: number; readonly turnNumber: number };
+      return { type: "turn", roomId: r.roomId, turnNumber: r.turnNumber };
+    };
+
+    const sendJob = async (job: RoomTurnJob): Promise<void> => {
+      if (job.type === "close_audience_slot") {
+        await env.ARENA_QUEUE.send(job, { delaySeconds: job.delaySeconds });
+      } else {
+        await env.ARENA_QUEUE.send(job);
+      }
+    };
+
     for (const message of batch.messages) {
       try {
-        const job = message.body as RoomTurnJob;
+        const job = normalizeJob(message.body);
 
         const annotations = {
           queue: batch.queue,
           queueMessageId: message.id,
           attempts: message.attempts,
+          jobType: job.type,
           roomId: job.roomId,
           turnNumber: job.turnNumber,
         };
 
-        const program = Effect.gen(function* () {
-          yield* Effect.logInfo("queue.turn");
-          const arena = yield* ArenaService;
-          const next = yield* arena.processTurn(job);
-          if (next) {
-            yield* Effect.logInfo("queue.turn.next").pipe(
-              Effect.annotateLogs({ nextTurnNumber: next.turnNumber }),
-            );
-          }
-          return next;
-        }).pipe(Effect.annotateLogs(annotations), Effect.withLogSpan("queue.turn"));
+        const program =
+          job.type === "close_audience_slot"
+            ? Effect.gen(function* () {
+                yield* Effect.logInfo("queue.audience_slot.close");
+
+                const { db } = yield* Db;
+                const discord = yield* Discord;
+                const turnEvents = yield* TurnEventService;
+
+                const room = yield* Effect.tryPromise({
+                  try: () => db.select().from(rooms).where(eq(rooms.id, job.roomId)).get(),
+                  catch: (e) => e,
+                }).pipe(Effect.orDie);
+
+                if (!room) return null;
+
+                // If the room was manually paused/resumed, or already advanced, do nothing.
+                if (room.status !== "audience_slot") return null;
+                if (room.currentTurnNumber !== job.turnNumber) return null;
+
+                // Best-effort: lock the thread.
+                yield* discord.lockThread(room.threadId).pipe(
+                  Effect.catchAll((e) =>
+                    Effect.logWarning("discord.thread.lock.failed").pipe(
+                      Effect.annotateLogs({
+                        roomId: room.id,
+                        threadId: room.threadId,
+                        error: String(e),
+                      }),
+                      Effect.asVoid,
+                    ),
+                  ),
+                  Effect.asVoid,
+                );
+
+                yield* Effect.tryPromise({
+                  try: () =>
+                    db.update(rooms).set({ status: "active" }).where(eq(rooms.id, room.id)).run(),
+                  catch: (e) => e,
+                }).pipe(Effect.orDie);
+
+                const nextTurnNumber = room.currentTurnNumber + 1;
+                if (room.lastEnqueuedTurnNumber >= nextTurnNumber) {
+                  yield* turnEvents.write({
+                    roomId: room.id,
+                    turnNumber: job.turnNumber,
+                    phase: "audience_slot_close",
+                    status: "info",
+                    data: { skippedEnqueue: true, nextTurnNumber },
+                  });
+                  return null;
+                }
+
+                yield* turnEvents.write({
+                  roomId: room.id,
+                  turnNumber: job.turnNumber,
+                  phase: "audience_slot_close",
+                  status: "ok",
+                  data: { nextTurnNumber },
+                });
+
+                return { type: "turn", roomId: room.id, turnNumber: nextTurnNumber } as const;
+              }).pipe(
+                Effect.annotateLogs(annotations),
+                Effect.withLogSpan("queue.audience_slot.close"),
+              )
+            : Effect.gen(function* () {
+                yield* Effect.logInfo("queue.turn");
+                const arena = yield* ArenaService;
+                const next = yield* arena.processTurn(job as TurnJob);
+                if (next) {
+                  yield* Effect.logInfo("queue.turn.next").pipe(
+                    Effect.annotateLogs({
+                      nextTurnNumber: next.turnNumber,
+                      nextJobType: next.type,
+                    }),
+                  );
+                }
+                return next;
+              }).pipe(Effect.annotateLogs(annotations), Effect.withLogSpan("queue.turn"));
 
         const next = await runtime.runPromise(program);
         if (next) {
-          await env.ARENA_QUEUE.send(next);
+          await sendJob(next);
 
-          // Persist an enqueue marker so a redelivered message (e.g., crash between send+ack)
-          // doesn't re-enqueue duplicates.
-          const markEnqueued = Effect.gen(function* () {
-            yield* Effect.logDebug("queue.mark_enqueued");
-            const { db } = yield* Db;
-            yield* Effect.tryPromise({
-              try: () =>
-                db
-                  .update(rooms)
-                  .set({
-                    lastEnqueuedTurnNumber: sql`max(${rooms.lastEnqueuedTurnNumber}, ${next.turnNumber})`,
-                  })
-                  .where(eq(rooms.id, next.roomId))
-                  .run(),
-              catch: () => null,
-            });
-          }).pipe(Effect.annotateLogs(annotations), Effect.withLogSpan("queue.mark_enqueued"));
+          if (next.type === "turn") {
+            // Persist an enqueue marker so a redelivered message (e.g., crash between send+ack)
+            // doesn't re-enqueue duplicates.
+            const markEnqueued = Effect.gen(function* () {
+              yield* Effect.logDebug("queue.mark_enqueued");
+              const { db } = yield* Db;
+              yield* Effect.tryPromise({
+                try: () =>
+                  db
+                    .update(rooms)
+                    .set({
+                      lastEnqueuedTurnNumber: sql`max(${rooms.lastEnqueuedTurnNumber}, ${next.turnNumber})`,
+                    })
+                    .where(eq(rooms.id, next.roomId))
+                    .run(),
+                catch: () => null,
+              });
+            }).pipe(Effect.annotateLogs(annotations), Effect.withLogSpan("queue.mark_enqueued"));
 
-          await runtime.runPromise(markEnqueued);
+            await runtime.runPromise(markEnqueued);
+          }
         }
 
         message.ack();
       } catch (e) {
-        console.error("queue turn failed", e);
+        console.error("queue message failed", e);
         message.retry({ delaySeconds: Math.min(60, 2 ** message.attempts) });
       }
     }

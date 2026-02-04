@@ -10,6 +10,8 @@ export type TurnEventPhase =
   | "llm_fail"
   | "webhook_post_ok"
   | "webhook_post_fail"
+  | "audience_slot_open"
+  | "audience_slot_close"
   | "final_failure_notify"
   | "finish";
 

@@ -4,15 +4,37 @@ import { and, asc, desc, eq, lt, or, sql } from "drizzle-orm";
 import { Config, Context, Effect, Either, Layer, Schema } from "effect";
 import { Db, nowMs } from "../d1/db.js";
 import { agents, discordChannels, messages, roomAgents, rooms } from "../d1/schema.js";
-import { Discord, DiscordApiError, type DiscordError, MissingDiscordConfig } from "./Discord.js";
+import {
+  Discord,
+  DiscordApiError,
+  DiscordRateLimited,
+  type DiscordError,
+  MissingDiscordConfig,
+} from "./Discord.js";
 import { DiscordWebhookPostFailed, DiscordWebhookPoster } from "./DiscordWebhook.js";
 import { type LlmRouterError, LlmRouter } from "./LlmRouter.js";
 import { TurnEventService } from "./TurnEventService.js";
 
-export type RoomTurnJob = {
+export type TurnJob = {
+  readonly type: "turn";
   readonly roomId: number;
   readonly turnNumber: number;
 };
+
+export type CloseAudienceSlotJob = {
+  readonly type: "close_audience_slot";
+  readonly roomId: number;
+  /**
+   * The last processed agent turn number (used for idempotency).
+   */
+  readonly turnNumber: number;
+  /**
+   * Delay used when enqueuing this job via CF Queues.
+   */
+  readonly delaySeconds: number;
+};
+
+export type RoomTurnJob = TurnJob | CloseAudienceSlotJob;
 
 export class RoomNotFound extends Schema.TaggedError<RoomNotFound>()("RoomNotFound", {
   roomId: Schema.Number,
@@ -32,6 +54,7 @@ export type ArenaError =
   | RoomDbError
   | LlmRouterError
   | DiscordApiError
+  | DiscordRateLimited
   | MissingDiscordConfig
   | DiscordWebhookPostFailed;
 
@@ -55,10 +78,15 @@ const isRetryableDiscordError = (e: DiscordError): boolean => {
   switch (e._tag) {
     case "MissingDiscordConfig":
       return false;
+    case "DiscordRateLimited":
+      return true;
     case "DiscordApiError":
       return e.status === 0 || e.status === 429 || e.status >= 500;
   }
 };
+
+const discordRetryAfterMs = (e: DiscordError): number | undefined =>
+  e._tag === "DiscordRateLimited" ? e.retryAfterMs : undefined;
 
 const isRetryableDiscordWebhookError = (e: DiscordWebhookPostFailed): boolean =>
   e.status === 0 || e.status === 429 || e.status >= 500;
@@ -158,7 +186,7 @@ export class ArenaService extends Context.Tag("@agon/ArenaService")<
       channelId: string;
       topic: string;
       agentIds?: ReadonlyArray<string>;
-    }) => Effect.Effect<{ roomId: number; firstJob: RoomTurnJob }, ArenaError>;
+    }) => Effect.Effect<{ roomId: number; firstJob: TurnJob }, ArenaError>;
 
     /**
      * Create (or restart) a room bound to an existing Discord thread.
@@ -173,7 +201,7 @@ export class ArenaService extends Context.Tag("@agon/ArenaService")<
       audienceSlotDurationSeconds?: number;
       audienceTokenLimit?: number;
       roomTokenLimit?: number;
-    }) => Effect.Effect<{ roomId: number; firstJob: RoomTurnJob }, ArenaError>;
+    }) => Effect.Effect<{ roomId: number; firstJob: TurnJob }, ArenaError>;
 
     readonly stopArena: (roomId: number) => Effect.Effect<void, ArenaError>;
 
@@ -181,7 +209,7 @@ export class ArenaService extends Context.Tag("@agon/ArenaService")<
      * Process a single queued turn.
      * Returns the next job to enqueue (or null when the loop terminates).
      */
-    readonly processTurn: (job: RoomTurnJob) => Effect.Effect<RoomTurnJob | null, ArenaError>;
+    readonly processTurn: (job: TurnJob) => Effect.Effect<RoomTurnJob | null, ArenaError>;
   }
 >() {
   static readonly layer = Layer.effect(
@@ -301,7 +329,7 @@ export class ArenaService extends Context.Tag("@agon/ArenaService")<
         // reset history
         yield* dbTry(() => db.delete(messages).where(eq(messages.roomId, roomId)).run());
 
-        return { roomId, firstJob: { roomId, turnNumber: 1 } } as const;
+        return { roomId, firstJob: { type: "turn", roomId, turnNumber: 1 } } as const;
       });
 
       const startArena = Effect.fn("ArenaService.startArena")(function* (args: {
@@ -430,7 +458,7 @@ export class ArenaService extends Context.Tag("@agon/ArenaService")<
         );
       });
 
-      const processTurn = Effect.fn("ArenaService.processTurn")((job: RoomTurnJob) =>
+      const processTurn = Effect.fn("ArenaService.processTurn")((job: TurnJob) =>
         Effect.scoped(
           Effect.gen(function* () {
             yield* Effect.logInfo("arena.turn.start").pipe(
@@ -441,7 +469,9 @@ export class ArenaService extends Context.Tag("@agon/ArenaService")<
               db.select().from(rooms).where(eq(rooms.id, job.roomId)).get(),
             );
             if (!room) return yield* RoomNotFound.make({ roomId: job.roomId });
-            if (room.status !== "active") return null;
+
+            // Hard stop: manual pause.
+            if (room.status === "paused") return null;
 
             yield* Effect.logDebug("arena.turn.room_loaded").pipe(
               Effect.annotateLogs({
@@ -457,18 +487,37 @@ export class ArenaService extends Context.Tag("@agon/ArenaService")<
             if (room.currentTurnNumber === job.turnNumber) {
               // This is a redelivery after the turn already advanced in D1, likely due to
               // a crash between enqueue+ack.
+              //
+              // If the last processed turn opened an audience slot, prefer re-enqueueing the
+              // close job (it's idempotent) rather than immediately advancing to the next agent.
+              if (room.status === "audience_slot") {
+                const audienceSlotSeconds = Math.max(0, room.audienceSlotDurationSeconds);
+                if (audienceSlotSeconds > 0) {
+                  yield* Effect.logInfo("arena.turn.redelivery_reenqueue_close_audience_slot");
+                  return {
+                    type: "close_audience_slot",
+                    roomId: room.id,
+                    turnNumber: job.turnNumber,
+                    delaySeconds: audienceSlotSeconds,
+                  } as const;
+                }
+              }
+
               const nextTurnNumber = job.turnNumber + 1;
               if (room.lastEnqueuedTurnNumber >= nextTurnNumber) {
                 yield* Effect.logDebug("arena.turn.redelivery_already_enqueued");
                 return null;
               }
               yield* Effect.logInfo("arena.turn.redelivery_reenqueue_next");
-              return { roomId: room.id, turnNumber: nextTurnNumber } as const;
+              return { type: "turn", roomId: room.id, turnNumber: nextTurnNumber } as const;
             }
             if (room.currentTurnNumber + 1 !== job.turnNumber) {
               yield* Effect.logDebug("arena.turn.idempotent_drop");
               return null;
             }
+
+            // Audience slot (and other non-active states) intentionally stop the auto-loop.
+            if (room.status !== "active") return null;
 
             const agent = yield* dbTry(() =>
               db.select().from(agents).where(eq(agents.id, room.currentTurnAgentId)).get(),
@@ -489,7 +538,11 @@ export class ArenaService extends Context.Tag("@agon/ArenaService")<
             ): Effect.Effect<void, never> =>
               discord.postMessage(room.threadId, turnFailedNotification).pipe(
                 (eff) =>
-                  retryWithBackoff(eff, { maxRetries: 3, isRetryable: isRetryableDiscordError }),
+                  retryWithBackoff(eff, {
+                    maxRetries: 3,
+                    isRetryable: isRetryableDiscordError,
+                    getRetryAfterMs: discordRetryAfterMs,
+                  }),
                 Effect.tap(() =>
                   turnEvents.write({
                     roomId: room.id,
@@ -544,11 +597,13 @@ export class ArenaService extends Context.Tag("@agon/ArenaService")<
               retryWithBackoff(discord.lockThread(room.threadId), {
                 maxRetries: 3,
                 isRetryable: isRetryableDiscordError,
+                getRetryAfterMs: discordRetryAfterMs,
               }).pipe(Effect.catchAll(logThreadWarning("lock")), Effect.as(room.threadId)),
               (threadId) =>
                 retryWithBackoff(discord.unlockThread(threadId), {
                   maxRetries: 3,
                   isRetryable: isRetryableDiscordError,
+                  getRetryAfterMs: discordRetryAfterMs,
                 }).pipe(Effect.catchAll(logThreadWarning("unlock")), Effect.asVoid),
             );
 
@@ -559,42 +614,47 @@ export class ArenaService extends Context.Tag("@agon/ArenaService")<
             //
             // Any other Discord API failure should fail the turn (and let the queue retry),
             // because Discord is the source of truth for room history.
-            const discordMessages = yield* discord
-              .fetchRecentMessages(room.threadId, historyLimit)
-              .pipe(
-                Effect.tap((msgs) =>
-                  turnEvents.write({
+            const discordMessages = yield* retryWithBackoff(
+              discord.fetchRecentMessages(room.threadId, historyLimit),
+              {
+                maxRetries: 3,
+                isRetryable: isRetryableDiscordError,
+                getRetryAfterMs: discordRetryAfterMs,
+              },
+            ).pipe(
+              Effect.tap((msgs) =>
+                turnEvents.write({
+                  roomId: room.id,
+                  turnNumber: job.turnNumber,
+                  phase: "discord_sync",
+                  status: "ok",
+                  data: { fetched: msgs.length },
+                }),
+              ),
+              Effect.catchTag("MissingDiscordConfig", () =>
+                turnEvents
+                  .write({
                     roomId: room.id,
                     turnNumber: job.turnNumber,
                     phase: "discord_sync",
-                    status: "ok",
-                    data: { fetched: msgs.length },
-                  }),
-                ),
-                Effect.catchTag("MissingDiscordConfig", () =>
-                  turnEvents
-                    .write({
-                      roomId: room.id,
-                      turnNumber: job.turnNumber,
-                      phase: "discord_sync",
-                      status: "info",
-                      data: { skipped: true },
-                    })
-                    .pipe(Effect.as(null)),
-                ),
-                Effect.tapError((e) =>
-                  turnEvents.write({
-                    roomId: room.id,
-                    turnNumber: job.turnNumber,
-                    phase: "discord_sync",
-                    status: "fail",
-                    data: {
-                      error: errorLabel(e),
-                    },
-                  }),
-                ),
-                Effect.withLogSpan("discord.sync"),
-              );
+                    status: "info",
+                    data: { skipped: true },
+                  })
+                  .pipe(Effect.as(null)),
+              ),
+              Effect.tapError((e) =>
+                turnEvents.write({
+                  roomId: room.id,
+                  turnNumber: job.turnNumber,
+                  phase: "discord_sync",
+                  status: "fail",
+                  data: {
+                    error: errorLabel(e),
+                  },
+                }),
+              ),
+              Effect.withLogSpan("discord.sync"),
+            );
 
             yield* Effect.logDebug("discord.sync.fetched").pipe(
               Effect.annotateLogs({
@@ -622,9 +682,11 @@ export class ArenaService extends Context.Tag("@agon/ArenaService")<
                 ({ m }) => m.webhook_id === undefined && m.author.bot === true,
               );
               const botUserId = needsBotUserId
-                ? yield* discord
-                    .getBotUserId()
-                    .pipe(Effect.catchTag("MissingDiscordConfig", () => Effect.succeed(null)))
+                ? yield* retryWithBackoff(discord.getBotUserId(), {
+                    maxRetries: 3,
+                    isRetryable: isRetryableDiscordError,
+                    getRetryAfterMs: discordRetryAfterMs,
+                  }).pipe(Effect.catchTag("MissingDiscordConfig", () => Effect.succeed(null)))
                 : null;
 
               for (const { m, createdAtMs } of ordered) {
@@ -1019,10 +1081,69 @@ export class ArenaService extends Context.Tag("@agon/ArenaService")<
             );
             const next = participants[(idx + 1) % participants.length];
 
+            const isEndOfAgentCycle = idx === participants.length - 1;
+            const audienceSlotSeconds = Math.max(0, room.audienceSlotDurationSeconds);
+            const shouldOpenAudienceSlot = isEndOfAgentCycle && audienceSlotSeconds > 0;
+
+            if (shouldOpenAudienceSlot) {
+              // We finished a full agent cycle; open the audience slot and pause the auto loop.
+              yield* dbTry(() =>
+                db
+                  .update(rooms)
+                  .set({
+                    status: "audience_slot",
+                    currentTurnNumber: job.turnNumber,
+                    currentTurnAgentId: next.agentId,
+                  })
+                  .where(eq(rooms.id, room.id))
+                  .run(),
+              );
+
+              // Best-effort: ensure the thread is unlocked for the audience slot.
+              yield* retryWithBackoff(discord.unlockThread(room.threadId), {
+                maxRetries: 3,
+                isRetryable: isRetryableDiscordError,
+                getRetryAfterMs: discordRetryAfterMs,
+              }).pipe(Effect.catchAll(logThreadWarning("unlock")));
+
+              yield* turnEvents.write({
+                roomId: room.id,
+                turnNumber: job.turnNumber,
+                phase: "audience_slot_open",
+                status: "ok",
+                data: { durationSeconds: audienceSlotSeconds },
+              });
+
+              yield* turnEvents.write({
+                roomId: room.id,
+                turnNumber: job.turnNumber,
+                phase: "finish",
+                status: "ok",
+                data: {
+                  nextTurnNumber: job.turnNumber + 1,
+                  nextAgentId: next.agentId,
+                  audienceSlotOpened: true,
+                  audienceSlotDurationSeconds: audienceSlotSeconds,
+                },
+              });
+
+              return {
+                type: "close_audience_slot",
+                roomId: room.id,
+                turnNumber: job.turnNumber,
+                delaySeconds: audienceSlotSeconds,
+              } as const;
+            }
+
+            // Normal case: advance to the next agent and continue.
             yield* dbTry(() =>
               db
                 .update(rooms)
-                .set({ currentTurnNumber: job.turnNumber, currentTurnAgentId: next.agentId })
+                .set({
+                  status: "active",
+                  currentTurnNumber: job.turnNumber,
+                  currentTurnAgentId: next.agentId,
+                })
                 .where(eq(rooms.id, room.id))
                 .run(),
             );
@@ -1035,7 +1156,7 @@ export class ArenaService extends Context.Tag("@agon/ArenaService")<
               data: { nextTurnNumber: job.turnNumber + 1, nextAgentId: next.agentId },
             });
 
-            return { roomId: room.id, turnNumber: job.turnNumber + 1 } as const;
+            return { type: "turn", roomId: room.id, turnNumber: job.turnNumber + 1 } as const;
           }).pipe(
             Effect.tapError((e) =>
               turnEvents.write({
