@@ -133,6 +133,7 @@ export class LlmRouter extends Context.Tag("@agon/LlmRouter")<
         model: string,
         prompt: Prompt.RawInput,
         apiKey: Redacted.Redacted,
+        options?: { readonly temperature?: number; readonly maxTokens?: number },
       ) =>
         Effect.tryPromise({
           try: async () => {
@@ -151,7 +152,12 @@ export class LlmRouter extends Context.Tag("@agon/LlmRouter")<
             const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
               method: "POST",
               headers,
-              body: JSON.stringify({ model, messages }),
+              body: JSON.stringify({
+                model,
+                messages,
+                ...(options?.temperature !== undefined && { temperature: options.temperature }),
+                ...(options?.maxTokens !== undefined && { max_tokens: options.maxTokens }),
+              }),
             });
 
             if (!res.ok) {
@@ -202,12 +208,19 @@ export class LlmRouter extends Context.Tag("@agon/LlmRouter")<
         readonly provider: LlmProvider;
         readonly model: string;
         readonly prompt: Prompt.RawInput;
+        readonly temperature?: number;
+        readonly maxTokens?: number;
+        readonly thinkingLevel?: "low" | "medium" | "high";
+        readonly thinkingBudgetTokens?: number;
       }) {
         const apiKey = yield* requireApiKey(args.provider);
 
         // OpenRouter: use direct chat completions API
         if (args.provider === "openrouter") {
-          return yield* openRouterGenerate(args.model, args.prompt, apiKey).pipe(
+          return yield* openRouterGenerate(args.model, args.prompt, apiKey, {
+            temperature: args.temperature,
+            maxTokens: args.maxTokens,
+          }).pipe(
             Effect.timeout("30 seconds"),
             Effect.mapError((cause) => LlmCallFailed.make({ provider: args.provider, cause })),
           );
