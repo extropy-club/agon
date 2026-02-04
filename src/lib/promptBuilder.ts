@@ -49,9 +49,13 @@ export const buildPrompt = (
   agent: PromptBuilderAgent,
   messages: ReadonlyArray<PromptBuilderMessage>,
 ): Prompt.RawInput => {
-  const prompt: Array<Prompt.MessageEncoded> = [
-    { role: "system", content: agent.systemPrompt },
-    {
+  const prompt: Array<Prompt.MessageEncoded> = [{ role: "system", content: agent.systemPrompt }];
+
+  const hasModeratorMessage = messages.some((m) => m.authorType === "moderator");
+
+  // Back-compat: older rooms might not have a persisted moderator message.
+  if (!hasModeratorMessage) {
+    prompt.push({
       role: "user",
       content: [
         textPart(
@@ -62,8 +66,8 @@ export const buildPrompt = (
           }),
         ),
       ],
-    },
-  ];
+    });
+  }
 
   let i = 0;
   while (i < messages.length) {

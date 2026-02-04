@@ -8,11 +8,15 @@ export default function RoomComposer() {
   const [agents] = createResource(agentsApi.list);
 
   const [selectedAgentIds, setSelectedAgentIds] = createSignal<string[]>([]);
+  const [title, setTitle] = createSignal("");
   const [topic, setTopic] = createSignal("");
   const [parentChannelId, setParentChannelId] = createSignal("");
   const [threadId, setThreadId] = createSignal("");
   const [threadName, setThreadName] = createSignal("Agon Room");
   const [autoArchiveDurationMinutes, setAutoArchiveDurationMinutes] = createSignal("1440");
+  const [audienceSlotDurationSeconds, setAudienceSlotDurationSeconds] = createSignal("30");
+  const [audienceTokenLimit, setAudienceTokenLimit] = createSignal("4096");
+  const [roomTokenLimit, setRoomTokenLimit] = createSignal("32000");
 
   const toggleAgent = (id: string) => {
     if (selectedAgentIds().includes(id)) {
@@ -26,10 +30,14 @@ export default function RoomComposer() {
     e.preventDefault();
 
     const result = await roomsApi.create({
+      title: title(),
       topic: topic(),
       parentChannelId: parentChannelId(),
       agentIds: selectedAgentIds(),
       autoArchiveDurationMinutes: Number(autoArchiveDurationMinutes()),
+      audienceSlotDurationSeconds: Number(audienceSlotDurationSeconds()),
+      audienceTokenLimit: Number(audienceTokenLimit()),
+      roomTokenLimit: Number(roomTokenLimit()),
       ...(threadId().trim().length > 0 ? { threadId: threadId().trim() } : {}),
       ...(() => {
         const tn = threadName().trim();
@@ -46,13 +54,25 @@ export default function RoomComposer() {
 
       <form class="card" onSubmit={handleSubmit}>
         <div class="form-group">
-          <label>Topic</label>
+          <label>Title</label>
           <input
+            class="form-control"
+            value={title()}
+            onInput={(e) => setTitle(e.currentTarget.value)}
+            required
+            placeholder="Room Title"
+          />
+        </div>
+
+        <div class="form-group">
+          <label>Topic</label>
+          <textarea
             class="form-control"
             value={topic()}
             onInput={(e) => setTopic(e.currentTarget.value)}
             required
             placeholder="e.g. The ethics of AI"
+            rows={4}
           />
         </div>
 
@@ -104,6 +124,54 @@ export default function RoomComposer() {
             <option value="4320">3 days</option>
             <option value="10080">1 week</option>
           </select>
+        </div>
+
+        <div class="form-group">
+          <label>Audience Slot Duration (seconds)</label>
+          <input
+            type="number"
+            class="form-control"
+            value={audienceSlotDurationSeconds()}
+            onInput={(e) => setAudienceSlotDurationSeconds(e.currentTarget.value)}
+            min="0"
+          />
+          <div
+            style={{ "font-size": "0.875rem", color: "var(--text-muted)", "margin-top": "0.5rem" }}
+          >
+            How long audience can speak per turn. 0 = manual only.
+          </div>
+        </div>
+
+        <div class="form-group">
+          <label>Audience Token Limit</label>
+          <input
+            type="number"
+            class="form-control"
+            value={audienceTokenLimit()}
+            onInput={(e) => setAudienceTokenLimit(e.currentTarget.value)}
+            min="1"
+          />
+          <div
+            style={{ "font-size": "0.875rem", color: "var(--text-muted)", "margin-top": "0.5rem" }}
+          >
+            Max tokens per audience message batch.
+          </div>
+        </div>
+
+        <div class="form-group">
+          <label>Room Token Limit</label>
+          <input
+            type="number"
+            class="form-control"
+            value={roomTokenLimit()}
+            onInput={(e) => setRoomTokenLimit(e.currentTarget.value)}
+            min="1"
+          />
+          <div
+            style={{ "font-size": "0.875rem", color: "var(--text-muted)", "margin-top": "0.5rem" }}
+          >
+            Max tokens for room context.
+          </div>
         </div>
 
         <div class="form-group">

@@ -72,6 +72,8 @@ type DiscordWebhookListItem = {
 
 type DiscordThread = { readonly id: string };
 
+type DiscordChannel = { readonly id: string; readonly name?: string };
+
 export class Discord extends Context.Tag("@agon/Discord")<
   Discord,
   {
@@ -95,16 +97,40 @@ export class Discord extends Context.Tag("@agon/Discord")<
       args: { name: string; autoArchiveDurationMinutes: DiscordAutoArchiveDurationMinutes },
     ) => Effect.Effect<string, DiscordError>;
 
+    /**
+     * Fetch the name of a channel/thread.
+     */
+    readonly fetchChannelName: (channelId: string) => Effect.Effect<string, DiscordError>;
+
+    /**
+     * Post a message to a channel/thread as the bot.
+     */
+    readonly postMessage: (
+      channelId: string,
+      content: string,
+    ) => Effect.Effect<DiscordMessage, DiscordError>;
+
     readonly fetchRecentMessages: (
       channelId: string,
       limit: number,
     ) => Effect.Effect<ReadonlyArray<DiscordMessage>, DiscordError>;
+
+    /**
+     * Resolve the bot user's id (used to classify non-webhook bot messages as notifications).
+     *
+     * Prefers DISCORD_BOT_USER_ID config when provided, otherwise fetches /users/@me.
+     */
+    readonly getBotUserId: () => Effect.Effect<string, DiscordError>;
   }
 >() {
   static readonly layer = Layer.effect(
     Discord,
     Effect.gen(function* () {
       const botToken = yield* Config.option(Config.redacted("DISCORD_BOT_TOKEN"));
+      const configuredBotUserId = yield* Config.option(Config.string("DISCORD_BOT_USER_ID"));
+
+      // Cache within the worker isolate (module instance) to avoid repeated Discord API calls.
+      let botUserIdCache: string | undefined;
 
       const sanitizeToken = (s: string) =>
         s
@@ -116,6 +142,36 @@ export class Discord extends Context.Tag("@agon/Discord")<
 
       const authHeader = (token: Redacted.Redacted) =>
         `Bot ${sanitizeToken(Redacted.value(token))}`;
+
+      const getBotUserId = () =>
+        Effect.suspend(() => {
+          if (botUserIdCache) return Effect.succeed(botUserIdCache);
+
+          return Option.match(configuredBotUserId, {
+            onSome: (id) =>
+              Effect.sync(() => {
+                botUserIdCache = id;
+                return id;
+              }),
+            onNone: () =>
+              requireBotToken(botToken).pipe(
+                Effect.map(authHeader),
+                Effect.flatMap((Authorization) =>
+                  requestJson<{ id: string }>(`/users/@me`, {
+                    method: "GET",
+                    headers: { Authorization },
+                  }),
+                ),
+                Effect.map((u) => u.id),
+                Effect.tap((id) =>
+                  Effect.sync(() => {
+                    botUserIdCache = id;
+                  }),
+                ),
+                Effect.mapError((e) => e as DiscordError),
+              ),
+          });
+        });
 
       const createWebhook = (channelId: string) =>
         requireBotToken(botToken).pipe(
@@ -181,6 +237,38 @@ export class Discord extends Context.Tag("@agon/Discord")<
           Effect.mapError((e) => e as DiscordError),
         );
 
+      const fetchChannelName = (channelId: string) =>
+        requireBotToken(botToken).pipe(
+          Effect.map(authHeader),
+          Effect.flatMap((Authorization) =>
+            requestJson<DiscordChannel>(`/channels/${channelId}`, {
+              method: "GET",
+              headers: { Authorization },
+            }),
+          ),
+          Effect.map((c) => c.name ?? ""),
+          Effect.mapError((e) => e as DiscordError),
+        );
+
+      const postMessage = (channelId: string, content: string) =>
+        requireBotToken(botToken).pipe(
+          Effect.map(authHeader),
+          Effect.flatMap((Authorization) =>
+            requestJson<DiscordMessage>(`/channels/${channelId}/messages`, {
+              method: "POST",
+              headers: {
+                Authorization,
+                "Content-Type": "application/json",
+              },
+              body: JSON.stringify({
+                content,
+                allowed_mentions: { parse: [] },
+              }),
+            }),
+          ),
+          Effect.mapError((e) => e as DiscordError),
+        );
+
       const fetchRecentMessages = (channelId: string, limit: number) =>
         requireBotToken(botToken).pipe(
           Effect.map(authHeader),
@@ -197,7 +285,10 @@ export class Discord extends Context.Tag("@agon/Discord")<
         createWebhook,
         createOrFetchWebhook,
         createPublicThread,
+        fetchChannelName,
+        postMessage,
         fetchRecentMessages,
+        getBotUserId,
       });
     }),
   );

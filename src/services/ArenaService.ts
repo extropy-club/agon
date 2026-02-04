@@ -1,9 +1,9 @@
-import * as Prompt from "@effect/ai/Prompt";
+import { buildPrompt } from "../lib/promptBuilder.js";
 import { and, asc, desc, eq, lt, or, sql } from "drizzle-orm";
 import { Config, Context, Effect, Layer, Schema } from "effect";
 import { Db, nowMs } from "../d1/db.js";
 import { agents, discordChannels, messages, roomAgents, rooms } from "../d1/schema.js";
-import { Discord, DiscordApiError } from "./Discord.js";
+import { Discord, DiscordApiError, MissingDiscordConfig } from "./Discord.js";
 import { DiscordWebhookPostFailed, DiscordWebhookPoster } from "./DiscordWebhook.js";
 import { type LlmRouterError, LlmRouter } from "./LlmRouter.js";
 import { TurnEventService } from "./TurnEventService.js";
@@ -31,6 +31,7 @@ export type ArenaError =
   | RoomDbError
   | LlmRouterError
   | DiscordApiError
+  | MissingDiscordConfig
   | DiscordWebhookPostFailed;
 
 const dbTry = <A>(thunk: () => Promise<A>) =>
@@ -75,8 +76,13 @@ const defaultAgents: ReadonlyArray<{
   },
 ];
 
-const rules = (topic: string) =>
-  `Debate topic: ${topic}\n\nRules:\n- Stay on topic.\n- No meta talk about being an AI.\n- Aim for 5-10 sentences.\n- If you want to end, say 'Goodbye.'`;
+const formatModeratorMessage = (args: { title: string; topic: string }) =>
+  `📢 **${args.title}**\n\n${args.topic}\n\n**Rules:**\n- Stay on topic\n- No meta talk about being an AI\n- Aim for 5-10 sentences\n- Say 'Goodbye' to end the debate\n\nDebate begins now!`;
+
+const isModeratorMessage = (content: string) =>
+  content.startsWith("📢 **") &&
+  content.includes("**Rules:**") &&
+  content.includes("Debate begins now!");
 
 export class ArenaService extends Context.Tag("@agon/ArenaService")<
   ArenaService,
@@ -99,6 +105,10 @@ export class ArenaService extends Context.Tag("@agon/ArenaService")<
       topic: string;
       autoArchiveDurationMinutes?: number;
       agentIds?: ReadonlyArray<string>;
+      title?: string;
+      audienceSlotDurationSeconds?: number;
+      audienceTokenLimit?: number;
+      roomTokenLimit?: number;
     }) => Effect.Effect<{ roomId: number; firstJob: RoomTurnJob }, ArenaError>;
 
     readonly stopArena: (roomId: number) => Effect.Effect<void, ArenaError>;
@@ -143,6 +153,10 @@ export class ArenaService extends Context.Tag("@agon/ArenaService")<
         topic: string;
         autoArchiveDurationMinutes: number;
         agentIds?: ReadonlyArray<string>;
+        title?: string;
+        audienceSlotDurationSeconds?: number;
+        audienceTokenLimit?: number;
+        roomTokenLimit?: number;
       }) {
         yield* seedAgents();
 
@@ -174,9 +188,13 @@ export class ArenaService extends Context.Tag("@agon/ArenaService")<
               .values({
                 status: "active",
                 topic: args.topic,
+                title: args.title ?? "",
                 parentChannelId: args.parentChannelId,
                 threadId: args.threadId,
                 autoArchiveDurationMinutes,
+                audienceSlotDurationSeconds: args.audienceSlotDurationSeconds ?? 60,
+                audienceTokenLimit: args.audienceTokenLimit ?? 4096,
+                roomTokenLimit: args.roomTokenLimit ?? 32000,
                 currentTurnAgentId: firstAgentId,
                 currentTurnNumber: 0,
                 lastEnqueuedTurnNumber: 0,
@@ -193,9 +211,13 @@ export class ArenaService extends Context.Tag("@agon/ArenaService")<
             .set({
               status: "active",
               topic: args.topic,
+              title: args.title ?? "",
               parentChannelId: args.parentChannelId,
               threadId: args.threadId,
               autoArchiveDurationMinutes,
+              audienceSlotDurationSeconds: args.audienceSlotDurationSeconds ?? 60,
+              audienceTokenLimit: args.audienceTokenLimit ?? 4096,
+              roomTokenLimit: args.roomTokenLimit ?? 32000,
               currentTurnAgentId: firstAgentId,
               currentTurnNumber: 0,
               lastEnqueuedTurnNumber: 0,
@@ -239,14 +261,99 @@ export class ArenaService extends Context.Tag("@agon/ArenaService")<
         topic: string;
         autoArchiveDurationMinutes?: number;
         agentIds?: ReadonlyArray<string>;
+        title?: string;
+        audienceSlotDurationSeconds?: number;
+        audienceTokenLimit?: number;
+        roomTokenLimit?: number;
       }) {
-        return yield* upsertRoom({
+        const providedTitle = args.title?.trim();
+        const hasProvidedTitle = providedTitle !== undefined && providedTitle.length > 0;
+
+        const result = yield* upsertRoom({
           parentChannelId: args.parentChannelId,
           threadId: args.threadId,
           topic: args.topic,
           autoArchiveDurationMinutes: args.autoArchiveDurationMinutes ?? 1440,
           ...(args.agentIds ? { agentIds: args.agentIds } : {}),
+          ...(hasProvidedTitle ? { title: providedTitle! } : {}),
+          ...(args.audienceSlotDurationSeconds !== undefined
+            ? { audienceSlotDurationSeconds: args.audienceSlotDurationSeconds }
+            : {}),
+          ...(args.audienceTokenLimit !== undefined
+            ? { audienceTokenLimit: args.audienceTokenLimit }
+            : {}),
+          ...(args.roomTokenLimit !== undefined ? { roomTokenLimit: args.roomTokenLimit } : {}),
         });
+
+        const fetchedTitle = hasProvidedTitle
+          ? ""
+          : yield* discord.fetchChannelName(args.threadId).pipe(
+              Effect.map((t) => t.trim()),
+              Effect.catchAll(() => Effect.succeed("")),
+            );
+
+        const title = hasProvidedTitle
+          ? (providedTitle as string)
+          : fetchedTitle.length > 0
+            ? fetchedTitle
+            : `Agon Room ${result.roomId}`;
+
+        // Only persist the Discord thread title if no title was provided and Discord returned a name.
+        if (!hasProvidedTitle && fetchedTitle.length > 0) {
+          yield* dbTry(() =>
+            db.update(rooms).set({ title: fetchedTitle }).where(eq(rooms.id, result.roomId)).run(),
+          );
+        }
+
+        const content = formatModeratorMessage({ title, topic: args.topic });
+
+        // Post visibly in the thread as the bot (not a webhook).
+        //
+        // IMPORTANT: Discord can fail (bad token, permissions, rate limit, etc.). Room creation should
+        // still succeed and we always insert a moderator message into D1.
+        const posted = yield* discord.postMessage(args.threadId, content).pipe(
+          Effect.catchTag("MissingDiscordConfig", (e) =>
+            Effect.logInfo("discord.postMessage.skipped_missing_config").pipe(
+              Effect.annotateLogs({ key: e.key, threadId: args.threadId, roomId: result.roomId }),
+              Effect.as(null),
+            ),
+          ),
+          Effect.catchAll((e) =>
+            Effect.logWarning("discord.postMessage.failed").pipe(
+              Effect.annotateLogs({
+                error: errorLabel(e),
+                threadId: args.threadId,
+                roomId: result.roomId,
+              }),
+              Effect.as(null),
+            ),
+          ),
+        );
+
+        const parsed = posted ? Date.parse(posted.timestamp) : NaN;
+        const now = yield* nowMs;
+        const createdAtMs = Number.isFinite(parsed) ? parsed : now;
+        const discordMessageId = posted
+          ? posted.id
+          : `local-moderator:${result.roomId}:${createdAtMs}`;
+
+        // Store in D1 so it appears as the first message in agent prompts.
+        yield* dbTry(() =>
+          db
+            .insert(messages)
+            .values({
+              roomId: result.roomId,
+              discordMessageId,
+              threadId: args.threadId,
+              authorType: "moderator",
+              authorAgentId: null,
+              content,
+              createdAtMs,
+            })
+            .run(),
+        );
+
+        return result;
       });
 
       const stopArena = Effect.fn("ArenaService.stopArena")(function* (roomId: number) {
@@ -386,13 +493,28 @@ export class ArenaService extends Context.Tag("@agon/ArenaService")<
               Effect.annotateLogs({ discordUpserted: ordered.length }),
             );
 
+            const needsBotUserId = ordered.some(
+              ({ m }) => m.webhook_id === undefined && m.author.bot === true,
+            );
+            const botUserId = needsBotUserId
+              ? yield* discord
+                  .getBotUserId()
+                  .pipe(Effect.catchTag("MissingDiscordConfig", () => Effect.succeed(null)))
+              : null;
+
             for (const { m, createdAtMs } of ordered) {
               const isWebhookMessage = m.webhook_id !== undefined;
+              const isNotification =
+                !isWebhookMessage && botUserId !== null && m.author.id === botUserId;
+              const isModerator = isNotification && isModeratorMessage(m.content);
+
               const authorType = isWebhookMessage
                 ? ("agent" as const)
-                : m.author.bot === true
-                  ? ("notification" as const)
-                  : ("audience" as const);
+                : isModerator
+                  ? ("moderator" as const)
+                  : isNotification
+                    ? ("notification" as const)
+                    : ("audience" as const);
 
               const authorAgentId =
                 authorType === "agent" ? agentNameToId.get(m.author.username) : undefined;
@@ -475,24 +597,35 @@ export class ArenaService extends Context.Tag("@agon/ArenaService")<
             Effect.annotateLogs({ promptMessages: promptHistory.length }),
           );
 
-          const prompt: Prompt.RawInput = [
-            {
-              role: "system",
-              content: `${agent.systemPrompt}\n\n${rules(room.topic)}`,
-            },
-            ...promptHistory.map((m) => {
-              if (m.authorType === "audience" || m.authorType === "moderator") {
-                return {
-                  role: "user",
-                  content: [Prompt.makePart("text", { text: m.content })],
-                } as const;
-              }
-              return {
-                role: "assistant",
-                content: [Prompt.makePart("text", { text: m.content })],
-              } as const;
-            }),
-          ];
+          const agentNameById = new Map(
+            (yield* dbTry(() =>
+              db.select({ id: agents.id, name: agents.name }).from(agents).all(),
+            )).map((a) => [a.id, a.name] as const),
+          );
+
+          const getAgentName = (agentId: string | null | undefined): string =>
+            (agentId ? agentNameById.get(agentId) : undefined) ?? "Unknown";
+
+          const getNonAgentName = (
+            m: { readonly authorType: string } & Record<string, unknown>,
+          ): string => {
+            const explicit = m["authorName"];
+            if (typeof explicit === "string" && explicit.trim().length > 0) return explicit;
+            if (m.authorType === "audience") return "Audience";
+            if (m.authorType === "moderator") return "Moderator";
+            return "Unknown";
+          };
+
+          const prompt = buildPrompt(
+            { title: room.title, topic: room.topic },
+            { systemPrompt: agent.systemPrompt },
+            promptHistory.map((m) => ({
+              authorType: m.authorType,
+              authorName:
+                m.authorType === "agent" ? getAgentName(m.authorAgentId) : getNonAgentName(m),
+              content: m.content,
+            })),
+          );
 
           // deterministic id to make turn replay idempotent
           const discordMessageId = `local-turn:${room.id}:${job.turnNumber}`;

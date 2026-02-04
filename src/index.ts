@@ -29,6 +29,7 @@ export interface Env {
   // Optional runtime config (usually provided via .dev.vars / wrangler secrets)
   DISCORD_PUBLIC_KEY?: string;
   DISCORD_BOT_TOKEN?: string;
+  DISCORD_BOT_USER_ID?: string;
 
   // Optional Cloudflare dashboard deep links (used by admin UI)
   CF_ACCOUNT_ID?: string;
@@ -73,6 +74,7 @@ const makeConfigLayer = (env: Env) => {
     "ADMIN_TOKEN",
     "DISCORD_PUBLIC_KEY",
     "DISCORD_BOT_TOKEN",
+    "DISCORD_BOT_USER_ID",
     "OPENAI_API_KEY",
     "OPENROUTER_API_KEY",
     "OPENROUTER_HTTP_REFERER",
@@ -227,6 +229,10 @@ export default {
       const CreateRoomSchema = Schema.Struct({
         parentChannelId: Schema.String,
         topic: Schema.String,
+        title: Schema.optional(Schema.String),
+        audienceSlotDurationSeconds: Schema.optional(Schema.Number),
+        audienceTokenLimit: Schema.optional(Schema.Number),
+        roomTokenLimit: Schema.optional(Schema.Number),
         autoArchiveDurationMinutes: Schema.optional(Schema.Number),
         agentIds: Schema.Array(Schema.String),
         // Provide threadId to bind to an existing thread. If omitted, we will create a thread.
@@ -454,6 +460,14 @@ export default {
               topic: body.topic,
               autoArchiveDurationMinutes,
               agentIds: body.agentIds,
+              ...(body.title !== undefined ? { title: body.title } : {}),
+              ...(body.audienceSlotDurationSeconds !== undefined
+                ? { audienceSlotDurationSeconds: body.audienceSlotDurationSeconds }
+                : {}),
+              ...(body.audienceTokenLimit !== undefined
+                ? { audienceTokenLimit: body.audienceTokenLimit }
+                : {}),
+              ...(body.roomTokenLimit !== undefined ? { roomTokenLimit: body.roomTokenLimit } : {}),
             });
 
             yield* Effect.tryPromise({
