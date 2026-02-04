@@ -1,8 +1,9 @@
 import * as Prompt from "@effect/ai/Prompt";
-import { and, asc, desc, eq, lt, sql } from "drizzle-orm";
+import { and, asc, desc, eq, lt, or, sql } from "drizzle-orm";
 import { Config, Context, Effect, Layer, Schema } from "effect";
 import { Db, nowMs } from "../d1/db.js";
 import { agents, discordChannels, messages, roomAgents, rooms } from "../d1/schema.js";
+import { Discord, DiscordApiError } from "./Discord.js";
 import { DiscordWebhookPostFailed, DiscordWebhookPoster } from "./DiscordWebhook.js";
 import { type LlmRouterError, LlmRouter } from "./LlmRouter.js";
 
@@ -28,6 +29,7 @@ export type ArenaError =
   | AgentNotFound
   | RoomDbError
   | LlmRouterError
+  | DiscordApiError
   | DiscordWebhookPostFailed;
 
 const dbTry = <A>(thunk: () => Promise<A>) =>
@@ -103,6 +105,7 @@ export class ArenaService extends Context.Tag("@agon/ArenaService")<
     ArenaService,
     Effect.gen(function* () {
       const { db } = yield* Db;
+      const discord = yield* Discord;
       const llmRouter = yield* LlmRouter;
       const webhookPoster = yield* DiscordWebhookPoster;
 
@@ -259,38 +262,140 @@ export class ArenaService extends Context.Tag("@agon/ArenaService")<
         );
         if (!agent) return yield* AgentNotFound.make({ agentId: room.currentTurnAgentId });
 
-        // bounded history
-        const history = yield* dbTry(() =>
+        // webhook info (used for both sync classification and posting)
+        const webhook = yield* dbTry(() =>
+          db
+            .select()
+            .from(discordChannels)
+            .where(eq(discordChannels.channelId, room.parentChannelId))
+            .get(),
+        );
+
+        // Sync recent Discord thread history into D1.
+        //
+        // If DISCORD_BOT_TOKEN is missing, Discord.fetchRecentMessages fails with
+        // MissingDiscordConfig — we intentionally skip sync and keep using D1-only history.
+        //
+        // Any other Discord API failure should fail the turn (and let the queue retry),
+        // because Discord is the source of truth for room history.
+        const discordMessages = yield* discord
+          .fetchRecentMessages(room.threadId, historyLimit)
+          .pipe(Effect.catchTag("MissingDiscordConfig", () => Effect.succeed(null)));
+
+        if (discordMessages) {
+          const agentNameToId = new Map(
+            (yield* dbTry(() =>
+              db.select({ id: agents.id, name: agents.name }).from(agents).all(),
+            )).map((a) => [a.name, a.id] as const),
+          );
+
+          const ordered = discordMessages
+            .map((m) => ({ m, createdAtMs: Date.parse(m.timestamp) }))
+            .filter((x) => Number.isFinite(x.createdAtMs))
+            .sort((a, b) => a.createdAtMs - b.createdAtMs);
+
+          for (const { m, createdAtMs } of ordered) {
+            const isWebhookMessage = m.webhook_id !== undefined;
+            const authorType = isWebhookMessage
+              ? ("agent" as const)
+              : m.author.bot === true
+                ? ("bot_other" as const)
+                : ("human" as const);
+
+            const authorAgentId =
+              authorType === "agent" ? agentNameToId.get(m.author.username) : undefined;
+
+            yield* dbTry(() =>
+              db
+                .insert(messages)
+                .values({
+                  roomId: room.id,
+                  discordMessageId: m.id,
+                  threadId: room.threadId,
+                  authorType,
+                  authorAgentId: authorAgentId ?? null,
+                  content: m.content,
+                  createdAtMs,
+                })
+                .onConflictDoUpdate({
+                  target: messages.discordMessageId,
+                  set: {
+                    roomId: room.id,
+                    threadId: room.threadId,
+                    authorType,
+                    authorAgentId: authorAgentId ?? null,
+                    content: m.content,
+                    createdAtMs,
+                  },
+                })
+                .run(),
+            );
+          }
+        }
+
+        // bounded history (timestamp-based due to sync inserts)
+        // We intentionally load more than `historyLimit` so that we can filter out
+        // bot_other + local-turn duplicates without losing context.
+        const rawHistoryLimit = Math.max(historyLimit * 3, 60);
+        const rawHistory = yield* dbTry(() =>
           db
             .select()
             .from(messages)
             .where(eq(messages.roomId, room.id))
-            .orderBy(desc(messages.id))
-            .limit(historyLimit)
+            .orderBy(desc(messages.createdAtMs), desc(messages.id))
+            .limit(rawHistoryLimit)
             .all(),
         );
+
+        const nonLocalAgentMessages = rawHistory.filter(
+          (m) => m.authorType === "agent" && !m.discordMessageId.startsWith("local-turn:"),
+        );
+
+        const localTurnDedupeWindowMs = 30 * 60 * 1000;
+        const localTurnDedupeAllowEarlyMs = 30 * 1000;
+
+        const promptHistory = rawHistory
+          .slice()
+          .reverse()
+          .filter((m) => m.authorType !== "bot_other")
+          .filter((m) => {
+            // Prefer synced Discord webhook messages over their local-turn duplicates, but
+            // keep local-turn messages when we don't have a synced copy yet.
+            if (m.authorType !== "agent") return true;
+            if (!m.discordMessageId.startsWith("local-turn:")) return true;
+
+            const isDuplicate = nonLocalAgentMessages.some((x) => {
+              if (x.content !== m.content) return false;
+              const dt = x.createdAtMs - m.createdAtMs;
+              if (dt < -localTurnDedupeAllowEarlyMs) return false;
+              if (dt > localTurnDedupeWindowMs) return false;
+              if (m.authorAgentId && x.authorAgentId && x.authorAgentId !== m.authorAgentId) {
+                return false;
+              }
+              return true;
+            });
+
+            return !isDuplicate;
+          })
+          .slice(-historyLimit);
 
         const prompt: Prompt.RawInput = [
           {
             role: "system",
             content: `${agent.systemPrompt}\n\n${rules(room.topic)}`,
           },
-          ...history
-            .slice()
-            .reverse()
-            .filter((m) => m.authorType !== "bot_other")
-            .map((m) => {
-              if (m.authorType === "human") {
-                return {
-                  role: "user",
-                  content: [Prompt.makePart("text", { text: m.content })],
-                } as const;
-              }
+          ...promptHistory.map((m) => {
+            if (m.authorType === "human") {
               return {
-                role: "assistant",
+                role: "user",
                 content: [Prompt.makePart("text", { text: m.content })],
               } as const;
-            }),
+            }
+            return {
+              role: "assistant",
+              content: [Prompt.makePart("text", { text: m.content })],
+            } as const;
+          }),
         ];
 
         // deterministic id to make turn replay idempotent
@@ -349,10 +454,10 @@ export class ArenaService extends Context.Tag("@agon/ArenaService")<
             if (count <= maxKeep) return;
 
             const cutoff = await db
-              .select({ id: messages.id })
+              .select({ id: messages.id, createdAtMs: messages.createdAtMs })
               .from(messages)
               .where(eq(messages.roomId, room.id))
-              .orderBy(desc(messages.id))
+              .orderBy(desc(messages.createdAtMs), desc(messages.id))
               .offset(maxKeep)
               .limit(1)
               .get();
@@ -361,20 +466,20 @@ export class ArenaService extends Context.Tag("@agon/ArenaService")<
 
             await db
               .delete(messages)
-              .where(and(eq(messages.roomId, room.id), lt(messages.id, cutoff.id)))
+              .where(
+                and(
+                  eq(messages.roomId, room.id),
+                  or(
+                    lt(messages.createdAtMs, cutoff.createdAtMs),
+                    and(eq(messages.createdAtMs, cutoff.createdAtMs), lt(messages.id, cutoff.id)),
+                  ),
+                ),
+              )
               .run();
           });
         }
 
         // Post to Discord if we have a webhook for this room's parent channel
-        const webhook = yield* dbTry(() =>
-          db
-            .select()
-            .from(discordChannels)
-            .where(eq(discordChannels.channelId, room.parentChannelId))
-            .get(),
-        );
-
         if (webhook) {
           yield* webhookPoster.post({
             webhook: { id: webhook.webhookId, token: webhook.webhookToken },

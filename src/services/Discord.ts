@@ -23,6 +23,16 @@ export type DiscordWebhook = {
 export type DiscordMessage = {
   readonly id: string;
   readonly content: string;
+
+  /** Present when the message was created by a webhook. */
+  readonly webhook_id?: string;
+
+  /** ISO timestamp (as returned by the Discord API). */
+  readonly timestamp: string;
+
+  /** ISO timestamp or null when the message was never edited. */
+  readonly edited_timestamp?: string | null;
+
   readonly author: { readonly id: string; readonly username: string; readonly bot?: boolean };
 };
 
