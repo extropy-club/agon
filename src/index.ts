@@ -595,6 +595,71 @@ export default {
             return json(200, { ok: true, enqueued: room.lastEnqueuedTurnNumber < nextTurnNumber });
           }
 
+          if (action === "kick") {
+            const room = yield* dbTry(() =>
+              db.select().from(rooms).where(eq(rooms.id, roomId)).get(),
+            );
+            if (!room) {
+              return yield* Effect.fail(
+                AdminNotFound.make({ resource: "room", id: String(roomId) }),
+              );
+            }
+
+            if (room.status !== "active") {
+              return json(409, { error: "Room is paused", ok: false, enqueued: false });
+            }
+
+            const nextTurnNumber = room.currentTurnNumber + 1;
+
+            // Prevent accidental duplicates while the room is actively progressing.
+            // Only allow kick when the room looks stale (no recent messages recorded).
+            const lastMsg = yield* dbTry(() =>
+              db
+                .select({ createdAtMs: messages.createdAtMs })
+                .from(messages)
+                .where(eq(messages.roomId, roomId))
+                .orderBy(desc(messages.createdAtMs))
+                .get(),
+            );
+
+            const now = Date.now();
+            const ageMs = lastMsg ? now - Number(lastMsg.createdAtMs) : Number.POSITIVE_INFINITY;
+            if (ageMs < 15_000) {
+              return json(409, {
+                error: "Room not stale (refusing to kick)",
+                ok: false,
+                enqueued: false,
+                nextTurnNumber,
+              });
+            }
+
+            const job = { roomId, turnNumber: nextTurnNumber } as const;
+
+            yield* Effect.tryPromise({
+              try: () => env.ARENA_QUEUE.send(job),
+              catch: (cause) => AdminQueueError.make({ cause }),
+            });
+
+            yield* dbTry(() =>
+              db
+                .update(rooms)
+                .set({
+                  lastEnqueuedTurnNumber: sql`max(${rooms.lastEnqueuedTurnNumber}, ${nextTurnNumber})`,
+                })
+                .where(eq(rooms.id, roomId))
+                .run(),
+            ).pipe(
+              Effect.catchAll((e) =>
+                Effect.logError("admin.last_enqueued_turn.update_failed").pipe(
+                  Effect.annotateLogs({ cause: String(e.cause) }),
+                  Effect.asVoid,
+                ),
+              ),
+            );
+
+            return json(200, { ok: true, enqueued: true, turnNumber: nextTurnNumber });
+          }
+
           return json(404, { error: "Not Found" });
         }
 

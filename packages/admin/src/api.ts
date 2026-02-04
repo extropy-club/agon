@@ -138,4 +138,10 @@ export const roomsApi = {
       enqueued: boolean;
     };
   },
+  kick: async (roomId: number): Promise<{ enqueued: boolean; turnNumber: number }> => {
+    return (await apiFetch(`/rooms/${roomId}/kick`, { method: "POST" })) as {
+      enqueued: boolean;
+      turnNumber: number;
+    };
+  },
 };

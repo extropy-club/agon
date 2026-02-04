@@ -1,4 +1,4 @@
-import { createResource, For, Show } from "solid-js";
+import { createResource, For, Show, createSignal } from "solid-js";
 import { useParams } from "@solidjs/router";
 import { roomsApi } from "../api";
 
@@ -9,6 +9,9 @@ export default function RoomDetail() {
     () => params.id,
     (id) => roomsApi.get(id),
   );
+
+  const [kickError, setKickError] = createSignal<string | null>(null);
+  const [kicking, setKicking] = createSignal(false);
 
   const toggleStatus = async () => {
     const d = detail();
@@ -21,6 +24,22 @@ export default function RoomDetail() {
     }
 
     refetch();
+  };
+
+  const kick = async () => {
+    const d = detail();
+    if (!d) return;
+
+    setKickError(null);
+    setKicking(true);
+    try {
+      await roomsApi.kick(d.room.id);
+      refetch();
+    } catch (e) {
+      setKickError(String(e instanceof Error ? e.message : e));
+    } finally {
+      setKicking(false);
+    }
   };
 
   return (
@@ -36,12 +55,30 @@ export default function RoomDetail() {
             }}
           >
             <h1>Room: {d().room.topic}</h1>
-            <div>
+            <div style={{ display: "flex", gap: "0.5rem" }}>
               <button class="btn" onClick={toggleStatus}>
                 {d().room.status === "active" ? "Pause" : "Resume"}
               </button>
+              <Show when={d().room.status === "active"}>
+                <button class="btn btn-primary" onClick={kick} disabled={kicking()}>
+                  {kicking() ? "Kicking…" : "Kick next turn"}
+                </button>
+              </Show>
             </div>
           </div>
+
+          <Show when={kickError()}>
+            <div
+              class="card"
+              style={{
+                "margin-bottom": "1rem",
+                "border-color": "#fecaca",
+                "background-color": "#fef2f2",
+              }}
+            >
+              {kickError()}
+            </div>
+          </Show>
 
           <div style={{ display: "grid", "grid-template-columns": "2fr 1fr", gap: "2rem" }}>
             <div>
