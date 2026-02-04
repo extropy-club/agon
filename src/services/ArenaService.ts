@@ -1106,6 +1106,78 @@ export class ArenaService extends Context.Tag("@agon/ArenaService")<
                 getRetryAfterMs: discordRetryAfterMs,
               }).pipe(Effect.catchAll(logThreadWarning("unlock")));
 
+              const notificationContent = `💬 Audience slot open (${audienceSlotSeconds}s) - share your thoughts!`;
+
+              const posted = yield* discord.postMessage(room.threadId, notificationContent).pipe(
+                (eff) =>
+                  retryWithBackoff(eff, {
+                    maxRetries: 3,
+                    isRetryable: isRetryableDiscordError,
+                    getRetryAfterMs: discordRetryAfterMs,
+                  }),
+                Effect.catchTag("MissingDiscordConfig", (e) =>
+                  Effect.logInfo("discord.postMessage.skipped_missing_config").pipe(
+                    Effect.annotateLogs({
+                      key: e.key,
+                      threadId: room.threadId,
+                      roomId: room.id,
+                      turnNumber: job.turnNumber,
+                    }),
+                    Effect.as(null),
+                  ),
+                ),
+                Effect.catchAll((e) =>
+                  Effect.logWarning("discord.postMessage.failed").pipe(
+                    Effect.annotateLogs({
+                      error: errorLabel(e),
+                      threadId: room.threadId,
+                      roomId: room.id,
+                      turnNumber: job.turnNumber,
+                    }),
+                    Effect.as(null),
+                  ),
+                ),
+              );
+
+              const parsed = posted ? Date.parse(posted.timestamp) : NaN;
+              const now = yield* nowMs;
+              const createdAtMs = Number.isFinite(parsed) ? parsed : now;
+              const discordMessageId = posted
+                ? posted.id
+                : `local-notification:audience_open:${room.id}:${job.turnNumber}`;
+
+              // Best-effort: store in D1 so notifications are visible in admin UI and filtered out of prompts.
+              yield* Effect.tryPromise({
+                try: () =>
+                  db
+                    .insert(messages)
+                    .values({
+                      roomId: room.id,
+                      discordMessageId,
+                      threadId: room.threadId,
+                      authorType: "notification",
+                      authorAgentId: null,
+                      authorName: "System",
+                      content: notificationContent,
+                      createdAtMs,
+                    })
+                    .onConflictDoNothing({ target: messages.discordMessageId })
+                    .run(),
+                catch: (e) => e,
+              }).pipe(
+                Effect.catchAll((e) =>
+                  Effect.logWarning("db.notification_insert.failed").pipe(
+                    Effect.annotateLogs({
+                      error: String(e),
+                      threadId: room.threadId,
+                      roomId: room.id,
+                      turnNumber: job.turnNumber,
+                    }),
+                    Effect.asVoid,
+                  ),
+                ),
+              );
+
               yield* turnEvents.write({
                 roomId: room.id,
                 turnNumber: job.turnNumber,

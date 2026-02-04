@@ -54,6 +54,10 @@ export const messages = sqliteTable("messages", {
     enum: ["moderator", "agent", "audience", "notification"],
   }).notNull(),
   authorAgentId: text("author_agent_id"),
+  /**
+   * Optional explicit author name (e.g. audience username, or "System" for notifications).
+   */
+  authorName: text("author_name"),
   content: text("content").notNull(),
   // store unix epoch millis
   createdAtMs: integer("created_at_ms").notNull(),

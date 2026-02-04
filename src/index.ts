@@ -3,7 +3,7 @@ import type { APIInteraction } from "discord-api-types/v10";
 import * as ConfigProvider from "effect/ConfigProvider";
 import { Config, Effect, Layer, Option, Redacted, Schema } from "effect";
 import * as ManagedRuntime from "effect/ManagedRuntime";
-import { Db } from "./d1/db.js";
+import { Db, nowMs } from "./d1/db.js";
 import {
   agents,
   discordChannels,
@@ -1239,6 +1239,86 @@ export default {
                 if (room.status !== "audience_slot" && room.status !== "active") return null;
                 if (room.currentTurnNumber !== job.turnNumber) return null;
 
+                const nextTurnNumber = room.currentTurnNumber + 1;
+                if (room.lastEnqueuedTurnNumber >= nextTurnNumber) {
+                  yield* turnEvents.write({
+                    roomId: room.id,
+                    turnNumber: job.turnNumber,
+                    phase: "audience_slot_close",
+                    status: "info",
+                    data: { skippedEnqueue: true, nextTurnNumber },
+                  });
+                  return null;
+                }
+
+                const nextAgentName = yield* Effect.tryPromise({
+                  try: () =>
+                    db
+                      .select({ name: agents.name })
+                      .from(agents)
+                      .where(eq(agents.id, room.currentTurnAgentId))
+                      .get(),
+                  catch: (e) => e,
+                }).pipe(
+                  Effect.map((row) => row?.name ?? "Unknown"),
+                  Effect.catchAll((e) =>
+                    Effect.logWarning("db.next_agent.lookup.failed").pipe(
+                      Effect.annotateLogs({ roomId: room.id, error: String(e) }),
+                      Effect.as("Unknown"),
+                    ),
+                  ),
+                );
+
+                const notificationContent = `🔒 Audience slot closed - debate continues with ${nextAgentName}`;
+
+                const posted = yield* discord.postMessage(room.threadId, notificationContent).pipe(
+                  Effect.catchAll((e) =>
+                    Effect.logWarning("discord.postMessage.failed").pipe(
+                      Effect.annotateLogs({
+                        roomId: room.id,
+                        threadId: room.threadId,
+                        error: String(e),
+                      }),
+                      Effect.as(null),
+                    ),
+                  ),
+                );
+
+                const parsed = posted ? Date.parse(posted.timestamp) : NaN;
+                const now = yield* nowMs;
+                const createdAtMs = posted && Number.isFinite(parsed) ? parsed : now;
+                const discordMessageId = posted
+                  ? posted.id
+                  : `local-notification:audience_close:${room.id}:${job.turnNumber}`;
+
+                // Best-effort: store in D1 so notifications are visible in admin UI and filtered out of prompts.
+                yield* Effect.tryPromise({
+                  try: () =>
+                    db
+                      .insert(messages)
+                      .values({
+                        roomId: room.id,
+                        discordMessageId,
+                        threadId: room.threadId,
+                        authorType: "notification",
+                        authorAgentId: null,
+                        authorName: "System",
+                        content: notificationContent,
+                        createdAtMs,
+                      })
+                      .onConflictDoNothing({ target: messages.discordMessageId })
+                      .run(),
+                  catch: (e) => e,
+                }).pipe(
+                  Effect.catchAll((e) =>
+                    Effect.logWarning("db.notification_insert.failed").pipe(
+                      Effect.annotateLogs({ roomId: room.id, error: String(e) }),
+                      Effect.asVoid,
+                    ),
+                  ),
+                  Effect.asVoid,
+                );
+
                 // Best-effort: lock the thread.
                 yield* discord.lockThread(room.threadId).pipe(
                   Effect.catchAll((e) =>
@@ -1253,18 +1333,6 @@ export default {
                   ),
                   Effect.asVoid,
                 );
-
-                const nextTurnNumber = room.currentTurnNumber + 1;
-                if (room.lastEnqueuedTurnNumber >= nextTurnNumber) {
-                  yield* turnEvents.write({
-                    roomId: room.id,
-                    turnNumber: job.turnNumber,
-                    phase: "audience_slot_close",
-                    status: "info",
-                    data: { skippedEnqueue: true, nextTurnNumber },
-                  });
-                  return null;
-                }
 
                 yield* Effect.tryPromise({
                   try: () =>

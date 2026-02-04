@@ -1,0 +1,1 @@
+ALTER TABLE `messages` ADD `author_name` text;
