@@ -13,7 +13,9 @@ export const agents = sqliteTable("agents", {
   // Optional per-agent generation params (null => provider defaults)
   temperature: text("temperature"),
   maxTokens: integer("max_tokens"),
-  thinkingLevel: text("thinking_level", { enum: ["low", "medium", "high"] }),
+  thinkingLevel: text("thinking_level", {
+    enum: ["none", "minimal", "low", "medium", "high", "xhigh"],
+  }),
   thinkingBudgetTokens: integer("thinking_budget_tokens"),
 });
 

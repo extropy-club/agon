@@ -163,21 +163,31 @@ export default function Agents() {
               />
             </div>
 
-            <Show when={selectedProvider() === "openai" || selectedProvider() === "anthropic"}>
-              <div class="form-group">
-                <label>Thinking Level</label>
-                <select
-                  class="form-control"
-                  name="thinkingLevel"
-                  value={editingAgent()?.thinkingLevel ?? ""}
-                >
-                  <option value="">Default</option>
-                  <option value="low">Low</option>
-                  <option value="medium">Medium</option>
-                  <option value="high">High</option>
-                </select>
+            <div class="form-group">
+              <label>Thinking / Reasoning Level</label>
+              <select
+                class="form-control"
+                name="thinkingLevel"
+                value={editingAgent()?.thinkingLevel ?? ""}
+              >
+                <option value="">Default</option>
+                <option value="none">None</option>
+                <option value="minimal">Minimal</option>
+                <option value="low">Low</option>
+                <option value="medium">Medium</option>
+                <option value="high">High</option>
+                <option value="xhigh">Extra High</option>
+              </select>
+              <div
+                style={{
+                  color: "var(--text-muted)",
+                  "margin-top": "0.25rem",
+                  "font-size": "0.85em",
+                }}
+              >
+                OpenAI: reasoning_effort · Anthropic: thinking budget · Gemini 3: LOW/HIGH
               </div>
-            </Show>
+            </div>
 
             <Show when={selectedProvider() === "anthropic"}>
               <div class="form-group">

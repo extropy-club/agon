@@ -32,7 +32,7 @@ export class LlmRouter extends Context.Tag("@agon/LlmRouter")<
       readonly prompt: Prompt.RawInput;
       readonly temperature?: number;
       readonly maxTokens?: number;
-      readonly thinkingLevel?: "low" | "medium" | "high";
+      readonly thinkingLevel?: "none" | "minimal" | "low" | "medium" | "high" | "xhigh";
       readonly thinkingBudgetTokens?: number;
     }) => Effect.Effect<string, LlmRouterError>;
   }
@@ -133,7 +133,11 @@ export class LlmRouter extends Context.Tag("@agon/LlmRouter")<
         model: string,
         prompt: Prompt.RawInput,
         apiKey: Redacted.Redacted,
-        options?: { readonly temperature?: number; readonly maxTokens?: number },
+        options?: {
+          readonly temperature?: number;
+          readonly maxTokens?: number;
+          readonly reasoningEffort?: string;
+        },
       ) =>
         Effect.tryPromise({
           try: async () => {
@@ -157,6 +161,9 @@ export class LlmRouter extends Context.Tag("@agon/LlmRouter")<
                 messages,
                 ...(options?.temperature !== undefined && { temperature: options.temperature }),
                 ...(options?.maxTokens !== undefined && { max_tokens: options.maxTokens }),
+                ...(options?.reasoningEffort !== undefined && {
+                  reasoning_effort: options.reasoningEffort,
+                }),
               }),
             });
 
@@ -210,16 +217,25 @@ export class LlmRouter extends Context.Tag("@agon/LlmRouter")<
         readonly prompt: Prompt.RawInput;
         readonly temperature?: number;
         readonly maxTokens?: number;
-        readonly thinkingLevel?: "low" | "medium" | "high";
+        readonly thinkingLevel?: "none" | "minimal" | "low" | "medium" | "high" | "xhigh";
         readonly thinkingBudgetTokens?: number;
       }) {
         const apiKey = yield* requireApiKey(args.provider);
 
         // OpenRouter: use direct chat completions API
         if (args.provider === "openrouter") {
+          // OpenRouter supports reasoning_effort for compatible models (o-series, gpt-5, etc.)
+          const orEffort =
+            args.thinkingLevel !== undefined && args.thinkingLevel !== "xhigh"
+              ? args.thinkingLevel
+              : args.thinkingLevel === "xhigh"
+                ? "high"
+                : undefined;
+
           return yield* openRouterGenerate(args.model, args.prompt, apiKey, {
             ...(args.temperature !== undefined ? { temperature: args.temperature } : {}),
             ...(args.maxTokens !== undefined ? { maxTokens: args.maxTokens } : {}),
+            ...(orEffort !== undefined ? { reasoningEffort: orEffort } : {}),
           }).pipe(
             Effect.timeout("30 seconds"),
             Effect.mapError((cause) => LlmCallFailed.make({ provider: args.provider, cause })),
@@ -260,13 +276,24 @@ export class LlmRouter extends Context.Tag("@agon/LlmRouter")<
           switch (args.provider) {
             case "openai": {
               const isOModel = args.model.toLowerCase().startsWith("o");
+              const isGpt5 = args.model.toLowerCase().startsWith("gpt-5");
+              const supportsReasoning = isOModel || isGpt5;
+
+              // OpenAI accepts: none, minimal, low, medium, high
+              // Map xhigh → high (not in OpenAI spec)
+              const mapOpenAiEffort = (
+                level: string,
+              ): "none" | "minimal" | "low" | "medium" | "high" =>
+                level === "xhigh"
+                  ? "high"
+                  : (level as "none" | "minimal" | "low" | "medium" | "high");
 
               const overrides = {
                 ...(args.temperature !== undefined && { temperature: args.temperature }),
                 ...(args.maxTokens !== undefined && { max_output_tokens: args.maxTokens }),
-                ...(isOModel &&
+                ...(supportsReasoning &&
                   args.thinkingLevel !== undefined && {
-                    reasoning_effort: args.thinkingLevel,
+                    reasoning_effort: mapOpenAiEffort(args.thinkingLevel),
                   }),
               };
 
@@ -278,14 +305,23 @@ export class LlmRouter extends Context.Tag("@agon/LlmRouter")<
             }
 
             case "anthropic": {
-              const budgetFromLevel = (level: "low" | "medium" | "high"): number => {
+              // Anthropic uses budget_tokens (≥1024) for extended thinking.
+              // none/minimal → disable thinking; low/medium/high/xhigh → increasing budgets.
+              const budgetFromLevel = (
+                level: "none" | "minimal" | "low" | "medium" | "high" | "xhigh",
+              ): number | null => {
                 switch (level) {
+                  case "none":
+                  case "minimal":
+                    return null; // disable thinking
                   case "low":
                     return 1024;
                   case "medium":
-                    return 2048;
-                  case "high":
                     return 4096;
+                  case "high":
+                    return 16384;
+                  case "xhigh":
+                    return 32768;
                 }
               };
 
@@ -299,9 +335,10 @@ export class LlmRouter extends Context.Tag("@agon/LlmRouter")<
               const overrides = {
                 ...(args.temperature !== undefined && { temperature: args.temperature }),
                 ...(args.maxTokens !== undefined && { max_tokens: args.maxTokens }),
-                ...(thinkingBudget !== undefined && {
-                  thinking: { type: "enabled", budget_tokens: thinkingBudget },
-                }),
+                ...(thinkingBudget !== undefined &&
+                  thinkingBudget !== null && {
+                    thinking: { type: "enabled" as const, budget_tokens: thinkingBudget },
+                  }),
               };
 
               return base.pipe(
@@ -317,12 +354,26 @@ export class LlmRouter extends Context.Tag("@agon/LlmRouter")<
                 ...(args.maxTokens !== undefined && { maxOutputTokens: args.maxTokens }),
               };
 
-              if (Object.keys(generationConfig).length === 0) return base;
+              // Gemini 3: thinkingLevel LOW/HIGH only (cannot disable).
+              // Map none/minimal/low → LOW; medium/high/xhigh → HIGH.
+              const mapGeminiLevel = (level: string): "LOW" | "HIGH" =>
+                level === "none" || level === "minimal" || level === "low" ? "LOW" : "HIGH";
 
-              const overrides: GoogleLanguageModel.Config.Service = {
-                toolConfig: {},
-                generationConfig,
-              };
+              const thinkingConfig =
+                args.thinkingBudgetTokens !== undefined
+                  ? { thinkingBudget: args.thinkingBudgetTokens }
+                  : args.thinkingLevel !== undefined
+                    ? { thinkingLevel: mapGeminiLevel(args.thinkingLevel) }
+                    : undefined;
+
+              const hasOverrides =
+                Object.keys(generationConfig).length > 0 || thinkingConfig !== undefined;
+              if (!hasOverrides) return base;
+
+              const overrides = {
+                ...(Object.keys(generationConfig).length > 0 && { generationConfig }),
+                ...(thinkingConfig !== undefined && { thinkingConfig }),
+              } as unknown as GoogleLanguageModel.Config.Service;
 
               return withGoogleConfigOverride(base, overrides);
             }
