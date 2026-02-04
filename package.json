@@ -20,7 +20,8 @@
     "lint:fix": "oxlint . --fix",
     "format": "oxfmt --write .",
     "format:check": "oxfmt --check .",
-    "gate": "npm run typecheck && npm run lint && npm run format:check"
+    "gate": "npm run typecheck && npm run lint && npm run format:check",
+    "test": "tsc -p tsconfig.test.json && node --test .test-dist/test/*.test.js && rm -rf .test-dist"
   },
   "dependencies": {
     "@discordjs/rest": "^2.4.0",

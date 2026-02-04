@@ -3,7 +3,14 @@ import * as ConfigProvider from "effect/ConfigProvider";
 import { Config, Effect, Layer, Option, Redacted, Schema } from "effect";
 import * as ManagedRuntime from "effect/ManagedRuntime";
 import { Db } from "./d1/db.js";
-import { agents, discordChannels, messages, roomAgents, rooms } from "./d1/schema.js";
+import {
+  agents,
+  discordChannels,
+  messages,
+  roomAgents,
+  rooms,
+  roomTurnEvents,
+} from "./d1/schema.js";
 import { ArenaService, type RoomTurnJob } from "./services/ArenaService.js";
 import {
   Discord,
@@ -13,6 +20,7 @@ import {
 import { DiscordWebhookPoster } from "./services/DiscordWebhook.js";
 import { LlmRouterLive } from "./services/LlmRouter.js";
 import { Observability } from "./services/Observability.js";
+import { TurnEventService } from "./services/TurnEventService.js";
 
 export interface Env {
   DB: D1Database;
@@ -100,6 +108,7 @@ const makeRuntime = (env: Env) => {
     DiscordWebhookPoster.layer,
     LlmRouterLive,
     Discord.layer,
+    TurnEventService.layer.pipe(Layer.provide(dbLayer)),
   );
 
   const arenaLayer = ArenaService.layer.pipe(Layer.provide(infraLayer));
@@ -524,6 +533,25 @@ export default {
           }
 
           return json(405, { error: "Method not allowed" });
+        }
+
+        // /admin/rooms/:id/events
+        if (segments.length === 4 && segments[1] === "rooms" && segments[3] === "events") {
+          const roomId = Number(segments[2]);
+          if (!Number.isFinite(roomId)) return json(400, { error: "Invalid room id" });
+
+          if (request.method !== "GET") return json(405, { error: "Method not allowed" });
+
+          const rows = yield* dbTry(() =>
+            db
+              .select()
+              .from(roomTurnEvents)
+              .where(eq(roomTurnEvents.roomId, roomId))
+              .orderBy(asc(roomTurnEvents.turnNumber), asc(roomTurnEvents.createdAtMs))
+              .all(),
+          );
+
+          return json(200, { roomId, events: rows });
         }
 
         // /admin/rooms/:id/pause | /admin/rooms/:id/resume

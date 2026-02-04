@@ -15,9 +15,13 @@ export const rooms = sqliteTable("rooms", {
   id: integer("id").primaryKey({ autoIncrement: true }),
   status: text("status", { enum: ["active", "paused"] }).notNull(),
   topic: text("topic").notNull(),
+  title: text("title").notNull().default(""),
   parentChannelId: text("parent_channel_id").notNull(),
   threadId: text("thread_id").notNull().unique(),
   autoArchiveDurationMinutes: integer("auto_archive_duration_minutes").notNull().default(1440),
+  audienceSlotDurationSeconds: integer("audience_slot_duration_seconds").notNull().default(30),
+  audienceTokenLimit: integer("audience_token_limit").notNull().default(4096),
+  roomTokenLimit: integer("room_token_limit").notNull().default(32000),
   currentTurnAgentId: text("current_turn_agent_id").notNull(),
   currentTurnNumber: integer("current_turn_number").notNull().default(0),
   lastEnqueuedTurnNumber: integer("last_enqueued_turn_number").notNull().default(0),
@@ -46,9 +50,27 @@ export const messages = sqliteTable("messages", {
     .references(() => rooms.id, { onDelete: "cascade" }),
   discordMessageId: text("discord_message_id").notNull().unique(),
   threadId: text("thread_id").notNull(),
-  authorType: text("author_type", { enum: ["human", "agent", "bot_other"] }).notNull(),
+  authorType: text("author_type", {
+    enum: ["moderator", "agent", "audience", "notification"],
+  }).notNull(),
   authorAgentId: text("author_agent_id"),
   content: text("content").notNull(),
   // store unix epoch millis
   createdAtMs: integer("created_at_ms").notNull(),
+});
+
+/**
+ * Minimal turn lifecycle telemetry for debugging.
+ *
+ * NOTE: no primary key; SQLite rowid can be used implicitly.
+ */
+export const roomTurnEvents = sqliteTable("room_turn_events", {
+  roomId: integer("room_id")
+    .notNull()
+    .references(() => rooms.id, { onDelete: "cascade" }),
+  turnNumber: integer("turn_number").notNull(),
+  phase: text("phase").notNull(),
+  status: text("status").notNull(),
+  createdAtMs: integer("created_at_ms").notNull(),
+  dataJson: text("data_json"),
 });

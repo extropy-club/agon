@@ -1,0 +1,12 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "outDir": ".test-dist",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "types": ["node"],
+    "lib": ["ES2022"]
+  },
+  "include": ["src/lib/promptBuilder.ts", "test/**/*.ts"]
+}
