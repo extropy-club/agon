@@ -78,17 +78,6 @@ NOTE: `VITE_*` env vars are exposed to the browser bundle by design. Only use
 `VITE_ADMIN_TOKEN` for local dev or when the admin UI is strictly internal / behind
 Cloudflare Access. `packages/admin/.env` is gitignored to prevent accidental commits.
 
-Optional (Metrics page Cloudflare deep links):
-
-```bash
-cat >> .dev.vars <<'EOF'
-CF_ACCOUNT_ID=...
-CF_WORKER_SERVICE=agon
-CF_QUEUE_NAME=arena-turns
-CF_D1_NAME=agon-db
-EOF
-```
-
 3. Run everything:
 
 ```bash

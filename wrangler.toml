@@ -1,4 +1,5 @@
 name = "agon"
+account_id = "2c42f4960f9c28a9235cac01483bd626"
 main = "src/index.ts"
 compatibility_date = "2025-01-29"
 compatibility_flags = ["nodejs_compat"]
@@ -21,6 +22,12 @@ max_retries = 3
 # Non-secret defaults (override in .dev.vars / Wrangler secrets)
 ARENA_MAX_TURNS = "30"
 ARENA_HISTORY_LIMIT = "20"
+
+# Used by the admin Metrics page (via /admin/meta) for deep links.
+CF_ACCOUNT_ID = "2c42f4960f9c28a9235cac01483bd626"
+CF_WORKER_SERVICE = "agon"
+CF_QUEUE_NAME = "arena-turns"
+CF_D1_NAME = "agon-db"
 
 [dev]
 port = 8787
