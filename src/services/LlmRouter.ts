@@ -5,8 +5,6 @@ import { AnthropicClient, AnthropicLanguageModel } from "@effect/ai-anthropic";
 import { GoogleClient, GoogleLanguageModel } from "@effect/ai-google";
 import { OpenAiClient, OpenAiLanguageModel } from "@effect/ai-openai";
 import * as FetchHttpClient from "@effect/platform/FetchHttpClient";
-import * as HttpClient from "@effect/platform/HttpClient";
-import * as HttpClientRequest from "@effect/platform/HttpClientRequest";
 import { Config, Context, Effect, Layer, Option, Redacted, Schedule, Schema } from "effect";
 
 export const LlmProviderSchema = Schema.Literal("openai", "anthropic", "gemini", "openrouter");
@@ -84,6 +82,89 @@ export class LlmRouter extends Context.Tag("@agon/LlmRouter")<
         }
       };
 
+      // Convert Prompt.RawInput to OpenAI chat messages format
+      const promptToMessages = (prompt: Prompt.RawInput) => {
+        const messages: Array<{ role: string; content: string }> = [];
+
+        // Handle string input
+        if (typeof prompt === "string") {
+          messages.push({ role: "user", content: prompt });
+          return messages;
+        }
+
+        // Handle Prompt object (has content array)
+        const items = "content" in prompt ? prompt.content : prompt;
+
+        for (const item of items) {
+          if (typeof item === "string") {
+            messages.push({ role: "user", content: item });
+            continue;
+          }
+
+          if (item.role === "system") {
+            messages.push({ role: "system", content: item.content as string });
+          } else if (item.role === "user" || item.role === "assistant") {
+            // Extract text from content parts
+            const content = item.content;
+            const text = Array.isArray(content)
+              ? content
+                  .map((part: unknown) => {
+                    if (typeof part === "string") return part;
+                    if (part && typeof part === "object" && "text" in part)
+                      return (part as { text: string }).text;
+                    return "";
+                  })
+                  .join("")
+              : String(content);
+            messages.push({ role: item.role, content: text });
+          }
+        }
+        return messages;
+      };
+
+      // Direct OpenRouter chat completions call (bypasses @effect/ai-openai Responses API)
+      const openRouterGenerate = (
+        model: string,
+        prompt: Prompt.RawInput,
+        apiKey: Redacted.Redacted,
+      ) =>
+        Effect.tryPromise({
+          try: async () => {
+            const messages = promptToMessages(prompt);
+            const headers: Record<string, string> = {
+              Authorization: `Bearer ${Redacted.value(apiKey)}`,
+              "Content-Type": "application/json",
+            };
+            if (Option.isSome(openRouterHttpReferer)) {
+              headers["HTTP-Referer"] = openRouterHttpReferer.value;
+            }
+            if (Option.isSome(openRouterTitle)) {
+              headers["X-Title"] = openRouterTitle.value;
+            }
+
+            const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+              method: "POST",
+              headers,
+              body: JSON.stringify({ model, messages }),
+            });
+
+            if (!res.ok) {
+              const body = await res.text();
+              throw new Error(`OpenRouter ${res.status}: ${body}`);
+            }
+
+            const data = (await res.json()) as {
+              choices?: Array<{ message?: { content?: string } }>;
+            };
+            const content = data.choices?.[0]?.message?.content;
+            if (typeof content !== "string") {
+              throw new Error("OpenRouter returned no content");
+            }
+            return content.trim();
+          },
+          catch: (e) => e,
+        });
+
       const makeLanguageModelLayer = (
         provider: LlmProvider,
         model: string,
@@ -95,40 +176,6 @@ export class LlmRouter extends Context.Tag("@agon/LlmRouter")<
               Layer.provide(OpenAiClient.layer({ apiKey: apiKey as Redacted.Redacted })),
             );
 
-          case "openrouter":
-            return OpenAiLanguageModel.layer({ model }).pipe(
-              Layer.provide(
-                OpenAiClient.layer({
-                  apiKey: apiKey as Redacted.Redacted,
-                  apiUrl: "https://openrouter.ai/api/v1",
-                  transformClient: (client) =>
-                    client.pipe(
-                      HttpClient.mapRequest((req) => {
-                        let next = req;
-
-                        if (Option.isSome(openRouterHttpReferer)) {
-                          next = HttpClientRequest.setHeader(
-                            next,
-                            "HTTP-Referer",
-                            openRouterHttpReferer.value,
-                          );
-                        }
-
-                        if (Option.isSome(openRouterTitle)) {
-                          next = HttpClientRequest.setHeader(
-                            next,
-                            "X-Title",
-                            openRouterTitle.value,
-                          );
-                        }
-
-                        return next;
-                      }),
-                    ),
-                }),
-              ),
-            );
-
           case "anthropic":
             return AnthropicLanguageModel.layer({ model }).pipe(
               Layer.provide(AnthropicClient.layer({ apiKey: apiKey as Redacted.Redacted })),
@@ -138,25 +185,34 @@ export class LlmRouter extends Context.Tag("@agon/LlmRouter")<
             return GoogleLanguageModel.layer({ model }).pipe(
               Layer.provide(GoogleClient.layer({ apiKey: apiKey as Redacted.Redacted })),
             );
+
+          case "openrouter":
+            // OpenRouter uses direct fetch, not @effect/ai layer
+            return null as never;
         }
       };
-
-      const makeModel = (provider: LlmProvider, model: string) =>
-        Effect.gen(function* () {
-          const apiKey = yield* requireApiKey(provider);
-          const languageModelLayer = makeLanguageModelLayer(provider, model, apiKey).pipe(
-            Layer.provide(FetchHttpClient.layer),
-          );
-
-          return Model.make(provider, languageModelLayer);
-        });
 
       const generate = Effect.fn("LlmRouter.generate")(function* (args: {
         readonly provider: LlmProvider;
         readonly model: string;
         readonly prompt: Prompt.RawInput;
       }) {
-        const modelLayer = yield* makeModel(args.provider, args.model);
+        const apiKey = yield* requireApiKey(args.provider);
+
+        // OpenRouter: use direct chat completions API
+        if (args.provider === "openrouter") {
+          return yield* openRouterGenerate(args.model, args.prompt, apiKey).pipe(
+            Effect.timeout("30 seconds"),
+            Effect.retry(retryPolicy),
+            Effect.mapError((cause) => LlmCallFailed.make({ provider: args.provider, cause })),
+          );
+        }
+
+        // Other providers: use @effect/ai layers
+        const languageModelLayer = makeLanguageModelLayer(args.provider, args.model, apiKey).pipe(
+          Layer.provide(FetchHttpClient.layer),
+        );
+        const modelLayer = Model.make(args.provider, languageModelLayer);
 
         return yield* LanguageModel.generateText({ prompt: args.prompt }).pipe(
           Effect.provide(modelLayer),
