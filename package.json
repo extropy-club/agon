@@ -9,6 +9,8 @@
   "scripts": {
     "prepare": "effect-language-service patch",
     "dev": "wrangler dev",
+    "dev:admin": "npm -w @agon/admin run dev",
+    "dev:all": "concurrently -n worker,admin -c blue,magenta \"npm run dev\" \"npm run dev:admin\"",
     "deploy": "wrangler deploy",
     "db:generate": "drizzle-kit generate",
     "db:migrate": "wrangler d1 migrations apply agon-db",
@@ -34,6 +36,7 @@
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20250129.0",
     "@effect/language-service": "^0.71.0",
+    "concurrently": "^9.1.2",
     "drizzle-kit": "^0.30.0",
     "oxfmt": "^0.28.0",
     "oxlint": "^1.11.0",

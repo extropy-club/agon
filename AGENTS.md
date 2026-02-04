@@ -57,6 +57,15 @@ npm run gate          # typecheck → lint → format:check
 
 Must pass before claiming work is done.
 
+## Dev (one command)
+
+```bash
+npm run dev:all
+```
+
+- Starts the worker via `wrangler dev` (default http://localhost:8787)
+- Starts the admin UI at http://localhost:3000 and proxies `/admin/*` to the worker
+
 ## Toolchain Notes
 
 - `npm run typecheck` uses `tsgo` (TypeScript-Go) rather than `tsc`.
