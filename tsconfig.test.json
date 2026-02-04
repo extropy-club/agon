@@ -5,7 +5,7 @@
     "outDir": ".test-dist",
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
-    "types": ["node"],
+    "types": ["node", "@cloudflare/workers-types"],
     "lib": ["ES2022"]
   },
   "include": ["src/lib/promptBuilder.ts", "test/**/*.ts"]

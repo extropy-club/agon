@@ -25,7 +25,17 @@ const base64UrlEncode = (data: ArrayBuffer | Uint8Array): string => {
 };
 
 const base64UrlDecodeToBytes = (s: string): Uint8Array => {
-  const padded = s.replace(/-/g, "+").replace(/_/g, "/") + "==".slice((s.length + 3) % 4);
+  // Base64url strings commonly omit `=` padding. `atob` expects correct padding.
+  // Padding needed is: (4 - (len % 4)) % 4.
+  const normalized = s.replace(/-/g, "+").replace(/_/g, "/");
+  const mod = normalized.length % 4;
+
+  // base64 strings should never have length % 4 === 1.
+  if (mod === 1) {
+    throw new Error("Invalid base64url string");
+  }
+
+  const padded = normalized + "=".repeat((4 - mod) % 4);
   const binary = atob(padded);
   const bytes = new Uint8Array(binary.length);
   for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
@@ -49,7 +59,8 @@ export const signJwt = async (payload: JwtPayload, secret: string): Promise<stri
   const signingInput = `${headerPart}.${payloadPart}`;
 
   const key = await importHmacKey(secret, ["sign"]);
-  const signature = await crypto.subtle.sign("HMAC", key, textEncoder.encode(signingInput));
+  const signatureInput = textEncoder.encode(signingInput);
+  const signature = await crypto.subtle.sign("HMAC", key, signatureInput);
 
   const signaturePart = base64UrlEncode(signature);
   return `${signingInput}.${signaturePart}`;
@@ -85,12 +96,8 @@ export const verifyJwt = async (token: string, secret: string): Promise<JwtPaylo
     const signatureBytes = base64UrlDecodeToBytes(signaturePart);
 
     const key = await importHmacKey(secret, ["verify"]);
-    const ok = await crypto.subtle.verify(
-      "HMAC",
-      key,
-      signatureBytes,
-      textEncoder.encode(signingInput),
-    );
+    const verifyInput = textEncoder.encode(signingInput);
+    const ok = await crypto.subtle.verify("HMAC", key, signatureBytes, verifyInput);
     if (!ok) return null;
 
     const p = payload as JwtPayload;
