@@ -1,9 +1,9 @@
-import { eq, sql } from "drizzle-orm";
+import { asc, desc, eq, sql } from "drizzle-orm";
 import * as ConfigProvider from "effect/ConfigProvider";
-import { Effect, Layer } from "effect";
+import { Config, Effect, Layer, Option, Redacted, Schema } from "effect";
 import * as ManagedRuntime from "effect/ManagedRuntime";
 import { Db } from "./d1/db.js";
-import { discordChannels, rooms } from "./d1/schema.js";
+import { agents, discordChannels, messages, roomAgents, rooms } from "./d1/schema.js";
 import { ArenaService, type RoomTurnJob } from "./services/ArenaService.js";
 import {
   Discord,
@@ -29,6 +29,9 @@ export interface Env {
 
   ARENA_MAX_TURNS?: string;
   ARENA_HISTORY_LIMIT?: string;
+
+  // Admin API auth
+  ADMIN_TOKEN?: string;
 }
 
 const json = (status: number, body: unknown) =>
@@ -76,6 +79,73 @@ const parseJson = <A>(request: Request): Effect.Effect<A, unknown> =>
     catch: (e) => e,
   });
 
+export class AdminUnauthorized extends Schema.TaggedError<AdminUnauthorized>()(
+  "AdminUnauthorized",
+  {},
+) {}
+
+export class AdminMissingConfig extends Schema.TaggedError<AdminMissingConfig>()(
+  "AdminMissingConfig",
+  {
+    key: Schema.String,
+  },
+) {}
+
+export class AdminBadRequest extends Schema.TaggedError<AdminBadRequest>()("AdminBadRequest", {
+  message: Schema.String,
+}) {}
+
+export class AdminNotFound extends Schema.TaggedError<AdminNotFound>()("AdminNotFound", {
+  resource: Schema.String,
+  id: Schema.String,
+}) {}
+
+export class AdminDbError extends Schema.TaggedError<AdminDbError>()("AdminDbError", {
+  cause: Schema.Defect,
+}) {}
+
+export class AdminQueueError extends Schema.TaggedError<AdminQueueError>()("AdminQueueError", {
+  cause: Schema.Defect,
+}) {}
+
+const requireAdmin = (request: Request) =>
+  Effect.gen(function* () {
+    const opt = yield* Config.option(Config.redacted("ADMIN_TOKEN")).pipe(
+      Effect.catchAll(() => Effect.succeed(Option.none())),
+    );
+
+    if (Option.isNone(opt)) {
+      return yield* Effect.fail(AdminMissingConfig.make({ key: "ADMIN_TOKEN" }));
+    }
+
+    const auth = request.headers.get("authorization") ?? "";
+    const match = auth.match(/^Bearer\s+(.+)$/i);
+    if (!match) return yield* Effect.fail(AdminUnauthorized.make({}));
+
+    if (Redacted.value(opt.value) !== match[1]) {
+      return yield* Effect.fail(AdminUnauthorized.make({}));
+    }
+  });
+
+const decodeBody = <A>(request: Request, schema: Schema.Schema<A>) =>
+  parseJson<unknown>(request).pipe(
+    Effect.flatMap((u) => Schema.decodeUnknown(schema)(u)),
+    Effect.mapError(() => AdminBadRequest.make({ message: "Invalid JSON body" })),
+  );
+
+const slugify = (s: string) =>
+  s
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/(^-|-$)/g, "");
+
+const dbTry = <A>(thunk: () => Promise<A>) =>
+  Effect.tryPromise({
+    try: thunk,
+    catch: (cause) => AdminDbError.make({ cause }),
+  });
+
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
@@ -83,6 +153,412 @@ export default {
 
     const requestId =
       request.headers.get("CF-Ray") ?? request.headers.get("cf-ray") ?? crypto.randomUUID();
+
+    // Admin API
+    if (url.pathname.startsWith("/admin")) {
+      const segments = url.pathname.split("/").filter(Boolean);
+
+      const AgentProviderSchema = Schema.Literal("openai", "anthropic", "gemini");
+
+      const AgentCreateSchema = Schema.Struct({
+        id: Schema.optional(Schema.String),
+        name: Schema.String,
+        avatarUrl: Schema.optional(Schema.String),
+        systemPrompt: Schema.String,
+        llmProvider: Schema.optional(AgentProviderSchema),
+        llmModel: Schema.optional(Schema.String),
+      });
+
+      const AgentUpdateSchema = Schema.Struct({
+        name: Schema.optional(Schema.String),
+        avatarUrl: Schema.optional(Schema.String),
+        systemPrompt: Schema.optional(Schema.String),
+        llmProvider: Schema.optional(AgentProviderSchema),
+        llmModel: Schema.optional(Schema.String),
+      });
+
+      const CreateRoomSchema = Schema.Struct({
+        parentChannelId: Schema.String,
+        topic: Schema.String,
+        autoArchiveDurationMinutes: Schema.optional(Schema.Number),
+        agentIds: Schema.Array(Schema.String),
+        // Provide threadId to bind to an existing thread. If omitted, we will create a thread.
+        threadId: Schema.optional(Schema.String),
+        threadName: Schema.optional(Schema.String),
+      });
+
+      const program = Effect.gen(function* () {
+        yield* requireAdmin(request);
+        const { db } = yield* Db;
+
+        // /admin/agents
+        if (segments.length === 2 && segments[1] === "agents") {
+          if (request.method === "GET") {
+            const rows = yield* dbTry(() =>
+              db.select().from(agents).orderBy(asc(agents.name)).all(),
+            );
+            return json(200, { agents: rows });
+          }
+
+          if (request.method === "POST") {
+            const body = yield* decodeBody(request, AgentCreateSchema);
+            const id = body.id ? body.id : slugify(body.name);
+            if (!id) return json(400, { error: "Invalid id" });
+
+            const avatarUrl = body.avatarUrl?.trim();
+            const avatarUrlOrNull = avatarUrl && avatarUrl.length > 0 ? avatarUrl : null;
+
+            yield* dbTry(() =>
+              db
+                .insert(agents)
+                .values({
+                  id,
+                  name: body.name,
+                  avatarUrl: avatarUrlOrNull,
+                  systemPrompt: body.systemPrompt,
+                  llmProvider: body.llmProvider ?? "openai",
+                  llmModel: body.llmModel ?? "gpt-4o-mini",
+                })
+                .onConflictDoUpdate({
+                  target: agents.id,
+                  set: {
+                    name: body.name,
+                    avatarUrl: avatarUrlOrNull,
+                    systemPrompt: body.systemPrompt,
+                    llmProvider: body.llmProvider ?? "openai",
+                    llmModel: body.llmModel ?? "gpt-4o-mini",
+                  },
+                })
+                .run(),
+            );
+
+            const agent = yield* dbTry(() =>
+              db.select().from(agents).where(eq(agents.id, id)).get(),
+            );
+            return json(200, { agent });
+          }
+
+          return json(405, { error: "Method not allowed" });
+        }
+
+        // /admin/agents/:id
+        if (segments.length === 3 && segments[1] === "agents") {
+          const agentId = segments[2];
+
+          if (request.method === "GET") {
+            const agent = yield* dbTry(() =>
+              db.select().from(agents).where(eq(agents.id, agentId)).get(),
+            );
+            if (!agent) {
+              return yield* Effect.fail(AdminNotFound.make({ resource: "agent", id: agentId }));
+            }
+            return json(200, { agent });
+          }
+
+          if (request.method === "PUT") {
+            const body = yield* decodeBody(request, AgentUpdateSchema);
+
+            const existing = yield* dbTry(() =>
+              db.select().from(agents).where(eq(agents.id, agentId)).get(),
+            );
+            if (!existing) {
+              return yield* Effect.fail(AdminNotFound.make({ resource: "agent", id: agentId }));
+            }
+
+            yield* dbTry(() =>
+              db
+                .update(agents)
+                .set({
+                  ...(body.name !== undefined ? { name: body.name } : {}),
+                  ...(body.avatarUrl !== undefined
+                    ? {
+                        avatarUrl: body.avatarUrl.trim().length > 0 ? body.avatarUrl.trim() : null,
+                      }
+                    : {}),
+                  ...(body.systemPrompt !== undefined ? { systemPrompt: body.systemPrompt } : {}),
+                  ...(body.llmProvider !== undefined ? { llmProvider: body.llmProvider } : {}),
+                  ...(body.llmModel !== undefined ? { llmModel: body.llmModel } : {}),
+                })
+                .where(eq(agents.id, agentId))
+                .run(),
+            );
+
+            const agent = yield* dbTry(() =>
+              db.select().from(agents).where(eq(agents.id, agentId)).get(),
+            );
+            return json(200, { agent });
+          }
+
+          if (request.method === "DELETE") {
+            yield* dbTry(() => db.delete(agents).where(eq(agents.id, agentId)).run());
+            return json(200, { ok: true });
+          }
+
+          return json(405, { error: "Method not allowed" });
+        }
+
+        // /admin/rooms
+        if (segments.length === 2 && segments[1] === "rooms") {
+          if (request.method === "GET") {
+            const rs = yield* dbTry(() => db.select().from(rooms).orderBy(desc(rooms.id)).all());
+            return json(200, { rooms: rs });
+          }
+
+          if (request.method === "POST") {
+            const body = yield* decodeBody(request, CreateRoomSchema);
+            const arena = yield* ArenaService;
+            const discord = yield* Discord;
+
+            const allowed = [60, 1440, 4320, 10080] as const;
+            const autoArchiveDurationMinutes = allowed.includes(
+              body.autoArchiveDurationMinutes as (typeof allowed)[number],
+            )
+              ? (body.autoArchiveDurationMinutes as number)
+              : 1440;
+
+            // ensure webhook mapping for parent channel
+            const existingWebhook = yield* dbTry(() =>
+              db
+                .select()
+                .from(discordChannels)
+                .where(eq(discordChannels.channelId, body.parentChannelId))
+                .get(),
+            );
+
+            const webhook = existingWebhook
+              ? { id: existingWebhook.webhookId, token: existingWebhook.webhookToken }
+              : yield* discord.createOrFetchWebhook(body.parentChannelId);
+
+            yield* dbTry(() =>
+              db
+                .insert(discordChannels)
+                .values({
+                  channelId: body.parentChannelId,
+                  webhookId: webhook.id,
+                  webhookToken: webhook.token,
+                })
+                .onConflictDoUpdate({
+                  target: discordChannels.channelId,
+                  set: { webhookId: webhook.id, webhookToken: webhook.token },
+                })
+                .run(),
+            );
+
+            const threadName = body.threadName?.trim();
+            const threadId = body.threadId
+              ? body.threadId
+              : yield* discord.createPublicThread(body.parentChannelId, {
+                  name:
+                    threadName && threadName.length > 0
+                      ? threadName
+                      : `Agon Room ${new Date().toISOString()}`,
+                  autoArchiveDurationMinutes:
+                    autoArchiveDurationMinutes as DiscordAutoArchiveDurationMinutes,
+                });
+
+            const result = yield* arena.createRoom({
+              parentChannelId: body.parentChannelId,
+              threadId,
+              topic: body.topic,
+              autoArchiveDurationMinutes,
+              agentIds: body.agentIds,
+            });
+
+            yield* Effect.tryPromise({
+              try: () => env.ARENA_QUEUE.send(result.firstJob),
+              catch: (cause) => AdminQueueError.make({ cause }),
+            });
+
+            const markerUpdated = yield* dbTry(() =>
+              db
+                .update(rooms)
+                .set({
+                  lastEnqueuedTurnNumber: sql`max(${rooms.lastEnqueuedTurnNumber}, ${result.firstJob.turnNumber})`,
+                })
+                .where(eq(rooms.id, result.roomId))
+                .run(),
+            ).pipe(
+              Effect.as(true),
+              Effect.catchAll((e) =>
+                Effect.logError("admin.last_enqueued_turn.update_failed").pipe(
+                  Effect.annotateLogs({ cause: String(e.cause) }),
+                  Effect.as(false),
+                ),
+              ),
+            );
+
+            return json(200, {
+              roomId: result.roomId,
+              threadId,
+              firstJob: result.firstJob,
+              enqueued: true,
+              markerUpdated,
+            });
+          }
+
+          return json(405, { error: "Method not allowed" });
+        }
+
+        // /admin/rooms/:id
+        if (segments.length === 3 && segments[1] === "rooms") {
+          const roomId = Number(segments[2]);
+          if (!Number.isFinite(roomId)) return json(400, { error: "Invalid room id" });
+
+          if (request.method === "GET") {
+            const room = yield* dbTry(() =>
+              db.select().from(rooms).where(eq(rooms.id, roomId)).get(),
+            );
+            if (!room) {
+              return yield* Effect.fail(
+                AdminNotFound.make({ resource: "room", id: String(roomId) }),
+              );
+            }
+
+            const participants = yield* dbTry(() =>
+              db
+                .select({
+                  turnOrder: roomAgents.turnOrder,
+                  agent: agents,
+                })
+                .from(roomAgents)
+                .innerJoin(agents, eq(roomAgents.agentId, agents.id))
+                .where(eq(roomAgents.roomId, roomId))
+                .orderBy(asc(roomAgents.turnOrder))
+                .all(),
+            );
+
+            const recentMessages = yield* dbTry(() =>
+              db
+                .select()
+                .from(messages)
+                .where(eq(messages.roomId, roomId))
+                .orderBy(desc(messages.createdAtMs), desc(messages.id))
+                .limit(50)
+                .all(),
+            );
+
+            return json(200, { room, participants, recentMessages });
+          }
+
+          return json(405, { error: "Method not allowed" });
+        }
+
+        // /admin/rooms/:id/pause | /admin/rooms/:id/resume
+        if (segments.length === 4 && segments[1] === "rooms") {
+          const roomId = Number(segments[2]);
+          if (!Number.isFinite(roomId)) return json(400, { error: "Invalid room id" });
+
+          if (request.method !== "POST") return json(405, { error: "Method not allowed" });
+
+          const action = segments[3];
+
+          if (action === "pause") {
+            const room = yield* dbTry(() =>
+              db.select().from(rooms).where(eq(rooms.id, roomId)).get(),
+            );
+            if (!room) {
+              return yield* Effect.fail(
+                AdminNotFound.make({ resource: "room", id: String(roomId) }),
+              );
+            }
+
+            yield* dbTry(() =>
+              db.update(rooms).set({ status: "paused" }).where(eq(rooms.id, roomId)).run(),
+            );
+            return json(200, { ok: true });
+          }
+
+          if (action === "resume") {
+            const room = yield* dbTry(() =>
+              db.select().from(rooms).where(eq(rooms.id, roomId)).get(),
+            );
+            if (!room) {
+              return yield* Effect.fail(
+                AdminNotFound.make({ resource: "room", id: String(roomId) }),
+              );
+            }
+
+            yield* dbTry(() =>
+              db.update(rooms).set({ status: "active" }).where(eq(rooms.id, roomId)).run(),
+            );
+
+            const nextTurnNumber = room.currentTurnNumber + 1;
+
+            if (room.lastEnqueuedTurnNumber < nextTurnNumber) {
+              const job = { roomId, turnNumber: nextTurnNumber } as const;
+              yield* Effect.tryPromise({
+                try: () => env.ARENA_QUEUE.send(job),
+                catch: (cause) => AdminQueueError.make({ cause }),
+              });
+
+              yield* dbTry(() =>
+                db
+                  .update(rooms)
+                  .set({
+                    lastEnqueuedTurnNumber: sql`max(${rooms.lastEnqueuedTurnNumber}, ${nextTurnNumber})`,
+                  })
+                  .where(eq(rooms.id, roomId))
+                  .run(),
+              ).pipe(
+                Effect.catchAll((e) =>
+                  Effect.logError("admin.last_enqueued_turn.update_failed").pipe(
+                    Effect.annotateLogs({ cause: String(e.cause) }),
+                    Effect.asVoid,
+                  ),
+                ),
+              );
+            }
+
+            return json(200, { ok: true, enqueued: room.lastEnqueuedTurnNumber < nextTurnNumber });
+          }
+
+          return json(404, { error: "Not Found" });
+        }
+
+        return json(404, { error: "Not Found" });
+      }).pipe(
+        Effect.annotateLogs({ requestId, route: url.pathname }),
+        Effect.withLogSpan("http.admin"),
+        Effect.catchTag("AdminUnauthorized", () =>
+          Effect.succeed(json(401, { error: "Unauthorized", requestId })),
+        ),
+        Effect.catchTag("AdminMissingConfig", (e) =>
+          Effect.succeed(json(500, { error: `Missing ${e.key}`, requestId })),
+        ),
+        Effect.catchTag("AdminBadRequest", (e) =>
+          Effect.succeed(json(400, { error: e.message, requestId })),
+        ),
+        Effect.catchTag("AdminNotFound", (e) =>
+          Effect.succeed(json(404, { error: `${e.resource} not found`, id: e.id, requestId })),
+        ),
+        Effect.catchTag("AdminDbError", (e) =>
+          Effect.gen(function* () {
+            yield* Effect.logError("admin.db_error").pipe(
+              Effect.annotateLogs({ cause: String(e.cause) }),
+            );
+            return json(500, { error: "DB error", requestId });
+          }),
+        ),
+        Effect.catchTag("AdminQueueError", (e) =>
+          Effect.gen(function* () {
+            yield* Effect.logError("admin.queue_error").pipe(
+              Effect.annotateLogs({ cause: String(e.cause) }),
+            );
+            return json(500, { error: "Queue error", requestId });
+          }),
+        ),
+        Effect.catchAllCause((cause) =>
+          Effect.gen(function* () {
+            yield* Effect.logError("admin.unhandled").pipe(
+              Effect.annotateLogs({ cause: String(cause) }),
+            );
+            return json(500, { error: "Internal error", requestId });
+          }),
+        ),
+      );
+
+      return await runtime.runPromise(program);
+    }
 
     // Health
     if (request.method === "GET" && url.pathname === "/health") {
