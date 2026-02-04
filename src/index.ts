@@ -4,7 +4,7 @@ import * as ManagedRuntime from "effect/ManagedRuntime";
 import { Db } from "./d1/db.js";
 import { ArenaService, type RoomTurnJob } from "./services/ArenaService.js";
 import { DiscordWebhookPoster } from "./services/DiscordWebhook.js";
-import { LlmLive } from "./services/Llm.js";
+import { LlmRouterLive } from "./services/LlmRouter.js";
 import { verifyDiscordInteraction } from "./services/Discord.js";
 
 export interface Env {
@@ -13,7 +13,12 @@ export interface Env {
 
   // Optional runtime config (usually provided via .dev.vars / wrangler secrets)
   DISCORD_PUBLIC_KEY?: string;
+
+  // LLM providers
   OPENAI_API_KEY?: string;
+  ANTHROPIC_API_KEY?: string;
+  GOOGLE_AI_API_KEY?: string;
+
   ARENA_MAX_TURNS?: string;
   ARENA_HISTORY_LIMIT?: string;
 }
@@ -41,7 +46,7 @@ const makeRuntime = (env: Env) => {
   const arenaLayer = ArenaService.layer.pipe(
     Layer.provideMerge(Db.layer(env.DB)),
     Layer.provideMerge(DiscordWebhookPoster.layer),
-    Layer.provideMerge(LlmLive),
+    Layer.provideMerge(LlmRouterLive),
   );
 
   const appLayer = arenaLayer.pipe(Layer.provideMerge(makeConfigLayer(env)));

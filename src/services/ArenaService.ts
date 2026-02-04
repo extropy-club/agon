@@ -4,7 +4,7 @@ import { Config, Context, Effect, Layer, Schema } from "effect";
 import { Db, nowMs } from "../d1/db.js";
 import { agents, discordChannels, messages, roomAgents, rooms } from "../d1/schema.js";
 import { DiscordWebhookPostFailed, DiscordWebhookPoster } from "./DiscordWebhook.js";
-import { type LlmError, Llm } from "./Llm.js";
+import { type LlmRouterError, LlmRouter } from "./LlmRouter.js";
 
 export type RoomTurnJob = {
   readonly roomId: number;
@@ -27,7 +27,7 @@ export type ArenaError =
   | RoomNotFound
   | AgentNotFound
   | RoomDbError
-  | LlmError
+  | LlmRouterError
   | DiscordWebhookPostFailed;
 
 const dbTry = <A>(thunk: () => Promise<A>) =>
@@ -89,7 +89,7 @@ export class ArenaService extends Context.Tag("@agon/ArenaService")<
     ArenaService,
     Effect.gen(function* () {
       const { db } = yield* Db;
-      const llm = yield* Llm;
+      const llmRouter = yield* LlmRouter;
       const webhookPoster = yield* DiscordWebhookPoster;
 
       const maxTurns = yield* Config.integer("ARENA_MAX_TURNS").pipe(
@@ -262,7 +262,11 @@ export class ArenaService extends Context.Tag("@agon/ArenaService")<
           // thinking delay (basic anti-spam)
           yield* Effect.sleep("3 seconds");
 
-          reply = yield* llm.generate(prompt);
+          reply = yield* llmRouter.generate({
+            provider: agent.llmProvider,
+            model: agent.llmModel,
+            prompt,
+          });
 
           const now = yield* nowMs;
           yield* dbTry(() =>
