@@ -30,6 +30,10 @@ export class LlmRouter extends Context.Tag("@agon/LlmRouter")<
       readonly provider: LlmProvider;
       readonly model: string;
       readonly prompt: Prompt.RawInput;
+      readonly temperature?: number;
+      readonly maxTokens?: number;
+      readonly thinkingLevel?: "low" | "medium" | "high";
+      readonly thinkingBudgetTokens?: number;
     }) => Effect.Effect<string, LlmRouterError>;
   }
 >() {
