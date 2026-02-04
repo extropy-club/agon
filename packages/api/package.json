@@ -1,0 +1,18 @@
+{
+  "name": "@agon/api",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "scripts": {
+    "typecheck": "tsgo --noEmit"
+  },
+  "dependencies": {
+    "@agon/types": "file:../types",
+    "effect": "^3.19.14"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0"
+  }
+}

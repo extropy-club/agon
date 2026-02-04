@@ -1,0 +1,26 @@
+name = "agon"
+main = "src/index.ts"
+compatibility_date = "2025-01-29"
+compatibility_flags = ["nodejs_compat"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "agon-db"
+database_id = "1b0fdea6-be60-4408-9e58-ca6f531ca126"
+
+[[queues.producers]]
+binding = "ARENA_QUEUE"
+queue = "arena-turns"
+
+[[queues.consumers]]
+queue = "arena-turns"
+max_batch_size = 1
+max_retries = 3
+
+[vars]
+# Non-secret defaults (override in .dev.vars / Wrangler secrets)
+ARENA_MAX_TURNS = "30"
+ARENA_HISTORY_LIMIT = "20"
+
+[dev]
+port = 8787

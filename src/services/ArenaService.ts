@@ -1,0 +1,374 @@
+import * as Prompt from "@effect/ai/Prompt";
+import { and, asc, desc, eq, lt, sql } from "drizzle-orm";
+import { Config, Context, Effect, Layer, Schema } from "effect";
+import { Db, nowMs } from "../d1/db.js";
+import { agents, discordChannels, messages, roomAgents, rooms } from "../d1/schema.js";
+import { DiscordWebhookPostFailed, DiscordWebhookPoster } from "./DiscordWebhook.js";
+import { type LlmError, Llm } from "./Llm.js";
+
+export type RoomTurnJob = {
+  readonly roomId: number;
+  readonly turnNumber: number;
+};
+
+export class RoomNotFound extends Schema.TaggedError<RoomNotFound>()("RoomNotFound", {
+  roomId: Schema.Number,
+}) {}
+
+export class AgentNotFound extends Schema.TaggedError<AgentNotFound>()("AgentNotFound", {
+  agentId: Schema.String,
+}) {}
+
+export class RoomDbError extends Schema.TaggedError<RoomDbError>()("RoomDbError", {
+  cause: Schema.Defect,
+}) {}
+
+export type ArenaError =
+  | RoomNotFound
+  | AgentNotFound
+  | RoomDbError
+  | LlmError
+  | DiscordWebhookPostFailed;
+
+const dbTry = <A>(thunk: () => Promise<A>) =>
+  Effect.tryPromise({
+    try: thunk,
+    catch: (cause) => RoomDbError.make({ cause }),
+  });
+
+const defaultAgents: ReadonlyArray<{
+  id: string;
+  name: string;
+  avatarUrl?: string;
+  systemPrompt: string;
+  llmProvider: "openai" | "anthropic" | "gemini";
+  llmModel: string;
+}> = [
+  {
+    id: "aristotle",
+    name: "Aristotle",
+    avatarUrl: "https://i.imgur.com/1X0xJtW.png",
+    systemPrompt:
+      "You are Aristotle. You speak formally and with careful logic. Keep answers concise. Ask one probing question at the end.",
+    llmProvider: "openai",
+    llmModel: "gpt-4o-mini",
+  },
+  {
+    id: "newton",
+    name: "Isaac Newton",
+    avatarUrl: "https://i.imgur.com/S7yqJmC.png",
+    systemPrompt:
+      "You are Isaac Newton. You are precise and mathematical. Prefer definitions and short derivations. Keep answers concise.",
+    llmProvider: "openai",
+    llmModel: "gpt-4o-mini",
+  },
+];
+
+const rules = (topic: string) =>
+  `Debate topic: ${topic}\n\nRules:\n- Stay on topic.\n- No meta talk about being an AI.\n- Aim for 5-10 sentences.\n- If you want to end, say 'Goodbye.'`;
+
+export class ArenaService extends Context.Tag("@agon/ArenaService")<
+  ArenaService,
+  {
+    readonly startArena: (args: {
+      channelId: string;
+      topic: string;
+      agentIds?: ReadonlyArray<string>;
+    }) => Effect.Effect<{ roomId: number; firstJob: RoomTurnJob }, ArenaError>;
+
+    readonly stopArena: (roomId: number) => Effect.Effect<void, ArenaError>;
+
+    /**
+     * Process a single queued turn.
+     * Returns the next job to enqueue (or null when the loop terminates).
+     */
+    readonly processTurn: (job: RoomTurnJob) => Effect.Effect<RoomTurnJob | null, ArenaError>;
+  }
+>() {
+  static readonly layer = Layer.effect(
+    ArenaService,
+    Effect.gen(function* () {
+      const { db } = yield* Db;
+      const llm = yield* Llm;
+      const webhookPoster = yield* DiscordWebhookPoster;
+
+      const maxTurns = yield* Config.integer("ARENA_MAX_TURNS").pipe(
+        Effect.orElseSucceed(() => 30),
+      );
+      const historyLimit = yield* Config.integer("ARENA_HISTORY_LIMIT").pipe(
+        Effect.orElseSucceed(() => 20),
+      );
+
+      const seedAgents = Effect.fn("ArenaService.seedAgents")(function* () {
+        for (const a of defaultAgents) {
+          const exists = yield* dbTry(() =>
+            db.select({ id: agents.id }).from(agents).where(eq(agents.id, a.id)).get(),
+          );
+          if (!exists) {
+            yield* dbTry(() => db.insert(agents).values(a).run());
+          }
+        }
+      });
+
+      const startArena = Effect.fn("ArenaService.startArena")(function* (args: {
+        channelId: string;
+        topic: string;
+        agentIds?: ReadonlyArray<string>;
+      }) {
+        yield* seedAgents();
+
+        const agentIds =
+          args.agentIds && args.agentIds.length > 0
+            ? args.agentIds
+            : defaultAgents.map((a) => a.id);
+
+        const firstAgentId = agentIds[0];
+
+        // DEV NOTE: for now we treat channelId as both the parent channel id and thread id.
+        // Real Discord thread creation will provide distinct values.
+        const parentChannelId = args.channelId;
+        const threadId = args.channelId;
+
+        // Upsert room by thread id
+        const existing = yield* dbTry(() =>
+          db.select().from(rooms).where(eq(rooms.threadId, threadId)).get(),
+        );
+
+        const roomId =
+          existing?.id ??
+          (yield* dbTry(async () => {
+            const result = await db
+              .insert(rooms)
+              .values({
+                status: "active",
+                topic: args.topic,
+                parentChannelId,
+                threadId,
+                autoArchiveDurationMinutes: 1440,
+                currentTurnAgentId: firstAgentId,
+                currentTurnNumber: 0,
+              })
+              .returning({ id: rooms.id })
+              .get();
+            return result.id;
+          }));
+
+        // Reset room state on restart
+        yield* dbTry(() =>
+          db
+            .update(rooms)
+            .set({
+              status: "active",
+              topic: args.topic,
+              parentChannelId,
+              threadId,
+              currentTurnAgentId: firstAgentId,
+              currentTurnNumber: 0,
+            })
+            .where(eq(rooms.id, roomId))
+            .run(),
+        );
+
+        // participants
+        yield* dbTry(() => db.delete(roomAgents).where(eq(roomAgents.roomId, roomId)).run());
+        for (let i = 0; i < agentIds.length; i++) {
+          yield* dbTry(() =>
+            db.insert(roomAgents).values({ roomId, agentId: agentIds[i], turnOrder: i }).run(),
+          );
+        }
+
+        // reset history
+        yield* dbTry(() => db.delete(messages).where(eq(messages.roomId, roomId)).run());
+
+        return { roomId, firstJob: { roomId, turnNumber: 1 } } as const;
+      });
+
+      const stopArena = Effect.fn("ArenaService.stopArena")(function* (roomId: number) {
+        const existing = yield* dbTry(() =>
+          db.select({ id: rooms.id }).from(rooms).where(eq(rooms.id, roomId)).get(),
+        );
+        if (!existing) return yield* RoomNotFound.make({ roomId });
+        yield* dbTry(() =>
+          db.update(rooms).set({ status: "paused" }).where(eq(rooms.id, roomId)).run(),
+        );
+      });
+
+      const processTurn = Effect.fn("ArenaService.processTurn")(function* (job: RoomTurnJob) {
+        const room = yield* dbTry(() =>
+          db.select().from(rooms).where(eq(rooms.id, job.roomId)).get(),
+        );
+        if (!room) return yield* RoomNotFound.make({ roomId: job.roomId });
+        if (room.status !== "active") return null;
+
+        // idempotency
+        if (room.currentTurnNumber + 1 !== job.turnNumber) return null;
+
+        const agent = yield* dbTry(() =>
+          db.select().from(agents).where(eq(agents.id, room.currentTurnAgentId)).get(),
+        );
+        if (!agent) return yield* AgentNotFound.make({ agentId: room.currentTurnAgentId });
+
+        // bounded history
+        const history = yield* dbTry(() =>
+          db
+            .select()
+            .from(messages)
+            .where(eq(messages.roomId, room.id))
+            .orderBy(desc(messages.id))
+            .limit(historyLimit)
+            .all(),
+        );
+
+        const prompt: Prompt.RawInput = [
+          {
+            role: "system",
+            content: `${agent.systemPrompt}\n\n${rules(room.topic)}`,
+          },
+          ...history
+            .slice()
+            .reverse()
+            .filter((m) => m.authorType !== "bot_other")
+            .map((m) => {
+              if (m.authorType === "human") {
+                return {
+                  role: "user",
+                  content: [Prompt.makePart("text", { text: m.content })],
+                } as const;
+              }
+              return {
+                role: "assistant",
+                content: [Prompt.makePart("text", { text: m.content })],
+              } as const;
+            }),
+        ];
+
+        // deterministic id to make turn replay idempotent
+        const discordMessageId = `local-turn:${room.id}:${job.turnNumber}`;
+
+        const existingReply = yield* dbTry(() =>
+          db
+            .select({ content: messages.content })
+            .from(messages)
+            .where(eq(messages.discordMessageId, discordMessageId))
+            .get(),
+        );
+
+        let reply: string;
+
+        if (existingReply) {
+          // queue retry: reuse persisted content and skip LLM call
+          reply = existingReply.content;
+        } else {
+          // thinking delay (basic anti-spam)
+          yield* Effect.sleep("3 seconds");
+
+          reply = yield* llm.generate(prompt);
+
+          const now = yield* nowMs;
+          yield* dbTry(() =>
+            db
+              .insert(messages)
+              .values({
+                roomId: room.id,
+                discordMessageId,
+                threadId: room.threadId,
+                authorType: "agent",
+                authorAgentId: agent.id,
+                content: reply,
+                createdAtMs: now,
+              })
+              .onConflictDoNothing({ target: messages.discordMessageId })
+              .run(),
+          );
+
+          // Trim history to avoid unbounded growth
+          yield* dbTry(async () => {
+            const countRow = await db
+              .select({ c: sql<number>`count(*)` })
+              .from(messages)
+              .where(eq(messages.roomId, room.id))
+              .get();
+
+            const count = countRow ? Number(countRow.c) : 0;
+            const maxKeep = Math.max(historyLimit * 3, 60);
+            if (count <= maxKeep) return;
+
+            const cutoff = await db
+              .select({ id: messages.id })
+              .from(messages)
+              .where(eq(messages.roomId, room.id))
+              .orderBy(desc(messages.id))
+              .offset(maxKeep)
+              .limit(1)
+              .get();
+
+            if (!cutoff) return;
+
+            await db
+              .delete(messages)
+              .where(and(eq(messages.roomId, room.id), lt(messages.id, cutoff.id)))
+              .run();
+          });
+        }
+
+        // Post to Discord if we have a webhook for this room's parent channel
+        const webhook = yield* dbTry(() =>
+          db
+            .select()
+            .from(discordChannels)
+            .where(eq(discordChannels.channelId, room.parentChannelId))
+            .get(),
+        );
+
+        if (webhook) {
+          yield* webhookPoster.post({
+            webhook: { id: webhook.webhookId, token: webhook.webhookToken },
+            threadId: room.threadId,
+            content: reply,
+            username: agent.name,
+            ...(agent.avatarUrl ? { avatarUrl: agent.avatarUrl } : {}),
+          });
+        }
+
+        const shouldStop = reply.toLowerCase().includes("goodbye") || job.turnNumber >= maxTurns;
+        if (shouldStop) {
+          yield* dbTry(() =>
+            db
+              .update(rooms)
+              .set({ status: "paused", currentTurnNumber: job.turnNumber })
+              .where(eq(rooms.id, room.id))
+              .run(),
+          );
+          return null;
+        }
+
+        const participants = yield* dbTry(() =>
+          db
+            .select()
+            .from(roomAgents)
+            .where(eq(roomAgents.roomId, room.id))
+            .orderBy(asc(roomAgents.turnOrder))
+            .all(),
+        );
+
+        const idx = Math.max(
+          0,
+          participants.findIndex((p) => p.agentId === agent.id),
+        );
+        const next = participants[(idx + 1) % participants.length];
+
+        yield* dbTry(() =>
+          db
+            .update(rooms)
+            .set({ currentTurnNumber: job.turnNumber, currentTurnAgentId: next.agentId })
+            .where(eq(rooms.id, room.id))
+            .run(),
+        );
+
+        return { roomId: room.id, turnNumber: job.turnNumber + 1 } as const;
+      });
+
+      return ArenaService.of({ startArena, stopArena, processTurn });
+    }),
+  );
+}
