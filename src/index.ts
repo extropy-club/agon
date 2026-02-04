@@ -22,6 +22,12 @@ export interface Env {
   DISCORD_PUBLIC_KEY?: string;
   DISCORD_BOT_TOKEN?: string;
 
+  // Optional Cloudflare dashboard deep links (used by admin UI)
+  CF_ACCOUNT_ID?: string;
+  CF_WORKER_SERVICE?: string;
+  CF_QUEUE_NAME?: string;
+  CF_D1_NAME?: string;
+
   // LLM providers
   OPENAI_API_KEY?: string;
   ANTHROPIC_API_KEY?: string;
@@ -65,6 +71,10 @@ const makeConfigLayer = (env: Env) => {
     "LLM_MODEL",
     "ARENA_MAX_TURNS",
     "ARENA_HISTORY_LIMIT",
+    "CF_ACCOUNT_ID",
+    "CF_WORKER_SERVICE",
+    "CF_QUEUE_NAME",
+    "CF_D1_NAME",
   ] as const;
 
   for (const k of secretKeys) {
@@ -212,6 +222,51 @@ export default {
       const program = Effect.gen(function* () {
         yield* requireAdmin(request);
         const { db } = yield* Db;
+
+        // /admin/meta
+        if (segments.length === 2 && segments[1] === "meta") {
+          if (request.method !== "GET") {
+            return json(405, { error: "Method not allowed" });
+          }
+
+          const accountId = yield* Config.option(Config.string("CF_ACCOUNT_ID")).pipe(
+            Effect.map(Option.getOrNull),
+          );
+
+          const workerService = yield* Config.option(Config.string("CF_WORKER_SERVICE")).pipe(
+            Effect.map(Option.getOrElse(() => "agon")),
+          );
+
+          const queueName = yield* Config.option(Config.string("CF_QUEUE_NAME")).pipe(
+            Effect.map(Option.getOrElse(() => "arena-turns")),
+          );
+
+          const d1Name = yield* Config.option(Config.string("CF_D1_NAME")).pipe(
+            Effect.map(Option.getOrElse(() => "agon-db")),
+          );
+
+          if (!accountId) {
+            return json(200, {
+              configured: false,
+              missing: ["CF_ACCOUNT_ID"],
+            });
+          }
+
+          return json(200, {
+            configured: true,
+            cloudflare: {
+              accountId,
+              workerService,
+              queueName,
+              d1Name,
+              links: {
+                queueMetrics: `https://dash.cloudflare.com/${accountId}/workers/queues/view/${encodeURIComponent(queueName)}`,
+                workerLogs: `https://dash.cloudflare.com/${accountId}/workers/services/view/${encodeURIComponent(workerService)}/production/observability/logs`,
+                d1Console: `https://dash.cloudflare.com/${accountId}/workers/d1/view/${encodeURIComponent(d1Name)}`,
+              },
+            },
+          });
+        }
 
         // /admin/agents
         if (segments.length === 2 && segments[1] === "agents") {

@@ -1,156 +1,141 @@
-import { Show, createSignal } from "solid-js";
+import { Show, createResource } from "solid-js";
+import { apiFetch } from "../api";
 
-const load = (key: string, fallback: string) => {
-  try {
-    return localStorage.getItem(key) ?? fallback;
-  } catch {
-    return fallback;
-  }
-};
-
-const save = (key: string, value: string) => {
-  try {
-    localStorage.setItem(key, value);
-  } catch {
-    // ignore
-  }
-};
+type AdminMeta =
+  | { configured: false; missing: readonly string[] }
+  | {
+      configured: true;
+      cloudflare: {
+        accountId: string;
+        workerService: string;
+        queueName: string;
+        d1Name: string;
+        links: {
+          queueMetrics: string;
+          workerLogs: string;
+          d1Console: string;
+        };
+      };
+    };
 
 export default function Metrics() {
-  const [accountId, setAccountId] = createSignal(load("agon.cf.accountId", ""));
-  const [queueName, setQueueName] = createSignal(load("agon.cf.queueName", "arena-turns"));
-  const [workerService, setWorkerService] = createSignal(load("agon.cf.workerService", "agon"));
-  const [d1Name, setD1Name] = createSignal(load("agon.cf.d1Name", "agon-db"));
-
-  const links = () => {
-    const acc = accountId().trim();
-    if (!acc) return [] as const;
-
-    return [
-      {
-        title: "Queue metrics",
-        description: "Backlog size, throughput, and consumer errors for the debate queue.",
-        url: `https://dash.cloudflare.com/${acc}/workers/queues/view/${encodeURIComponent(queueName().trim())}`,
-      },
-      {
-        title: "Worker logs",
-        description: "Structured logs (Effect JSON logger) with requestId + queue correlation.",
-        url: `https://dash.cloudflare.com/${acc}/workers/services/view/${encodeURIComponent(workerService().trim())}/production/observability/logs`,
-      },
-      {
-        title: "D1 console",
-        description: "Inspect / query Agon state (rooms, agents, messages).",
-        url: `https://dash.cloudflare.com/${acc}/workers/d1/view/${encodeURIComponent(d1Name().trim())}`,
-      },
-    ] as const;
-  };
-
-  const persist = () => {
-    save("agon.cf.accountId", accountId());
-    save("agon.cf.queueName", queueName());
-    save("agon.cf.workerService", workerService());
-    save("agon.cf.d1Name", d1Name());
-  };
+  const [meta] = createResource(async () => (await apiFetch("/meta")) as AdminMeta);
 
   return (
     <div>
       <h1>Metrics & Observability</h1>
       <p style={{ "margin-bottom": "2rem", color: "var(--text-muted)" }}>
-        Agon uses Cloudflare’s native infrastructure for queues, logs, and D1. This page
-        intentionally does not replicate Cloudflare dashboards — it just gives you the right links
-        and what to look for.
+        Shortcuts to the Cloudflare dashboards you actually use.
       </p>
 
-      <div class="card" style={{ "margin-bottom": "2rem" }}>
-        <h3>Cloudflare links config</h3>
-        <div class="form-group">
-          <label>Account ID</label>
-          <input
-            class="form-control"
-            value={accountId()}
-            onInput={(e) => setAccountId(e.currentTarget.value)}
-          />
-        </div>
-        <div class="form-group">
-          <label>Worker service</label>
-          <input
-            class="form-control"
-            value={workerService()}
-            onInput={(e) => setWorkerService(e.currentTarget.value)}
-          />
-        </div>
-        <div class="form-group">
-          <label>Queue name</label>
-          <input
-            class="form-control"
-            value={queueName()}
-            onInput={(e) => setQueueName(e.currentTarget.value)}
-          />
-        </div>
-        <div class="form-group">
-          <label>D1 database name</label>
-          <input
-            class="form-control"
-            value={d1Name()}
-            onInput={(e) => setD1Name(e.currentTarget.value)}
-          />
-        </div>
+      <Show when={meta.loading}>
+        <div class="card">Loading…</div>
+      </Show>
 
-        <button class="btn btn-primary" onClick={persist}>
-          Save
-        </button>
+      <Show when={meta.error}>
+        <div class="card" style={{ "border-color": "#fecaca", "background-color": "#fef2f2" }}>
+          Failed to load admin metadata: {String(meta.error)}
+        </div>
+      </Show>
 
-        <Show when={!accountId().trim()}>
-          <p style={{ "margin-top": "1rem", color: "var(--text-muted)" }}>
-            Enter your Cloudflare account id to enable the links below.
-          </p>
-        </Show>
-      </div>
+      <Show when={meta() && !meta.loading && !meta.error}>
+        {(() => {
+          const m = meta();
+          if (!m) return null;
 
-      <div
-        style={{
-          display: "grid",
-          "grid-template-columns": "repeat(auto-fit, minmax(300px, 1fr))",
-          gap: "1.5rem",
-        }}
-      >
-        {links().map((link) => (
-          <div class="card">
-            <h3>{link.title}</h3>
-            <p style={{ "margin-bottom": "1.5rem" }}>{link.description}</p>
-            <a
-              href={link.url}
-              target="_blank"
-              rel="noopener noreferrer"
-              class="btn btn-primary"
-              style={{ "text-decoration": "none" }}
-            >
-              Open in Cloudflare
-            </a>
-          </div>
-        ))}
-      </div>
+          if (!m.configured) {
+            return (
+              <div class="card">
+                <h3>Cloudflare links not configured</h3>
+                <p style={{ color: "var(--text-muted)" }}>
+                  Set <code>CF_ACCOUNT_ID</code> in the worker environment.
+                </p>
+                <pre
+                  style={{
+                    "margin-top": "1rem",
+                    padding: "1rem",
+                    "background-color": "#111827",
+                    color: "#e5e7eb",
+                    "border-radius": "0.5rem",
+                    overflow: "auto",
+                  }}
+                >{`# .dev.vars\nCF_ACCOUNT_ID=...\nCF_WORKER_SERVICE=agon\nCF_QUEUE_NAME=arena-turns\nCF_D1_NAME=agon-db`}</pre>
+              </div>
+            );
+          }
 
-      <div
-        class="card"
-        style={{ "margin-top": "2rem", "background-color": "#fffbeb", "border-color": "#fef3c7" }}
-      >
-        <h4 style={{ color: "#92400e", "margin-top": 0 }}>What to look for</h4>
-        <ul style={{ color: "#92400e", "font-size": "0.9375rem" }}>
-          <li>
-            <strong>Queue backlog growing?</strong> Check worker logs for rate limits / failures,
-            and queue consumer errors.
-          </li>
-          <li>
-            <strong>Turn loop stuck?</strong> Look at room state in D1: rooms.currentTurnNumber vs
-            rooms.lastEnqueuedTurnNumber.
-          </li>
-          <li>
-            <strong>Discord issues?</strong> Filter logs by requestId / queueMessageId and look for
-            discord.sync / discord.webhook spans.
-          </li>
-        </ul>
-      </div>
+          const links = [
+            {
+              title: "Queue metrics",
+              description: "Backlog size, throughput, and consumer errors.",
+              url: m.cloudflare.links.queueMetrics,
+            },
+            {
+              title: "Worker logs",
+              description: "Structured logs with requestId + queue correlation.",
+              url: m.cloudflare.links.workerLogs,
+            },
+            {
+              title: "D1 console",
+              description: "Query rooms, agents, and messages.",
+              url: m.cloudflare.links.d1Console,
+            },
+          ] as const;
+
+          return (
+            <>
+              <div
+                style={{
+                  display: "grid",
+                  "grid-template-columns": "repeat(auto-fit, minmax(300px, 1fr))",
+                  gap: "1.5rem",
+                }}
+              >
+                {links.map((link) => (
+                  <div class="card">
+                    <h3>{link.title}</h3>
+                    <p style={{ "margin-bottom": "1.5rem" }}>{link.description}</p>
+                    <a
+                      href={link.url}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      class="btn btn-primary"
+                      style={{ "text-decoration": "none" }}
+                    >
+                      Open in Cloudflare
+                    </a>
+                  </div>
+                ))}
+              </div>
+
+              <div
+                class="card"
+                style={{
+                  "margin-top": "2rem",
+                  "background-color": "#fffbeb",
+                  "border-color": "#fef3c7",
+                }}
+              >
+                <h4 style={{ color: "#92400e", "margin-top": 0 }}>What to look for</h4>
+                <ul style={{ color: "#92400e", "font-size": "0.9375rem" }}>
+                  <li>
+                    <strong>Queue backlog growing?</strong> Check worker logs for failures and queue
+                    consumer errors.
+                  </li>
+                  <li>
+                    <strong>Turn loop stuck?</strong> Compare D1 room state:
+                    <code>currentTurnNumber</code> vs <code>lastEnqueuedTurnNumber</code>.
+                  </li>
+                  <li>
+                    <strong>Discord issues?</strong> Filter logs by requestId / queueMessageId and
+                    look for discord.sync / discord.webhook spans.
+                  </li>
+                </ul>
+              </div>
+            </>
+          );
+        })()}
+      </Show>
     </div>
   );
 }
