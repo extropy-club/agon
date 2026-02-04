@@ -72,6 +72,15 @@ export type Message = {
   readonly createdAtMs: number;
 };
 
+export type RoomTurnEvent = {
+  readonly roomId: number;
+  readonly turnNumber: number;
+  readonly phase: string;
+  readonly status: string;
+  readonly createdAtMs: number;
+  readonly dataJson: string | null;
+};
+
 export const agentsApi = {
   list: async (): Promise<readonly Agent[]> => {
     const res = (await apiFetch("/agents")) as { agents: readonly Agent[] };
@@ -143,5 +152,12 @@ export const roomsApi = {
       enqueued: boolean;
       turnNumber: number;
     };
+  },
+  events: async (roomId: number | string): Promise<readonly RoomTurnEvent[]> => {
+    const res = (await apiFetch(`/rooms/${roomId}/events`)) as {
+      roomId: number;
+      events: readonly RoomTurnEvent[];
+    };
+    return res.events;
   },
 };

@@ -1,4 +1,4 @@
-import { createResource, For, Show, createSignal } from "solid-js";
+import { createMemo, createResource, For, Show, createSignal } from "solid-js";
 import { useParams } from "@solidjs/router";
 import { roomsApi } from "../api";
 
@@ -9,6 +9,26 @@ export default function RoomDetail() {
     () => params.id,
     (id) => roomsApi.get(id),
   );
+
+  const [events, { refetch: refetchEvents }] = createResource(
+    () => params.id,
+    (id) => roomsApi.events(id),
+  );
+
+  const eventsByTurn = createMemo(() => {
+    const list = events() ?? [];
+    const map = new Map<number, (typeof list)[number][]>();
+
+    for (const e of list) {
+      const arr = map.get(e.turnNumber);
+      if (arr) arr.push(e);
+      else map.set(e.turnNumber, [e]);
+    }
+
+    return Array.from(map.entries())
+      .sort((a, b) => a[0] - b[0])
+      .map(([turnNumber, events]) => ({ turnNumber, events }));
+  });
 
   const [kickError, setKickError] = createSignal<string | null>(null);
   const [kicking, setKicking] = createSignal(false);
@@ -24,6 +44,7 @@ export default function RoomDetail() {
     }
 
     refetch();
+    refetchEvents();
   };
 
   const kick = async () => {
@@ -35,6 +56,7 @@ export default function RoomDetail() {
     try {
       await roomsApi.kick(d.room.id);
       refetch();
+      refetchEvents();
     } catch (e) {
       setKickError(String(e instanceof Error ? e.message : e));
     } finally {
@@ -136,6 +158,86 @@ export default function RoomDetail() {
                     )}
                   </For>
                 </div>
+              </section>
+
+              <section class="card">
+                <div
+                  style={{
+                    display: "flex",
+                    "justify-content": "space-between",
+                    "align-items": "center",
+                    gap: "1rem",
+                  }}
+                >
+                  <h3>Turn Timeline</h3>
+                  <button class="btn" onClick={() => refetchEvents()}>
+                    Refresh
+                  </button>
+                </div>
+
+                <Show when={events()} fallback={<p>Loading events...</p>}>
+                  {(evs) => (
+                    <Show when={evs().length > 0} fallback={<p>No turn events yet.</p>}>
+                      <For each={eventsByTurn()}>
+                        {(t) => (
+                          <div style={{ "margin-bottom": "1.5rem" }}>
+                            <div style={{ "font-weight": 600, "margin-bottom": "0.5rem" }}>
+                              Turn {t.turnNumber}
+                            </div>
+
+                            <div
+                              style={{
+                                display: "flex",
+                                "flex-direction": "column",
+                                gap: "0.35rem",
+                              }}
+                            >
+                              <For each={t.events}>
+                                {(e) => (
+                                  <div>
+                                    <div
+                                      style={{
+                                        display: "flex",
+                                        gap: "0.5rem",
+                                        "align-items": "center",
+                                        "flex-wrap": "wrap",
+                                      }}
+                                    >
+                                      <span
+                                        style={{
+                                          "font-size": "0.75rem",
+                                          color: "var(--text-muted)",
+                                          "min-width": "160px",
+                                        }}
+                                      >
+                                        {new Date(e.createdAtMs).toLocaleString()}
+                                      </span>
+                                      <span style={{ "font-family": "monospace" }}>{e.phase}</span>
+                                      <span class={`badge badge-${e.status}`}>{e.status}</span>
+                                    </div>
+                                    <Show when={e.dataJson}>
+                                      <div
+                                        style={{
+                                          "margin-left": "1.25rem",
+                                          "margin-top": "0.25rem",
+                                          "font-size": "0.75rem",
+                                          color: "var(--text-muted)",
+                                          "white-space": "pre-wrap",
+                                        }}
+                                      >
+                                        {e.dataJson}
+                                      </div>
+                                    </Show>
+                                  </div>
+                                )}
+                              </For>
+                            </div>
+                          </div>
+                        )}
+                      </For>
+                    </Show>
+                  )}
+                </Show>
               </section>
             </div>
 

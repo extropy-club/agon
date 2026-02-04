@@ -139,3 +139,18 @@ th {
   background-color: #fee2e2;
   color: #991b1b;
 }
+
+.badge-ok {
+  background-color: #dcfce7;
+  color: #166534;
+}
+
+.badge-fail {
+  background-color: #fee2e2;
+  color: #991b1b;
+}
+
+.badge-info {
+  background-color: #e0f2fe;
+  color: #075985;
+}

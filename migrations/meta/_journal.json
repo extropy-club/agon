@@ -15,6 +15,20 @@
       "when": 1770176043834,
       "tag": "0001_outstanding_red_hulk",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1770220310756,
+      "tag": "0002_confused_runaways",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "6",
+      "when": 1770223068384,
+      "tag": "0003_fixed_the_professor",
+      "breakpoints": true
     }
   ]
 }
