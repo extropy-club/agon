@@ -110,7 +110,9 @@ export class Discord extends Context.Tag("@agon/Discord")<
         s
           .trim()
           .replace(/^"(.*)"$/, "$1")
-          .replace(/^'(.*)'$/, "$1");
+          .replace(/^'(.*)'$/, "$1")
+          .replace(/^Bot\s+/i, "")
+          .replace(/^Bearer\s+/i, "");
 
       const authHeader = (token: Redacted.Redacted) =>
         `Bot ${sanitizeToken(Redacted.value(token))}`;

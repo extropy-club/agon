@@ -39,7 +39,14 @@ if (!currentOk && caFile) {
       .replace(/^"(.*)"$/, "$1")
       .replace(/^'(.*)'$/, "$1");
 
+  const stripAuthPrefix = (s) =>
+    String(s)
+      .replace(/^Bot\s+/i, "")
+      .replace(/^Bearer\s+/i, "");
+
   const sanitize = (s) => stripQuotes(String(s).replaceAll("\r", "").replaceAll("\n", "").trim());
+
+  const sanitizeToken = (s) => stripAuthPrefix(sanitize(s));
 
   const keys = [
     "ADMIN_TOKEN",
@@ -64,7 +71,9 @@ if (!currentOk && caFile) {
       if (idx <= 0) continue;
       const k = line.slice(0, idx).trim();
       const v = line.slice(idx + 1);
-      existing.set(k, sanitize(v));
+      const vv =
+        k === "DISCORD_BOT_TOKEN" || k.endsWith("_API_KEY") ? sanitizeToken(v) : sanitize(v);
+      existing.set(k, vv);
     }
   }
 
@@ -77,7 +86,11 @@ if (!currentOk && caFile) {
     if (key === "ADMIN_TOKEN") continue;
     const envVal = process.env[key];
     if (typeof envVal === "string" && envVal.length > 0) {
-      existing.set(key, sanitize(envVal));
+      const vv =
+        key === "DISCORD_BOT_TOKEN" || key.endsWith("_API_KEY")
+          ? sanitizeToken(envVal)
+          : sanitize(envVal);
+      existing.set(key, vv);
     }
   }
 
