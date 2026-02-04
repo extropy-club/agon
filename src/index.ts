@@ -50,6 +50,28 @@ const makeConfigLayer = (env: Env) => {
     if (typeof v === "string") map.set(k, v);
   }
 
+  // IMPORTANT: secrets can be defined as non-enumerable properties on `env`,
+  // so `Object.entries(env)` may miss them. We explicitly copy the ones we use.
+  const secretKeys = [
+    "ADMIN_TOKEN",
+    "DISCORD_PUBLIC_KEY",
+    "DISCORD_BOT_TOKEN",
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "GOOGLE_AI_API_KEY",
+    "LOG_LEVEL",
+    "LOG_FORMAT",
+    "LLM_PROVIDER",
+    "LLM_MODEL",
+    "ARENA_MAX_TURNS",
+    "ARENA_HISTORY_LIMIT",
+  ] as const;
+
+  for (const k of secretKeys) {
+    const v = (env as unknown as Record<string, unknown>)[k];
+    if (typeof v === "string") map.set(k, v);
+  }
+
   return Layer.setConfigProvider(ConfigProvider.fromMap(map));
 };
 
