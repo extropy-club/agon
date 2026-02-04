@@ -1,11 +1,17 @@
+import { eq } from "drizzle-orm";
 import * as ConfigProvider from "effect/ConfigProvider";
 import { Effect, Layer } from "effect";
 import * as ManagedRuntime from "effect/ManagedRuntime";
 import { Db } from "./d1/db.js";
+import { discordChannels } from "./d1/schema.js";
 import { ArenaService, type RoomTurnJob } from "./services/ArenaService.js";
+import {
+  Discord,
+  type DiscordAutoArchiveDurationMinutes,
+  verifyDiscordInteraction,
+} from "./services/Discord.js";
 import { DiscordWebhookPoster } from "./services/DiscordWebhook.js";
 import { LlmRouterLive } from "./services/LlmRouter.js";
-import { verifyDiscordInteraction } from "./services/Discord.js";
 
 export interface Env {
   DB: D1Database;
@@ -13,6 +19,7 @@ export interface Env {
 
   // Optional runtime config (usually provided via .dev.vars / wrangler secrets)
   DISCORD_PUBLIC_KEY?: string;
+  DISCORD_BOT_TOKEN?: string;
 
   // LLM providers
   OPENAI_API_KEY?: string;
@@ -43,13 +50,20 @@ const makeConfigLayer = (env: Env) => {
 };
 
 const makeRuntime = (env: Env) => {
-  const arenaLayer = ArenaService.layer.pipe(
-    Layer.provideMerge(Db.layer(env.DB)),
-    Layer.provideMerge(DiscordWebhookPoster.layer),
-    Layer.provideMerge(LlmRouterLive),
+  const dbLayer = Db.layer(env.DB);
+
+  const infraLayer = Layer.mergeAll(
+    dbLayer,
+    DiscordWebhookPoster.layer,
+    LlmRouterLive,
+    Discord.layer,
   );
 
-  const appLayer = arenaLayer.pipe(Layer.provideMerge(makeConfigLayer(env)));
+  const arenaLayer = ArenaService.layer.pipe(Layer.provide(infraLayer));
+
+  const appLayer = Layer.mergeAll(infraLayer, arenaLayer).pipe(
+    Layer.provideMerge(makeConfigLayer(env)),
+  );
 
   return ManagedRuntime.make(appLayer);
 };
@@ -122,6 +136,99 @@ export default {
         enqueued: true,
         firstJob: result.firstJob,
       });
+    }
+
+    // DEV: create a Discord room as a public thread under a parent channel
+    if (url.pathname === "/dev/room/create" && request.method === "POST") {
+      const payload = (await request.json().catch(() => null)) as unknown;
+      const rec =
+        payload && typeof payload === "object" ? (payload as Record<string, unknown>) : undefined;
+
+      const parentChannelId =
+        rec && typeof rec.parentChannelId === "string" ? rec.parentChannelId : undefined;
+      const name = rec && typeof rec.name === "string" ? rec.name : undefined;
+      const topic = rec && typeof rec.topic === "string" ? rec.topic : undefined;
+
+      const agentIdsRaw = rec && Array.isArray(rec.agentIds) ? rec.agentIds : undefined;
+      const agentIds = agentIdsRaw?.filter((a): a is string => typeof a === "string");
+
+      const allowed = [60, 1440, 4320, 10080] as const;
+      const autoArchiveDurationMinutesRaw =
+        rec && typeof rec.autoArchiveDurationMinutes === "number"
+          ? rec.autoArchiveDurationMinutes
+          : undefined;
+      const autoArchiveDurationMinutesNum = autoArchiveDurationMinutesRaw ?? 1440;
+
+      if (!parentChannelId || !name || !topic) {
+        return json(400, { error: "Invalid payload" });
+      }
+
+      if (!allowed.includes(autoArchiveDurationMinutesNum as (typeof allowed)[number])) {
+        return json(400, {
+          error: "Invalid autoArchiveDurationMinutes",
+          allowed,
+        });
+      }
+
+      const autoArchiveDurationMinutes =
+        autoArchiveDurationMinutesNum as DiscordAutoArchiveDurationMinutes;
+
+      const program = Effect.gen(function* () {
+        const discord = yield* Discord;
+        const { db } = yield* Db;
+        const arena = yield* ArenaService;
+
+        const existingWebhook = yield* Effect.tryPromise({
+          try: () =>
+            db
+              .select()
+              .from(discordChannels)
+              .where(eq(discordChannels.channelId, parentChannelId))
+              .get(),
+          catch: (e) => e,
+        }).pipe(Effect.orDie);
+
+        const webhook = existingWebhook
+          ? { id: existingWebhook.webhookId, token: existingWebhook.webhookToken }
+          : yield* discord.createOrFetchWebhook(parentChannelId);
+
+        // Upsert webhook mapping for the parent channel
+        yield* Effect.tryPromise({
+          try: () =>
+            db
+              .insert(discordChannels)
+              .values({
+                channelId: parentChannelId,
+                webhookId: webhook.id,
+                webhookToken: webhook.token,
+              })
+              .onConflictDoUpdate({
+                target: discordChannels.channelId,
+                set: { webhookId: webhook.id, webhookToken: webhook.token },
+              })
+              .run(),
+          catch: (e) => e,
+        }).pipe(Effect.orDie);
+
+        const threadId = yield* discord.createPublicThread(parentChannelId, {
+          name,
+          autoArchiveDurationMinutes,
+        });
+
+        const result = yield* arena.createRoom({
+          parentChannelId,
+          threadId,
+          topic,
+          autoArchiveDurationMinutes,
+          ...(agentIds && agentIds.length > 0 ? { agentIds } : {}),
+        });
+
+        return { roomId: result.roomId, threadId, firstJob: result.firstJob } as const;
+      });
+
+      const result = await runtime.runPromise(program);
+      ctx.waitUntil(env.ARENA_QUEUE.send(result.firstJob));
+      return json(200, { roomId: result.roomId, threadId: result.threadId });
     }
 
     if (url.pathname === "/dev/arena/stop" && request.method === "POST") {

@@ -70,9 +70,23 @@ const rules = (topic: string) =>
 export class ArenaService extends Context.Tag("@agon/ArenaService")<
   ArenaService,
   {
+    /**
+     * DEV endpoint (legacy): uses `channelId` as both parentChannelId and threadId.
+     */
     readonly startArena: (args: {
       channelId: string;
       topic: string;
+      agentIds?: ReadonlyArray<string>;
+    }) => Effect.Effect<{ roomId: number; firstJob: RoomTurnJob }, ArenaError>;
+
+    /**
+     * Create (or restart) a room bound to an existing Discord thread.
+     */
+    readonly createRoom: (args: {
+      parentChannelId: string;
+      threadId: string;
+      topic: string;
+      autoArchiveDurationMinutes?: number;
       agentIds?: ReadonlyArray<string>;
     }) => Effect.Effect<{ roomId: number; firstJob: RoomTurnJob }, ArenaError>;
 
@@ -110,9 +124,11 @@ export class ArenaService extends Context.Tag("@agon/ArenaService")<
         }
       });
 
-      const startArena = Effect.fn("ArenaService.startArena")(function* (args: {
-        channelId: string;
+      const upsertRoom = Effect.fn("ArenaService.upsertRoom")(function* (args: {
+        parentChannelId: string;
+        threadId: string;
         topic: string;
+        autoArchiveDurationMinutes: number;
         agentIds?: ReadonlyArray<string>;
       }) {
         yield* seedAgents();
@@ -124,14 +140,17 @@ export class ArenaService extends Context.Tag("@agon/ArenaService")<
 
         const firstAgentId = agentIds[0];
 
-        // DEV NOTE: for now we treat channelId as both the parent channel id and thread id.
-        // Real Discord thread creation will provide distinct values.
-        const parentChannelId = args.channelId;
-        const threadId = args.channelId;
+        // Guard against invalid values (Discord only accepts a small set).
+        const allowedDurations = [60, 1440, 4320, 10080] as const;
+        const autoArchiveDurationMinutes = allowedDurations.includes(
+          args.autoArchiveDurationMinutes as (typeof allowedDurations)[number],
+        )
+          ? args.autoArchiveDurationMinutes
+          : 1440;
 
         // Upsert room by thread id
         const existing = yield* dbTry(() =>
-          db.select().from(rooms).where(eq(rooms.threadId, threadId)).get(),
+          db.select().from(rooms).where(eq(rooms.threadId, args.threadId)).get(),
         );
 
         const roomId =
@@ -142,9 +161,9 @@ export class ArenaService extends Context.Tag("@agon/ArenaService")<
               .values({
                 status: "active",
                 topic: args.topic,
-                parentChannelId,
-                threadId,
-                autoArchiveDurationMinutes: 1440,
+                parentChannelId: args.parentChannelId,
+                threadId: args.threadId,
+                autoArchiveDurationMinutes,
                 currentTurnAgentId: firstAgentId,
                 currentTurnNumber: 0,
               })
@@ -160,8 +179,9 @@ export class ArenaService extends Context.Tag("@agon/ArenaService")<
             .set({
               status: "active",
               topic: args.topic,
-              parentChannelId,
-              threadId,
+              parentChannelId: args.parentChannelId,
+              threadId: args.threadId,
+              autoArchiveDurationMinutes,
               currentTurnAgentId: firstAgentId,
               currentTurnNumber: 0,
             })
@@ -181,6 +201,37 @@ export class ArenaService extends Context.Tag("@agon/ArenaService")<
         yield* dbTry(() => db.delete(messages).where(eq(messages.roomId, roomId)).run());
 
         return { roomId, firstJob: { roomId, turnNumber: 1 } } as const;
+      });
+
+      const startArena = Effect.fn("ArenaService.startArena")(function* (args: {
+        channelId: string;
+        topic: string;
+        agentIds?: ReadonlyArray<string>;
+      }) {
+        // Legacy DEV endpoint: channelId == parentChannelId == threadId
+        return yield* upsertRoom({
+          parentChannelId: args.channelId,
+          threadId: args.channelId,
+          topic: args.topic,
+          autoArchiveDurationMinutes: 1440,
+          ...(args.agentIds ? { agentIds: args.agentIds } : {}),
+        });
+      });
+
+      const createRoom = Effect.fn("ArenaService.createRoom")(function* (args: {
+        parentChannelId: string;
+        threadId: string;
+        topic: string;
+        autoArchiveDurationMinutes?: number;
+        agentIds?: ReadonlyArray<string>;
+      }) {
+        return yield* upsertRoom({
+          parentChannelId: args.parentChannelId,
+          threadId: args.threadId,
+          topic: args.topic,
+          autoArchiveDurationMinutes: args.autoArchiveDurationMinutes ?? 1440,
+          ...(args.agentIds ? { agentIds: args.agentIds } : {}),
+        });
       });
 
       const stopArena = Effect.fn("ArenaService.stopArena")(function* (roomId: number) {
@@ -372,7 +423,7 @@ export class ArenaService extends Context.Tag("@agon/ArenaService")<
         return { roomId: room.id, turnNumber: job.turnNumber + 1 } as const;
       });
 
-      return ArenaService.of({ startArena, stopArena, processTurn });
+      return ArenaService.of({ startArena, createRoom, stopArena, processTurn });
     }),
   );
 }
