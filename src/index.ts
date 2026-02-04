@@ -1236,7 +1236,7 @@ export default {
                 if (!room) return null;
 
                 // If the room was manually paused/resumed, or already advanced, do nothing.
-                if (room.status !== "audience_slot") return null;
+                if (room.status !== "audience_slot" && room.status !== "active") return null;
                 if (room.currentTurnNumber !== job.turnNumber) return null;
 
                 // Best-effort: lock the thread.
@@ -1254,12 +1254,6 @@ export default {
                   Effect.asVoid,
                 );
 
-                yield* Effect.tryPromise({
-                  try: () =>
-                    db.update(rooms).set({ status: "active" }).where(eq(rooms.id, room.id)).run(),
-                  catch: (e) => e,
-                }).pipe(Effect.orDie);
-
                 const nextTurnNumber = room.currentTurnNumber + 1;
                 if (room.lastEnqueuedTurnNumber >= nextTurnNumber) {
                   yield* turnEvents.write({
@@ -1271,6 +1265,12 @@ export default {
                   });
                   return null;
                 }
+
+                yield* Effect.tryPromise({
+                  try: () =>
+                    db.update(rooms).set({ status: "active" }).where(eq(rooms.id, room.id)).run(),
+                  catch: (e) => e,
+                }).pipe(Effect.orDie);
 
                 yield* turnEvents.write({
                   roomId: room.id,
