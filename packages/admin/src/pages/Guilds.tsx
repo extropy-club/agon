@@ -34,7 +34,7 @@ export default function Guilds() {
       <Show when={!guilds.loading} fallback={<p>Loading guilds...</p>}>
         <Show when={guilds.error}>
           <div class="card">
-            <h3 style={{ marginTop: 0 }}>Failed to load guilds</h3>
+            <h3 style={{ "margin-top": "0" }}>Failed to load guilds</h3>
             <pre style={{ "white-space": "pre-wrap" }}>{String(guilds.error)}</pre>
           </div>
         </Show>
