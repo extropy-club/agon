@@ -8,6 +8,13 @@
       "when": 1770170820803,
       "tag": "0000_clumsy_whistler",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "6",
+      "when": 1770176043834,
+      "tag": "0001_outstanding_red_hulk",
+      "breakpoints": true
     }
   ]
 }

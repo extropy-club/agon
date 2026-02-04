@@ -169,6 +169,7 @@ export class ArenaService extends Context.Tag("@agon/ArenaService")<
                 autoArchiveDurationMinutes,
                 currentTurnAgentId: firstAgentId,
                 currentTurnNumber: 0,
+                lastEnqueuedTurnNumber: 0,
               })
               .returning({ id: rooms.id })
               .get();
@@ -187,6 +188,7 @@ export class ArenaService extends Context.Tag("@agon/ArenaService")<
               autoArchiveDurationMinutes,
               currentTurnAgentId: firstAgentId,
               currentTurnNumber: 0,
+              lastEnqueuedTurnNumber: 0,
             })
             .where(eq(rooms.id, roomId))
             .run(),
@@ -255,6 +257,13 @@ export class ArenaService extends Context.Tag("@agon/ArenaService")<
         if (room.status !== "active") return null;
 
         // idempotency
+        // - normal case: currentTurnNumber + 1 == job.turnNumber
+        // - retry case: currentTurnNumber == job.turnNumber (turn was processed but enqueue/ack may have failed)
+        if (room.currentTurnNumber === job.turnNumber) {
+          const nextTurnNumber = job.turnNumber + 1;
+          if (room.lastEnqueuedTurnNumber >= nextTurnNumber) return null;
+          return { roomId: room.id, turnNumber: nextTurnNumber } as const;
+        }
         if (room.currentTurnNumber + 1 !== job.turnNumber) return null;
 
         const agent = yield* dbTry(() =>
@@ -403,17 +412,19 @@ export class ArenaService extends Context.Tag("@agon/ArenaService")<
 
         const existingReply = yield* dbTry(() =>
           db
-            .select({ content: messages.content })
+            .select({ content: messages.content, createdAtMs: messages.createdAtMs })
             .from(messages)
             .where(eq(messages.discordMessageId, discordMessageId))
             .get(),
         );
 
         let reply: string;
+        let replyCreatedAtMs: number;
 
         if (existingReply) {
           // queue retry: reuse persisted content and skip LLM call
           reply = existingReply.content;
+          replyCreatedAtMs = existingReply.createdAtMs;
         } else {
           // thinking delay (basic anti-spam)
           yield* Effect.sleep("3 seconds");
@@ -425,6 +436,7 @@ export class ArenaService extends Context.Tag("@agon/ArenaService")<
           });
 
           const now = yield* nowMs;
+          replyCreatedAtMs = now;
           yield* dbTry(() =>
             db
               .insert(messages)
@@ -479,8 +491,42 @@ export class ArenaService extends Context.Tag("@agon/ArenaService")<
           });
         }
 
-        // Post to Discord if we have a webhook for this room's parent channel
-        if (webhook) {
+        // Post to Discord if we have a webhook for this room's parent channel.
+        //
+        // When the queue retries a turn after we already successfully posted, we need to avoid
+        // duplicating the Discord message.
+        let alreadyPostedToDiscord = false;
+        let alreadyPostedInDiscordThread = false;
+
+        if (existingReply) {
+          alreadyPostedToDiscord = rawHistory.some((m) => {
+            if (m.authorType !== "agent") return false;
+            if (m.discordMessageId.startsWith("local-turn:")) return false;
+            if (m.content !== reply) return false;
+            const dt = m.createdAtMs - replyCreatedAtMs;
+            if (dt < -localTurnDedupeAllowEarlyMs) return false;
+            if (dt > localTurnDedupeWindowMs) return false;
+            if (m.authorAgentId !== agent.id) return false;
+            return true;
+          });
+
+          alreadyPostedInDiscordThread =
+            !alreadyPostedToDiscord &&
+            !!discordMessages &&
+            discordMessages.some((m) => {
+              if (m.webhook_id === undefined) return false;
+              if (m.content !== reply) return false;
+              if (m.author.username !== agent.name) return false;
+              const createdAtMs = Date.parse(m.timestamp);
+              if (!Number.isFinite(createdAtMs)) return false;
+              const dt = createdAtMs - replyCreatedAtMs;
+              if (dt < -localTurnDedupeAllowEarlyMs) return false;
+              if (dt > localTurnDedupeWindowMs) return false;
+              return true;
+            });
+        }
+
+        if (webhook && !(alreadyPostedToDiscord || alreadyPostedInDiscordThread)) {
           yield* webhookPoster.post({
             webhook: { id: webhook.webhookId, token: webhook.webhookToken },
             threadId: room.threadId,

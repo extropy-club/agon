@@ -1,9 +1,9 @@
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import * as ConfigProvider from "effect/ConfigProvider";
 import { Effect, Layer } from "effect";
 import * as ManagedRuntime from "effect/ManagedRuntime";
 import { Db } from "./d1/db.js";
-import { discordChannels } from "./d1/schema.js";
+import { discordChannels, rooms } from "./d1/schema.js";
 import { ArenaService, type RoomTurnJob } from "./services/ArenaService.js";
 import {
   Discord,
@@ -251,23 +251,47 @@ export default {
     return text(404, "Not Found");
   },
 
-  async queue(batch: MessageBatch<RoomTurnJob>, env: Env, ctx: ExecutionContext): Promise<void> {
+  async queue(batch: MessageBatch<RoomTurnJob>, env: Env, _ctx: ExecutionContext): Promise<void> {
     const runtime = makeRuntime(env);
 
     for (const message of batch.messages) {
-      const job = message.body as RoomTurnJob;
+      try {
+        const job = message.body as RoomTurnJob;
 
-      const program = Effect.gen(function* () {
-        const arena = yield* ArenaService;
-        return yield* arena.processTurn(job);
-      });
+        const program = Effect.gen(function* () {
+          const arena = yield* ArenaService;
+          return yield* arena.processTurn(job);
+        });
 
-      const next = await runtime.runPromise(program);
-      if (next) {
-        ctx.waitUntil(env.ARENA_QUEUE.send(next));
+        const next = await runtime.runPromise(program);
+        if (next) {
+          await env.ARENA_QUEUE.send(next);
+
+          // Persist an enqueue marker so a redelivered message (e.g., crash between send+ack)
+          // doesn't re-enqueue duplicates.
+          const markEnqueued = Effect.gen(function* () {
+            const { db } = yield* Db;
+            yield* Effect.tryPromise({
+              try: () =>
+                db
+                  .update(rooms)
+                  .set({
+                    lastEnqueuedTurnNumber: sql`max(${rooms.lastEnqueuedTurnNumber}, ${next.turnNumber})`,
+                  })
+                  .where(eq(rooms.id, next.roomId))
+                  .run(),
+              catch: () => null,
+            });
+          });
+
+          await runtime.runPromise(markEnqueued);
+        }
+
+        message.ack();
+      } catch (e) {
+        console.error("queue turn failed", e);
+        message.retry({ delaySeconds: Math.min(60, 2 ** message.attempts) });
       }
-
-      message.ack();
     }
   },
 };

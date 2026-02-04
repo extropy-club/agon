@@ -1,0 +1,1 @@
+ALTER TABLE `rooms` ADD `last_enqueued_turn_number` integer DEFAULT 0 NOT NULL;

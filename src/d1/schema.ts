@@ -20,6 +20,7 @@ export const rooms = sqliteTable("rooms", {
   autoArchiveDurationMinutes: integer("auto_archive_duration_minutes").notNull().default(1440),
   currentTurnAgentId: text("current_turn_agent_id").notNull(),
   currentTurnNumber: integer("current_turn_number").notNull().default(0),
+  lastEnqueuedTurnNumber: integer("last_enqueued_turn_number").notNull().default(0),
 });
 
 export const roomAgents = sqliteTable("room_agents", {
