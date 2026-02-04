@@ -32,7 +32,7 @@ export class LlmRouter extends Context.Tag("@agon/LlmRouter")<
       readonly prompt: Prompt.RawInput;
       readonly temperature?: number;
       readonly maxTokens?: number;
-      readonly thinkingLevel?: "none" | "minimal" | "low" | "medium" | "high" | "xhigh";
+      readonly thinkingLevel?: string;
       readonly thinkingBudgetTokens?: number;
     }) => Effect.Effect<string, LlmRouterError>;
   }
@@ -217,25 +217,17 @@ export class LlmRouter extends Context.Tag("@agon/LlmRouter")<
         readonly prompt: Prompt.RawInput;
         readonly temperature?: number;
         readonly maxTokens?: number;
-        readonly thinkingLevel?: "none" | "minimal" | "low" | "medium" | "high" | "xhigh";
+        readonly thinkingLevel?: string;
         readonly thinkingBudgetTokens?: number;
       }) {
         const apiKey = yield* requireApiKey(args.provider);
 
         // OpenRouter: use direct chat completions API
         if (args.provider === "openrouter") {
-          // OpenRouter supports reasoning_effort for compatible models (o-series, gpt-5, etc.)
-          const orEffort =
-            args.thinkingLevel !== undefined && args.thinkingLevel !== "xhigh"
-              ? args.thinkingLevel
-              : args.thinkingLevel === "xhigh"
-                ? "high"
-                : undefined;
-
           return yield* openRouterGenerate(args.model, args.prompt, apiKey, {
             ...(args.temperature !== undefined ? { temperature: args.temperature } : {}),
             ...(args.maxTokens !== undefined ? { maxTokens: args.maxTokens } : {}),
-            ...(orEffort !== undefined ? { reasoningEffort: orEffort } : {}),
+            ...(args.thinkingLevel !== undefined ? { reasoningEffort: args.thinkingLevel } : {}),
           }).pipe(
             Effect.timeout("30 seconds"),
             Effect.mapError((cause) => LlmCallFailed.make({ provider: args.provider, cause })),
@@ -275,26 +267,14 @@ export class LlmRouter extends Context.Tag("@agon/LlmRouter")<
         const withOverrides = (() => {
           switch (args.provider) {
             case "openai": {
-              const isOModel = args.model.toLowerCase().startsWith("o");
-              const isGpt5 = args.model.toLowerCase().startsWith("gpt-5");
-              const supportsReasoning = isOModel || isGpt5;
-
-              // OpenAI accepts: none, minimal, low, medium, high
-              // Map xhigh → high (not in OpenAI spec)
-              const mapOpenAiEffort = (
-                level: string,
-              ): "none" | "minimal" | "low" | "medium" | "high" =>
-                level === "xhigh"
-                  ? "high"
-                  : (level as "none" | "minimal" | "low" | "medium" | "high");
-
+              // OpenAI reasoning_effort: none | minimal | low | medium | high
+              // Passed through directly — UI enforces valid values.
               const overrides = {
                 ...(args.temperature !== undefined && { temperature: args.temperature }),
                 ...(args.maxTokens !== undefined && { max_output_tokens: args.maxTokens }),
-                ...(supportsReasoning &&
-                  args.thinkingLevel !== undefined && {
-                    reasoning_effort: mapOpenAiEffort(args.thinkingLevel),
-                  }),
+                ...(args.thinkingLevel !== undefined && {
+                  reasoning_effort: args.thinkingLevel,
+                }),
               };
 
               return base.pipe(
@@ -305,40 +285,17 @@ export class LlmRouter extends Context.Tag("@agon/LlmRouter")<
             }
 
             case "anthropic": {
-              // Anthropic uses budget_tokens (≥1024) for extended thinking.
-              // none/minimal → disable thinking; low/medium/high/xhigh → increasing budgets.
-              const budgetFromLevel = (
-                level: "none" | "minimal" | "low" | "medium" | "high" | "xhigh",
-              ): number | null => {
-                switch (level) {
-                  case "none":
-                  case "minimal":
-                    return null; // disable thinking
-                  case "low":
-                    return 1024;
-                  case "medium":
-                    return 4096;
-                  case "high":
-                    return 16384;
-                  case "xhigh":
-                    return 32768;
-                }
-              };
-
-              const thinkingBudget =
-                args.thinkingBudgetTokens !== undefined
-                  ? args.thinkingBudgetTokens
-                  : args.thinkingLevel !== undefined
-                    ? budgetFromLevel(args.thinkingLevel)
-                    : undefined;
-
+              // Anthropic: thinkingBudgetTokens (integer ≥1024) for extended thinking.
+              // thinkingLevel is not used — UI only shows budget input for Anthropic.
               const overrides = {
                 ...(args.temperature !== undefined && { temperature: args.temperature }),
                 ...(args.maxTokens !== undefined && { max_tokens: args.maxTokens }),
-                ...(thinkingBudget !== undefined &&
-                  thinkingBudget !== null && {
-                    thinking: { type: "enabled" as const, budget_tokens: thinkingBudget },
-                  }),
+                ...(args.thinkingBudgetTokens !== undefined && {
+                  thinking: {
+                    type: "enabled" as const,
+                    budget_tokens: args.thinkingBudgetTokens,
+                  },
+                }),
               };
 
               return base.pipe(
@@ -349,21 +306,18 @@ export class LlmRouter extends Context.Tag("@agon/LlmRouter")<
             }
 
             case "gemini": {
+              // Gemini 3: thinkingLevel LOW | HIGH (passed through directly)
+              // Gemini 2.5: thinkingBudget (integer)
               const generationConfig = {
                 ...(args.temperature !== undefined && { temperature: args.temperature }),
                 ...(args.maxTokens !== undefined && { maxOutputTokens: args.maxTokens }),
               };
 
-              // Gemini 3: thinkingLevel LOW/HIGH only (cannot disable).
-              // Map none/minimal/low → LOW; medium/high/xhigh → HIGH.
-              const mapGeminiLevel = (level: string): "LOW" | "HIGH" =>
-                level === "none" || level === "minimal" || level === "low" ? "LOW" : "HIGH";
-
               const thinkingConfig =
                 args.thinkingBudgetTokens !== undefined
                   ? { thinkingBudget: args.thinkingBudgetTokens }
                   : args.thinkingLevel !== undefined
-                    ? { thinkingLevel: mapGeminiLevel(args.thinkingLevel) }
+                    ? { thinkingLevel: args.thinkingLevel }
                     : undefined;
 
               const hasOverrides =

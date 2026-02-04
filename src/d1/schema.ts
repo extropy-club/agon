@@ -13,9 +13,11 @@ export const agents = sqliteTable("agents", {
   // Optional per-agent generation params (null => provider defaults)
   temperature: text("temperature"),
   maxTokens: integer("max_tokens"),
-  thinkingLevel: text("thinking_level", {
-    enum: ["none", "minimal", "low", "medium", "high", "xhigh"],
-  }),
+  // Provider-native values stored directly:
+  // OpenAI/OpenRouter: none | minimal | low | medium | high
+  // Gemini 3: LOW | HIGH
+  // Anthropic: uses thinkingBudgetTokens instead
+  thinkingLevel: text("thinking_level"),
   thinkingBudgetTokens: integer("thinking_budget_tokens"),
 });
 

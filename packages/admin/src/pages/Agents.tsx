@@ -163,43 +163,73 @@ export default function Agents() {
               />
             </div>
 
-            <div class="form-group">
-              <label>Thinking / Reasoning Level</label>
-              <select
-                class="form-control"
-                name="thinkingLevel"
-                value={editingAgent()?.thinkingLevel ?? ""}
-              >
-                <option value="">Default</option>
-                <option value="none">None</option>
-                <option value="minimal">Minimal</option>
-                <option value="low">Low</option>
-                <option value="medium">Medium</option>
-                <option value="high">High</option>
-                <option value="xhigh">Extra High</option>
-              </select>
-              <div
-                style={{
-                  color: "var(--text-muted)",
-                  "margin-top": "0.25rem",
-                  "font-size": "0.85em",
-                }}
-              >
-                OpenAI: reasoning_effort · Anthropic: thinking budget · Gemini 3: LOW/HIGH
+            {/* OpenAI: reasoning_effort */}
+            <Show when={selectedProvider() === "openai"}>
+              <div class="form-group">
+                <label>Reasoning Effort</label>
+                <select
+                  class="form-control"
+                  name="thinkingLevel"
+                  value={editingAgent()?.thinkingLevel ?? ""}
+                >
+                  <option value="">Default</option>
+                  <option value="none">None</option>
+                  <option value="minimal">Minimal</option>
+                  <option value="low">Low</option>
+                  <option value="medium">Medium</option>
+                  <option value="high">High</option>
+                </select>
               </div>
-            </div>
+            </Show>
 
+            {/* OpenRouter: reasoning_effort (same as OpenAI, models vary) */}
+            <Show when={selectedProvider() === "openrouter"}>
+              <div class="form-group">
+                <label>Reasoning Effort</label>
+                <select
+                  class="form-control"
+                  name="thinkingLevel"
+                  value={editingAgent()?.thinkingLevel ?? ""}
+                >
+                  <option value="">Default</option>
+                  <option value="none">None</option>
+                  <option value="minimal">Minimal</option>
+                  <option value="low">Low</option>
+                  <option value="medium">Medium</option>
+                  <option value="high">High</option>
+                </select>
+              </div>
+            </Show>
+
+            {/* Anthropic: thinking budget tokens */}
             <Show when={selectedProvider() === "anthropic"}>
               <div class="form-group">
-                <label>Thinking Budget Tokens</label>
+                <label>Thinking Budget (tokens)</label>
                 <input
                   class="form-control"
                   name="thinkingBudgetTokens"
                   type="number"
-                  min="1"
-                  step="1"
+                  min="1024"
+                  step="1024"
+                  placeholder="e.g. 4096 (min 1024, leave empty to disable)"
                   value={editingAgent()?.thinkingBudgetTokens ?? ""}
                 />
+              </div>
+            </Show>
+
+            {/* Gemini 3: thinking level LOW/HIGH */}
+            <Show when={selectedProvider() === "gemini"}>
+              <div class="form-group">
+                <label>Thinking Level</label>
+                <select
+                  class="form-control"
+                  name="thinkingLevel"
+                  value={editingAgent()?.thinkingLevel ?? ""}
+                >
+                  <option value="">Default (HIGH)</option>
+                  <option value="LOW">Low</option>
+                  <option value="HIGH">High</option>
+                </select>
               </div>
             </Show>
 
