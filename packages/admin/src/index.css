@@ -1,6 +1,8 @@
 :root {
   --primary: #3b82f6;
   --primary-hover: #2563eb;
+  --danger: #ef4444;
+  --danger-hover: #dc2626;
   --bg: #f8fafc;
   --card-bg: #ffffff;
   --text: #1e293b;
@@ -88,6 +90,15 @@ a:hover {
 
 .btn-primary:hover {
   background-color: var(--primary-hover);
+}
+
+.btn-danger {
+  background-color: var(--danger);
+  color: white;
+}
+
+.btn-danger:hover {
+  background-color: var(--danger-hover);
 }
 
 .form-group {

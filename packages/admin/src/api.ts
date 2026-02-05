@@ -158,6 +158,9 @@ export const roomsApi = {
       body: JSON.stringify(data),
     })) as { roomId: number; threadId: string; enqueued: boolean };
   },
+  delete: async (roomId: number): Promise<void> => {
+    await apiFetch(`/rooms/${roomId}`, { method: "DELETE" });
+  },
   pause: async (roomId: number): Promise<void> => {
     await apiFetch(`/rooms/${roomId}/pause`, { method: "POST" });
   },

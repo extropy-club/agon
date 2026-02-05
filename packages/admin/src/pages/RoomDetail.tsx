@@ -1,9 +1,10 @@
 import { createMemo, createResource, For, Show, createSignal } from "solid-js";
-import { useParams } from "@solidjs/router";
+import { useNavigate, useParams } from "@solidjs/router";
 import { roomsApi } from "../api";
 
 export default function RoomDetail() {
   const params = useParams();
+  const navigate = useNavigate();
 
   const [detail, { refetch }] = createResource(
     () => params.id,
@@ -64,6 +65,16 @@ export default function RoomDetail() {
     }
   };
 
+  const deleteRoom = async () => {
+    const d = detail();
+    if (!d) return;
+
+    if (!confirm("Delete this room and all its data?")) return;
+
+    await roomsApi.delete(d.room.id);
+    navigate("/rooms");
+  };
+
   return (
     <Show when={detail()} fallback={<p>Loading room...</p>}>
       {(d) => (
@@ -86,6 +97,9 @@ export default function RoomDetail() {
                   {kicking() ? "Kicking…" : "Kick next turn"}
                 </button>
               </Show>
+              <button class="btn btn-danger" onClick={deleteRoom}>
+                Delete
+              </button>
             </div>
           </div>
 

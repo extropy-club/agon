@@ -1322,6 +1322,18 @@ export default {
             return json(200, { room, participants, recentMessages });
           }
 
+          if (request.method === "DELETE") {
+            const room = yield* dbTry(() =>
+              db.select().from(rooms).where(eq(rooms.id, roomId)).get(),
+            );
+            if (!room) {
+              return yield* AdminNotFound.make({ resource: "room", id: String(roomId) });
+            }
+
+            yield* dbTry(() => db.delete(rooms).where(eq(rooms.id, roomId)).run());
+            return json(200, { ok: true });
+          }
+
           return json(405, { error: "Method not allowed" });
         }
 
