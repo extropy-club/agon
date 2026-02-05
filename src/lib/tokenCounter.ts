@@ -23,18 +23,16 @@ let globalEncoder: Encoder | null | undefined = undefined;
 const resolveGlobalEncoder = (): Encoder | null => {
   if (globalEncoder !== undefined) return globalEncoder ?? null;
 
-  const g = globalThis as unknown as Record<string, unknown>;
-
   const candidates: ReadonlyArray<unknown> = [
     // common ad-hoc patterns
-    g["__agonTiktokenEncoder"],
-    g["tiktokenEncoder"],
-    g["__tiktokenEncoder"],
+    Reflect.get(globalThis, "__agonTiktokenEncoder"),
+    Reflect.get(globalThis, "tiktokenEncoder"),
+    Reflect.get(globalThis, "__tiktokenEncoder"),
     // module-like globals (if user wires it up)
-    g["tiktoken"],
-    g["jsTiktoken"],
+    Reflect.get(globalThis, "tiktoken"),
+    Reflect.get(globalThis, "jsTiktoken"),
     // last resort: check top-level namespace
-    g,
+    globalThis,
   ];
 
   for (const c of candidates) {
