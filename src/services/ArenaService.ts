@@ -1174,7 +1174,7 @@ export class ArenaService extends Context.Tag("@agon/ArenaService")<
                     })
                     .onConflictDoNothing({ target: messages.discordMessageId })
                     .run(),
-                catch: (e) => e,
+                catch: (cause) => RoomDbError.make({ cause }),
               }).pipe(
                 Effect.catchAll((e) =>
                   Effect.logWarning("db.notification_insert.failed").pipe(

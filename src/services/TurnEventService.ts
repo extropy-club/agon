@@ -1,4 +1,4 @@
-import { Context, Effect, Layer } from "effect";
+import { Context, Effect, Layer, Schema } from "effect";
 import { Db, nowMs } from "../d1/db.js";
 import { roomTurnEvents } from "../d1/schema.js";
 
@@ -24,6 +24,10 @@ export type TurnEventWriteArgs = {
   readonly status: TurnEventStatus;
   readonly data?: unknown;
 };
+
+export class TurnEventDbError extends Schema.TaggedError<TurnEventDbError>()("TurnEventDbError", {
+  cause: Schema.Defect,
+}) {}
 
 /**
  * Best-effort persistence of internal turn lifecycle events.
@@ -67,7 +71,7 @@ export class TurnEventService extends Context.Tag("@agon/TurnEventService")<
                   dataJson,
                 })
                 .run(),
-            catch: (e) => e,
+            catch: (cause) => TurnEventDbError.make({ cause }),
           }).pipe(
             Effect.asVoid,
             Effect.catchAll((cause) =>

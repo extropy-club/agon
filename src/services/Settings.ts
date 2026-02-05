@@ -1,14 +1,22 @@
 import { eq } from "drizzle-orm";
-import { Config, Context, Effect, Layer, Option, Redacted } from "effect";
+import { Config, Context, Effect, Layer, Option, Redacted, Schema } from "effect";
 import { Db, nowMs } from "../d1/db.js";
 import { settings } from "../d1/schema.js";
-import { decrypt, encrypt } from "../lib/crypto.js";
+import { CryptoError, decrypt, encrypt } from "../lib/crypto.js";
 
 export type SettingsKeyStatus = {
   readonly key: string;
   readonly configured: boolean;
   readonly updatedAtMs: number | null;
 };
+
+export class SettingsDbError extends Schema.TaggedError<SettingsDbError>()("SettingsDbError", {
+  operation: Schema.String,
+  key: Schema.optional(Schema.String),
+  cause: Schema.Defect,
+}) {}
+
+export type SettingsError = SettingsDbError | CryptoError;
 
 export class Settings extends Context.Tag("@agon/Settings")<
   Settings,
@@ -21,12 +29,12 @@ export class Settings extends Context.Tag("@agon/Settings")<
     /**
      * Encrypt and store a setting.
      */
-    readonly setSetting: (key: string, value: string) => Effect.Effect<void, unknown>;
+    readonly setSetting: (key: string, value: string) => Effect.Effect<void, SettingsError>;
 
     /**
      * List all keys present in the DB (NOT values).
      */
-    readonly listKeys: () => Effect.Effect<ReadonlyArray<SettingsKeyStatus>, unknown>;
+    readonly listKeys: () => Effect.Effect<ReadonlyArray<SettingsKeyStatus>, SettingsError>;
   }
 >() {
   static readonly layer = Layer.effect(
@@ -39,7 +47,7 @@ export class Settings extends Context.Tag("@agon/Settings")<
       const getSetting = Effect.fn("Settings.getSetting")(function* (key: string) {
         const row = yield* Effect.tryPromise({
           try: () => db.select().from(settings).where(eq(settings.key, key)).get(),
-          catch: (e) => e,
+          catch: (cause) => SettingsDbError.make({ operation: "getSetting", key, cause }),
         }).pipe(
           Effect.catchAll((cause) =>
             Effect.logError("settings.db_get_failed").pipe(
@@ -90,7 +98,7 @@ export class Settings extends Context.Tag("@agon/Settings")<
                 set: { value: encrypted, updatedAtMs },
               })
               .run(),
-          catch: (e) => e,
+          catch: (cause) => SettingsDbError.make({ operation: "setSetting", key, cause }),
         }).pipe(Effect.asVoid);
       });
 
@@ -104,7 +112,7 @@ export class Settings extends Context.Tag("@agon/Settings")<
               })
               .from(settings)
               .all(),
-          catch: (e) => e,
+          catch: (cause) => SettingsDbError.make({ operation: "listKeys", cause }),
         });
 
         return rows.map((r) => ({ key: r.key, configured: true, updatedAtMs: r.updatedAtMs }));
