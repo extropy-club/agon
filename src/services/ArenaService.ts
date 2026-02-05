@@ -116,6 +116,22 @@ const errorDetail = (e: unknown): Record<string, unknown> => {
   return detail;
 };
 
+const messageXmlWrapperRe = /^\s*<message[^>]*>([\s\S]*)<\/message>\s*$/;
+
+/**
+ * Safety-net: unwrap accidental <message ...>...</message> wrappers from model output.
+ * Applied repeatedly to handle nested wrappers.
+ */
+const stripMessageXml = (text: string): string => {
+  let out = text;
+  for (let i = 0; i < 10; i++) {
+    const m = messageXmlWrapperRe.exec(out);
+    if (!m) return out;
+    out = m[1];
+  }
+  return out;
+};
+
 const turnFailedNotification = "⚠️ Turn failed — skipping to next agent.";
 
 const isRetryableDiscordError = (e: DiscordError): boolean => {
@@ -892,7 +908,7 @@ export class ArenaService extends Context.Tag("@agon/ArenaService")<
 
             if (existingReply) {
               // queue retry: reuse persisted content and skip LLM call
-              reply = existingReply.content;
+              reply = stripMessageXml(existingReply.content);
               replyCreatedAtMs = existingReply.createdAtMs;
               yield* Effect.logDebug("llm.generate.skip_existing").pipe(
                 Effect.annotateLogs({ replyChars: reply.length }),
@@ -999,7 +1015,7 @@ export class ArenaService extends Context.Tag("@agon/ArenaService")<
                 return { type: "turn", roomId: room.id, turnNumber: job.turnNumber + 1 } as const;
               }
 
-              reply = llmResult.right;
+              reply = stripMessageXml(llmResult.right);
 
               yield* turnEvents.write({
                 roomId: room.id,

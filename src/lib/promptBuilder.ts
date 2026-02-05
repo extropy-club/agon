@@ -39,6 +39,20 @@ const wrapXmlMessage = (args: {
   return `<message author="${authorNameEscaped}" audience="${audience}">${contentEscaped}</message>`;
 };
 
+const messageXmlWrapperRe = /^\s*<message[^>]*>([\s\S]*)<\/message>\s*$/;
+
+// Safety-net: older rooms may have persisted agent content wrapped in <message> XML.
+// We strip it so assistant role messages remain plain text.
+const stripMessageXml = (text: string): string => {
+  let out = text;
+  for (let i = 0; i < 10; i++) {
+    const m = messageXmlWrapperRe.exec(out);
+    if (!m) return out;
+    out = m[1];
+  }
+  return out;
+};
+
 const houseRules = `<rules>
 - Stay on topic.
 - Aim for 5-10 sentences per reply.
@@ -56,7 +70,7 @@ You are posting in a Discord thread.
 
 const buildIdentity = (agent: PromptBuilderAgent): string => `<identity>
 Your name is ${agent.name}. Your id is ${agent.id}.
-Messages are tagged with an author attribute — use it to know who is speaking.
+Messages from other participants are tagged with an author attribute — use it to know who is speaking.
 When someone addresses you by name, respond directly to them.
 When the audience (audience="true") asks you a question or challenges your point, engage with it.
 You are one of several participants in a structured debate.
@@ -91,52 +105,54 @@ export const buildPrompt = (
 
   const hasModeratorMessage = messages.some((m) => m.authorType === "moderator");
 
+  // Build a flat list of {role, content} entries, then merge consecutive same-role
+  // entries to guarantee strict user/assistant alternation.
+  //
+  // IMPORTANT: assistant messages must be plain text (no <message> wrappers).
+  const entries: Array<{ role: "user" | "assistant"; content: string }> = [];
+
   // Back-compat: older rooms might not have a persisted moderator message.
+  // Include it as a user entry so it participates in the merge logic (strict alternation).
   if (!hasModeratorMessage) {
-    prompt.push({
+    entries.push({
       role: "user",
-      content: [
-        textPart(
-          wrapXmlMessage({
-            authorName: "Moderator",
-            isAudience: false,
-            content: buildModeratorContent(room),
-          }),
-        ),
-      ],
+      content: wrapXmlMessage({
+        authorName: "Moderator",
+        isAudience: false,
+        content: buildModeratorContent(room),
+      }),
     });
   }
 
-  // Build a flat list of {role, xml} entries, then merge consecutive same-role
-  // entries to guarantee strict user/assistant alternation.
-  const entries: Array<{ role: "user" | "assistant"; xml: string }> = [];
   for (const m of messages) {
-    entries.push({
-      role: isOwnMessage(m, agent) ? "assistant" : "user",
-      xml: messageToXml(m),
-    });
+    if (isOwnMessage(m, agent)) {
+      entries.push({ role: "assistant", content: stripMessageXml(m.content) });
+    } else {
+      entries.push({ role: "user", content: messageToXml(m) });
+    }
   }
 
   // Merge consecutive same-role entries
   let i = 0;
   while (i < entries.length) {
     const role = entries[i].role;
-    const parts: Array<Prompt.TextPartEncoded> = [];
+    const chunks: Array<string> = [];
 
     while (i < entries.length && entries[i].role === role) {
-      parts.push(textPart(entries[i].xml));
+      chunks.push(entries[i].content);
       i++;
     }
 
     if (role === "assistant") {
-      // Assistant content is string | Array<TextPart | ...>
-      // Use string for single, parts array for multiple
       prompt.push({
         role: "assistant",
-        content: parts.length === 1 ? parts[0].text : parts.map((p) => p),
+        content: chunks.join("\n\n"),
       });
     } else {
-      prompt.push({ role: "user", content: parts });
+      prompt.push({
+        role: "user",
+        content: [textPart(chunks.join("\n"))],
+      });
     }
   }
 
