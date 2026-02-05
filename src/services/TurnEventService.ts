@@ -51,11 +51,9 @@ export class TurnEventService extends Context.Tag("@agon/TurnEventService")<
 
           let dataJson: string | null = null;
           if (args.data !== undefined) {
-            try {
-              dataJson = JSON.stringify(args.data);
-            } catch {
-              dataJson = null;
-            }
+            dataJson = yield* Effect.try(() => JSON.stringify(args.data)).pipe(
+              Effect.catchAll(() => Effect.succeed(null)),
+            );
           }
 
           yield* Effect.tryPromise({

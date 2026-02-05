@@ -590,6 +590,12 @@ export default {
       const AgentProviderSchema = Schema.Literal("openai", "anthropic", "gemini", "openrouter");
       const ThinkingLevelSchema = Schema.Literal("low", "medium", "high");
 
+      const NonNegativeIntSchema = Schema.Int.pipe(
+        Schema.nonNegative(),
+        Schema.finite(),
+        Schema.nonNaN(),
+      );
+
       const AgentCreateSchema = Schema.Struct({
         id: Schema.optional(Schema.String),
         name: Schema.String,
@@ -598,9 +604,9 @@ export default {
         llmProvider: Schema.optional(AgentProviderSchema),
         llmModel: Schema.optional(Schema.String),
         temperature: Schema.optional(Schema.String),
-        maxTokens: Schema.optional(Schema.NullOr(Schema.Number)),
+        maxTokens: Schema.optional(Schema.NullOr(NonNegativeIntSchema)),
         thinkingLevel: Schema.optional(Schema.NullOr(ThinkingLevelSchema)),
-        thinkingBudgetTokens: Schema.optional(Schema.NullOr(Schema.Number)),
+        thinkingBudgetTokens: Schema.optional(Schema.NullOr(NonNegativeIntSchema)),
       });
 
       const AgentUpdateSchema = Schema.Struct({
@@ -610,19 +616,19 @@ export default {
         llmProvider: Schema.optional(AgentProviderSchema),
         llmModel: Schema.optional(Schema.String),
         temperature: Schema.optional(Schema.String),
-        maxTokens: Schema.optional(Schema.NullOr(Schema.Number)),
+        maxTokens: Schema.optional(Schema.NullOr(NonNegativeIntSchema)),
         thinkingLevel: Schema.optional(Schema.NullOr(ThinkingLevelSchema)),
-        thinkingBudgetTokens: Schema.optional(Schema.NullOr(Schema.Number)),
+        thinkingBudgetTokens: Schema.optional(Schema.NullOr(NonNegativeIntSchema)),
       });
 
       const CreateRoomSchema = Schema.Struct({
         parentChannelId: Schema.String,
         topic: Schema.String,
         title: Schema.optional(Schema.String),
-        audienceSlotDurationSeconds: Schema.optional(Schema.Number),
-        audienceTokenLimit: Schema.optional(Schema.Number),
-        roomTokenLimit: Schema.optional(Schema.Number),
-        autoArchiveDurationMinutes: Schema.optional(Schema.Number),
+        audienceSlotDurationSeconds: Schema.optional(NonNegativeIntSchema),
+        audienceTokenLimit: Schema.optional(NonNegativeIntSchema),
+        roomTokenLimit: Schema.optional(NonNegativeIntSchema),
+        autoArchiveDurationMinutes: Schema.optional(NonNegativeIntSchema),
         agentIds: Schema.Array(Schema.String),
         // Provide threadId to bind to an existing thread. If omitted, we will create a thread.
         threadId: Schema.optional(Schema.String),
@@ -758,10 +764,10 @@ export default {
 
         // /admin/settings/:key
         if (segments.length === 3 && segments[1] === "settings") {
-          let key: string;
-          try {
-            key = decodeURIComponent(segments[2] ?? "");
-          } catch {
+          const key = yield* Effect.try(() => decodeURIComponent(segments[2] ?? "")).pipe(
+            Effect.catchAll(() => Effect.succeed(null as string | null)),
+          );
+          if (key === null) {
             return json(400, { error: "Malformed key encoding" });
           }
           const known = KNOWN_SETTINGS.find((s) => s.key === key);
