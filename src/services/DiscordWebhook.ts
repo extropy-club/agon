@@ -50,7 +50,7 @@ export class DiscordWebhookPoster extends Context.Tag("@agon/DiscordWebhookPoste
             });
             if (!res.ok) {
               const body = await res.text();
-              throw DiscordWebhookPostFailed.make({ status: res.status, body });
+              return Promise.reject(DiscordWebhookPostFailed.make({ status: res.status, body }));
             }
           },
           catch: (e) =>
