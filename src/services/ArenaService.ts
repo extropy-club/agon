@@ -218,7 +218,7 @@ const defaultAgents: ReadonlyArray<{
 ];
 
 const formatModeratorMessage = (args: { title: string; topic: string }) =>
-  `📢 **${args.title}**\n\n${args.topic}\n\n**Rules:**\n- Stay on topic\n- No meta talk about being an AI\n- Aim for 5-10 sentences\n- Say 'Goodbye' to end the debate\n\nDebate begins now!`;
+  `📢 **${args.title}**\n\n${args.topic}\n\n**Rules:**\n- Stay on topic\n- No meta talk about being an AI\n- Aim for 5-10 sentences\n\nDebate begins now!`;
 
 const isModeratorMessage = (content: string) =>
   content.startsWith("📢 **") &&
@@ -270,9 +270,6 @@ export class ArenaService extends Context.Tag("@agon/ArenaService")<
       const webhookPoster = yield* DiscordWebhookPoster;
       const turnEvents = yield* TurnEventService;
 
-      const maxTurns = yield* Config.integer("ARENA_MAX_TURNS").pipe(
-        Effect.orElseSucceed(() => 30),
-      );
       const historyLimit = yield* Config.integer("ARENA_HISTORY_LIMIT").pipe(
         Effect.orElseSucceed(() => 20),
       );
@@ -1132,28 +1129,6 @@ export class ArenaService extends Context.Tag("@agon/ArenaService")<
               yield* Effect.logDebug("discord.webhook.skip_duplicate");
             } else {
               yield* Effect.logDebug("discord.webhook.skip_missing");
-            }
-
-            const shouldStop =
-              reply.toLowerCase().includes("goodbye") || job.turnNumber >= maxTurns;
-            if (shouldStop) {
-              yield* dbTry(() =>
-                db
-                  .update(rooms)
-                  .set({ status: "paused", currentTurnNumber: job.turnNumber })
-                  .where(eq(rooms.id, room.id))
-                  .run(),
-              );
-
-              yield* turnEvents.write({
-                roomId: room.id,
-                turnNumber: job.turnNumber,
-                phase: "finish",
-                status: "ok",
-                data: { stopped: true },
-              });
-
-              return null;
             }
 
             const participants = yield* dbTry(() =>

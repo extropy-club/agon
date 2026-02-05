@@ -37,7 +37,7 @@ const wrapXmlMessage = (args: {
   return `<message author="${authorNameEscaped}" audience="${audience}">${contentEscaped}</message>`;
 };
 
-const moderatorRules = `Rules:\n- Stay on topic.\n- No meta talk about being an AI.\n- Aim for 5-10 sentences.\n- If you want to end, say 'Goodbye.'`;
+const moderatorRules = `Rules:\n- Stay on topic.\n- No meta talk about being an AI.\n- Aim for 5-10 sentences.`;
 
 const buildModeratorContent = (room: PromptBuilderRoom): string =>
   `Room title: ${room.title}\nTopic: ${room.topic}\n\n${moderatorRules}`;
