@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import { Effect } from "effect";
+
 import { signJwt, verifyJwt } from "../src/lib/jwt.js";
 
 test("jwt: signJwt + verifyJwt roundtrip", async () => {
@@ -15,8 +17,8 @@ test("jwt: signJwt + verifyJwt roundtrip", async () => {
     extra: "x",
   };
 
-  const token = await signJwt(payload, secret);
-  const verified = await verifyJwt(token, secret);
+  const token = await Effect.runPromise(signJwt(payload, secret));
+  const verified = await Effect.runPromise(verifyJwt(token, secret));
 
   assert.ok(verified);
   assert.equal(verified.sub, payload.sub);
@@ -29,13 +31,13 @@ test("jwt: verifyJwt rejects expired tokens", async () => {
   const secret = "test-secret";
   const now = Math.floor(Date.now() / 1000);
 
-  const token = await signJwt({ sub: "1", exp: now - 1 }, secret);
-  const verified = await verifyJwt(token, secret);
+  const token = await Effect.runPromise(signJwt({ sub: "1", exp: now - 1 }, secret));
+  const verified = await Effect.runPromise(verifyJwt(token, secret));
 
   assert.equal(verified, null);
 });
 
 test("jwt: verifyJwt rejects malformed tokens", async () => {
-  const verified = await verifyJwt("not-a-jwt", "secret");
+  const verified = await Effect.runPromise(verifyJwt("not-a-jwt", "secret"));
   assert.equal(verified, null);
 });
