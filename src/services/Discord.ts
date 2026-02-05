@@ -261,6 +261,11 @@ export class Discord extends Context.Tag("@agon/Discord")<
      *
      * Requires the bot to have the MANAGE_THREADS permission in the parent channel.
      */
+    readonly deleteMessage: (
+      channelId: string,
+      messageId: string,
+    ) => Effect.Effect<void, DiscordError>;
+
     readonly lockThread: (threadId: string) => Effect.Effect<void, DiscordError>;
 
     /**
@@ -522,6 +527,34 @@ export class Discord extends Context.Tag("@agon/Discord")<
           ),
         );
 
+      const deleteMessage = (channelId: string, messageId: string) =>
+        requireBotToken(botToken).pipe(
+          Effect.map(authHeader),
+          Effect.flatMap((Authorization) =>
+            Effect.tryPromise({
+              try: async () => {
+                const res = await fetch(
+                  `${DISCORD_API}/channels/${channelId}/messages/${messageId}`,
+                  {
+                    method: "DELETE",
+                    headers: { Authorization },
+                  },
+                );
+                if (!res.ok && res.status !== 404) {
+                  const body = await res.text().catch(() => "");
+                  throw DiscordApiError.make({
+                    endpoint: `/channels/${channelId}/messages/${messageId}`,
+                    status: res.status,
+                    body,
+                  });
+                }
+              },
+              catch: (cause) => cause as DiscordError,
+            }),
+          ),
+          Effect.mapError((e) => e as DiscordError),
+        );
+
       return Discord.of({
         createWebhook,
         createOrFetchWebhook,
@@ -530,6 +563,7 @@ export class Discord extends Context.Tag("@agon/Discord")<
         lockThread,
         unlockThread,
         postMessage,
+        deleteMessage,
         fetchRecentMessages,
         getBotUserId,
         getGuilds,

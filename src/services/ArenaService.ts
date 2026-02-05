@@ -894,6 +894,14 @@ export class ArenaService extends Context.Tag("@agon/ArenaService")<
                 Effect.annotateLogs({ replyChars: reply.length }),
               );
             } else {
+              // Post a "thinking" indicator that we'll delete after the agent responds.
+              const thinkingMsg = yield* discord
+                .postMessage(room.threadId, `💭 **${agent.name}** is thinking…`)
+                .pipe(
+                  Effect.map((m) => m.id),
+                  Effect.catchAll(() => Effect.succeed(null as string | null)),
+                );
+
               // thinking delay (basic anti-spam)
               yield* Effect.sleep("3 seconds");
 
@@ -919,6 +927,13 @@ export class ArenaService extends Context.Tag("@agon/ArenaService")<
                 }),
                 { maxRetries: 3, isRetryable: isRetryableLlmError },
               ).pipe(Effect.withLogSpan("llm.generate"), Effect.either);
+
+              // Delete the "thinking" indicator now that the LLM has responded (or failed).
+              if (thinkingMsg) {
+                yield* discord
+                  .deleteMessage(room.threadId, thinkingMsg)
+                  .pipe(Effect.catchAll(() => Effect.void));
+              }
 
               if (Either.isLeft(llmResult)) {
                 const e = llmResult.left;
