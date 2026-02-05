@@ -1,6 +1,7 @@
 import * as LanguageModel from "@effect/ai/LanguageModel";
 import * as Model from "@effect/ai/Model";
 import type * as Prompt from "@effect/ai/Prompt";
+import * as Toolkit from "@effect/ai/Toolkit";
 import { AnthropicClient, AnthropicLanguageModel } from "@effect/ai-anthropic";
 import { Generated as GoogleGenerated, GoogleClient, GoogleLanguageModel } from "@effect/ai-google";
 import { OpenAiClient, OpenAiLanguageModel } from "@effect/ai-openai";
@@ -12,6 +13,7 @@ import {
   buildOpenAiOverrides,
   buildOpenRouterBody,
 } from "../lib/llmOverrides.js";
+import { ExitDebate, OpenAiExitDebateTool } from "../lib/tools.js";
 import { Settings } from "./Settings.js";
 
 export const LlmProviderSchema = Schema.Literal("openai", "anthropic", "gemini", "openrouter");
@@ -35,10 +37,21 @@ export class LlmContentError extends Schema.TaggedError<LlmContentError>()("LlmC
 export type LlmRouterError = MissingLlmApiKey | LlmCallFailed | LlmContentError;
 
 export type LlmResult = {
+  /**
+   * Generated assistant text.
+   *
+   * NOTE: when `exit_debate` is called, providers may return *no* regular text.
+   * In that case we set `text` to the exit summary for convenience.
+   */
   readonly text: string;
   readonly reasoningText: string | null;
   readonly inputTokens: number | null;
   readonly outputTokens: number | null;
+
+  /**
+   * When not null, the model requested to end the debate.
+   */
+  readonly exitSummary: string | null;
 };
 
 export class LlmRouter extends Context.Tag("@agon/LlmRouter")<
@@ -171,7 +184,12 @@ export class LlmRouter extends Context.Tag("@agon/LlmRouter")<
           }
 
           const body = yield* Effect.try({
-            try: () => JSON.stringify(buildOpenRouterBody(model, messages, options)),
+            try: () =>
+              JSON.stringify({
+                ...buildOpenRouterBody(model, messages, options),
+                tools: [OpenAiExitDebateTool],
+                tool_choice: "auto",
+              }),
             catch: (cause) => LlmCallFailed.make({ provider: "openrouter", cause }),
           });
 
@@ -202,18 +220,73 @@ export class LlmRouter extends Context.Tag("@agon/LlmRouter")<
             catch: (cause) => LlmCallFailed.make({ provider: "openrouter", cause }),
           })) as {
             choices?: Array<{
-              message?: { content?: string; reasoning?: string; reasoning_content?: string };
+              message?: {
+                content?: string;
+                reasoning?: string;
+                reasoning_content?: string;
+                tool_calls?: Array<{
+                  id?: string;
+                  type?: string;
+                  function?: { name?: string; arguments?: unknown };
+                }>;
+              };
             }>;
             usage?: { prompt_tokens?: number; completion_tokens?: number };
           };
 
-          const content = data.choices?.[0]?.message?.content;
-          if (typeof content !== "string") {
+          const message = data.choices?.[0]?.message;
+
+          // Tool calls (Chat Completions function calling format)
+          const toolCalls = message?.tool_calls;
+          let exitSummary: string | null = null;
+
+          if (Array.isArray(toolCalls)) {
+            for (const call of toolCalls) {
+              const fn =
+                call && typeof call === "object" && call !== null && "function" in call
+                  ? (call as { function?: unknown }).function
+                  : undefined;
+
+              if (!fn || typeof fn !== "object" || fn === null) continue;
+              const name = (fn as { name?: unknown }).name;
+              if (name !== "exit_debate") continue;
+
+              const argsRaw = (fn as { arguments?: unknown }).arguments;
+              if (typeof argsRaw === "string") {
+                try {
+                  const parsed = JSON.parse(argsRaw) as unknown;
+                  if (
+                    parsed &&
+                    typeof parsed === "object" &&
+                    "summary" in parsed &&
+                    typeof (parsed as { summary?: unknown }).summary === "string"
+                  ) {
+                    exitSummary = (parsed as { summary: string }).summary;
+                  }
+                } catch {
+                  // ignore malformed args
+                }
+              } else if (
+                argsRaw &&
+                typeof argsRaw === "object" &&
+                "summary" in argsRaw &&
+                typeof (argsRaw as { summary?: unknown }).summary === "string"
+              ) {
+                exitSummary = (argsRaw as { summary: string }).summary;
+              }
+            }
+          }
+
+          const contentRaw = message?.content;
+          const contentText = typeof contentRaw === "string" ? contentRaw.trim() : "";
+          const exitSummaryText = typeof exitSummary === "string" ? exitSummary.trim() : null;
+
+          // If the model used the tool, it may not produce regular text.
+          if (exitSummaryText === null && contentText.length === 0) {
             return yield* LlmContentError.make({ provider: "openrouter", model });
           }
 
-          const reasoningRaw =
-            data.choices?.[0]?.message?.reasoning ?? data.choices?.[0]?.message?.reasoning_content;
+          const reasoningRaw = message?.reasoning ?? message?.reasoning_content;
 
           const inputTokens =
             typeof data.usage?.prompt_tokens === "number" ? data.usage.prompt_tokens : null;
@@ -221,10 +294,11 @@ export class LlmRouter extends Context.Tag("@agon/LlmRouter")<
             typeof data.usage?.completion_tokens === "number" ? data.usage.completion_tokens : null;
 
           return {
-            text: content.trim(),
+            text: exitSummaryText ?? contentText,
             reasoningText: typeof reasoningRaw === "string" ? reasoningRaw.trim() : null,
             inputTokens,
             outputTokens,
+            exitSummary: exitSummaryText,
           };
         });
 
@@ -254,6 +328,12 @@ export class LlmRouter extends Context.Tag("@agon/LlmRouter")<
             return null as never;
         }
       };
+
+      // Tooling: allow models to explicitly end a debate.
+      const exitToolkit = Toolkit.make(ExitDebate);
+      const exitToolkitLayer = exitToolkit.toLayer({
+        exit_debate: ({ summary }) => Effect.succeed(summary),
+      });
 
       const generate = Effect.fn("LlmRouter.generate")(function* (args: {
         readonly provider: LlmProvider;
@@ -293,7 +373,11 @@ export class LlmRouter extends Context.Tag("@agon/LlmRouter")<
         );
         const modelLayer = Model.make(args.provider, languageModelLayer);
 
-        const base = LanguageModel.generateText({ prompt: args.prompt });
+        const base = LanguageModel.generateText({
+          prompt: args.prompt,
+          toolkit: exitToolkit,
+          toolChoice: "auto",
+        });
 
         const isGoogleThinkingLevel = Schema.is(GoogleGenerated.ThinkingConfigThinkingLevel);
 
@@ -374,12 +458,22 @@ export class LlmRouter extends Context.Tag("@agon/LlmRouter")<
 
         return yield* withOverrides.pipe(
           Effect.provide(modelLayer),
-          Effect.map((r) => ({
-            text: r.text.trim(),
-            reasoningText: typeof r.reasoningText === "string" ? r.reasoningText.trim() : null,
-            inputTokens: typeof r.usage?.inputTokens === "number" ? r.usage.inputTokens : null,
-            outputTokens: typeof r.usage?.outputTokens === "number" ? r.usage.outputTokens : null,
-          })),
+          Effect.provide(exitToolkitLayer),
+          Effect.map((r) => {
+            const exitCall = r.toolCalls.find((c) => c.name === "exit_debate");
+            const exitSummary = exitCall ? exitCall.params.summary.trim() : null;
+
+            const textRaw = r.text.trim();
+            const text = textRaw.length > 0 ? textRaw : (exitSummary ?? "");
+
+            return {
+              text,
+              reasoningText: typeof r.reasoningText === "string" ? r.reasoningText.trim() : null,
+              inputTokens: typeof r.usage?.inputTokens === "number" ? r.usage.inputTokens : null,
+              outputTokens: typeof r.usage?.outputTokens === "number" ? r.usage.outputTokens : null,
+              exitSummary,
+            } satisfies LlmResult;
+          }),
           Effect.timeout("10 minutes"),
           Effect.mapError((cause) => LlmCallFailed.make({ provider: args.provider, cause })),
         );

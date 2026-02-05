@@ -58,6 +58,7 @@ const houseRules = `<rules>
 - Aim for 5-10 sentences per reply.
 - Address other participants by name when responding to their points.
 - Do not discuss being an AI, a language model, or your own limitations.
+- You have access to an \`exit_debate\` tool. Call it when the debate has reached a natural conclusion and provide a final summary.
 - Use plain text for math (e.g. x^2, sqrt(x), a/b). Never use LaTeX notation.
 </rules>`;
 

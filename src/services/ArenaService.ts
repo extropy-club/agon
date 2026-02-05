@@ -911,6 +911,8 @@ export class ArenaService extends Context.Tag("@agon/ArenaService")<
 
             let reply: string;
             let replyCreatedAtMs: number;
+            let isAgentExit = false;
+            let exitSummary: string | null = null;
 
             if (existingReply) {
               // queue retry: reuse persisted content and skip LLM call
@@ -1027,7 +1029,9 @@ export class ArenaService extends Context.Tag("@agon/ArenaService")<
 
               const ok: LlmResult = llmResult.right;
 
-              reply = stripMessageXml(ok.text);
+              exitSummary = ok.exitSummary;
+              isAgentExit = exitSummary !== null;
+              reply = stripMessageXml(exitSummary ?? ok.text);
 
               yield* turnEvents.write({
                 roomId: room.id,
@@ -1038,6 +1042,7 @@ export class ArenaService extends Context.Tag("@agon/ArenaService")<
                   replyChars: reply.length,
                   inputTokens: ok.inputTokens,
                   outputTokens: ok.outputTokens,
+                  ...(isAgentExit ? { agentExit: true, exitSummaryChars: reply.length } : {}),
                 },
               });
 
@@ -1171,18 +1176,25 @@ export class ArenaService extends Context.Tag("@agon/ArenaService")<
                   data: { error: errorLabel(e), detail: errorDetail(e) },
                 });
 
-                yield* notifyFinalFailure("webhook_post", e);
+                if (!isAgentExit) {
+                  yield* notifyFinalFailure("webhook_post", e);
 
-                yield* turnEvents.write({
-                  roomId: room.id,
-                  turnNumber: job.turnNumber,
-                  phase: "finish",
-                  status: "fail",
-                  data: { error: errorLabel(e), source: "webhook_post", detail: errorDetail(e) },
-                });
+                  yield* turnEvents.write({
+                    roomId: room.id,
+                    turnNumber: job.turnNumber,
+                    phase: "finish",
+                    status: "fail",
+                    data: { error: errorLabel(e), source: "webhook_post", detail: errorDetail(e) },
+                  });
 
-                // Do not return: the reply is already persisted in D1. We'll advance the turn
-                // normally so the loop continues, and Discord will catch up on the next sync.
+                  // Do not return: the reply is already persisted in D1. We'll advance the turn
+                  // normally so the loop continues, and Discord will catch up on the next sync.
+                } else {
+                  yield* Effect.logWarning("discord.webhook.post.failed_agent_exit").pipe(
+                    Effect.annotateLogs({ roomId: room.id, turnNumber: job.turnNumber }),
+                    Effect.asVoid,
+                  );
+                }
               } else {
                 yield* turnEvents.write({
                   roomId: room.id,
@@ -1197,6 +1209,58 @@ export class ArenaService extends Context.Tag("@agon/ArenaService")<
               yield* Effect.logDebug("discord.webhook.skip_duplicate");
             } else {
               yield* Effect.logDebug("discord.webhook.skip_missing");
+            }
+
+            if (isAgentExit) {
+              const participants = yield* dbTry(() =>
+                db
+                  .select()
+                  .from(roomAgents)
+                  .where(eq(roomAgents.roomId, room.id))
+                  .orderBy(asc(roomAgents.turnOrder))
+                  .all(),
+              );
+
+              const idx = Math.max(
+                0,
+                participants.findIndex((p) => p.agentId === agent.id),
+              );
+              const next = participants[(idx + 1) % participants.length];
+
+              yield* dbTry(() =>
+                db
+                  .update(rooms)
+                  .set({
+                    status: "paused",
+                    currentTurnNumber: job.turnNumber,
+                    currentTurnAgentId: next.agentId,
+                  })
+                  .where(eq(rooms.id, room.id))
+                  .run(),
+              );
+
+              yield* turnEvents.write({
+                roomId: room.id,
+                turnNumber: job.turnNumber,
+                phase: "agent_exit",
+                status: "ok",
+                data: { agentId: agent.id, summary: reply },
+              });
+
+              yield* turnEvents.write({
+                roomId: room.id,
+                turnNumber: job.turnNumber,
+                phase: "finish",
+                status: "ok",
+                data: {
+                  stopped: true,
+                  reason: "agent_exit",
+                  nextTurnNumber: job.turnNumber + 1,
+                  nextAgentId: next.agentId,
+                },
+              });
+
+              return null;
             }
 
             if (job.turnNumber >= room.maxTurns) {

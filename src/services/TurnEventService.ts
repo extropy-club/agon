@@ -8,6 +8,7 @@ export type TurnEventPhase =
   | "llm_start"
   | "llm_ok"
   | "llm_fail"
+  | "agent_exit"
   | "webhook_post_ok"
   | "webhook_post_fail"
   | "audience_slot_open"
