@@ -96,6 +96,11 @@ const isRetryableLlmError = (e: LlmRouterError): boolean => {
     case "MissingLlmApiKey":
       return false;
 
+    case "LlmContentError":
+      // Provider returned an unexpected response shape.
+      // Treat as transient (provider hiccup) and retry.
+      return true;
+
     case "LlmCallFailed": {
       const s = String(e.cause).toLowerCase();
 

@@ -50,10 +50,7 @@ export class Settings extends Context.Tag("@agon/Settings")<
         );
 
         if (row?.value) {
-          const decrypted = yield* Effect.tryPromise({
-            try: () => decrypt(row.value, secret),
-            catch: (e) => e,
-          }).pipe(
+          const decrypted = yield* decrypt(row.value, secret).pipe(
             Effect.catchAll((cause) =>
               Effect.logError("settings.decrypt_failed").pipe(
                 Effect.annotateLogs({ key, cause: String(cause) }),
@@ -81,10 +78,7 @@ export class Settings extends Context.Tag("@agon/Settings")<
       const setSetting = Effect.fn("Settings.setSetting")(function* (key: string, value: string) {
         const updatedAtMs = yield* nowMs;
 
-        const encrypted = yield* Effect.tryPromise({
-          try: () => encrypt(value, secret),
-          catch: (e) => e,
-        });
+        const encrypted = yield* encrypt(value, secret);
 
         yield* Effect.tryPromise({
           try: () =>

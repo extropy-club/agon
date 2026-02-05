@@ -21,7 +21,12 @@ export class LlmCallFailed extends Schema.TaggedError<LlmCallFailed>()("LlmCallF
   cause: Schema.Defect,
 }) {}
 
-export type LlmRouterError = MissingLlmApiKey | LlmCallFailed;
+export class LlmContentError extends Schema.TaggedError<LlmContentError>()("LlmContentError", {
+  provider: LlmProviderSchema,
+  model: Schema.String,
+}) {}
+
+export type LlmRouterError = MissingLlmApiKey | LlmCallFailed | LlmContentError;
 
 export class LlmRouter extends Context.Tag("@agon/LlmRouter")<
   LlmRouter,
@@ -139,24 +144,22 @@ export class LlmRouter extends Context.Tag("@agon/LlmRouter")<
           readonly reasoningEffort?: string;
         },
       ) =>
-        Effect.tryPromise({
-          try: async () => {
-            const messages = promptToMessages(prompt);
-            const headers: Record<string, string> = {
-              Authorization: `Bearer ${Redacted.value(apiKey)}`,
-              "Content-Type": "application/json",
-            };
-            if (Option.isSome(openRouterHttpReferer)) {
-              headers["HTTP-Referer"] = openRouterHttpReferer.value;
-            }
-            if (Option.isSome(openRouterTitle)) {
-              headers["X-Title"] = openRouterTitle.value;
-            }
+        Effect.gen(function* () {
+          const messages = promptToMessages(prompt);
+          const headers: Record<string, string> = {
+            Authorization: `Bearer ${Redacted.value(apiKey)}`,
+            "Content-Type": "application/json",
+          };
+          if (Option.isSome(openRouterHttpReferer)) {
+            headers["HTTP-Referer"] = openRouterHttpReferer.value;
+          }
+          if (Option.isSome(openRouterTitle)) {
+            headers["X-Title"] = openRouterTitle.value;
+          }
 
-            const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-              method: "POST",
-              headers,
-              body: JSON.stringify({
+          const body = yield* Effect.try({
+            try: () =>
+              JSON.stringify({
                 model,
                 messages,
                 ...(options?.temperature !== undefined && { temperature: options.temperature }),
@@ -165,23 +168,44 @@ export class LlmRouter extends Context.Tag("@agon/LlmRouter")<
                   reasoning_effort: options.reasoningEffort,
                 }),
               }),
+            catch: (cause) => LlmCallFailed.make({ provider: "openrouter", cause }),
+          });
+
+          const res = yield* Effect.tryPromise({
+            try: () =>
+              fetch("https://openrouter.ai/api/v1/chat/completions", {
+                method: "POST",
+                headers,
+                body,
+              }),
+            catch: (cause) => LlmCallFailed.make({ provider: "openrouter", cause }),
+          });
+
+          if (!res.ok) {
+            const bodyText = yield* Effect.tryPromise({
+              try: () => res.text(),
+              catch: (cause) => LlmCallFailed.make({ provider: "openrouter", cause }),
             });
 
-            if (!res.ok) {
-              const body = await res.text();
-              throw new Error(`OpenRouter ${res.status}: ${body}`);
-            }
+            return yield* LlmCallFailed.make({
+              provider: "openrouter",
+              cause: new Error(`OpenRouter ${res.status}: ${bodyText}`),
+            });
+          }
 
-            const data = (await res.json()) as {
-              choices?: Array<{ message?: { content?: string } }>;
-            };
-            const content = data.choices?.[0]?.message?.content;
-            if (typeof content !== "string") {
-              throw new Error("OpenRouter returned no content");
-            }
-            return content.trim();
-          },
-          catch: (e) => e,
+          const data = (yield* Effect.tryPromise({
+            try: () => res.json(),
+            catch: (cause) => LlmCallFailed.make({ provider: "openrouter", cause }),
+          })) as {
+            choices?: Array<{ message?: { content?: string } }>;
+          };
+
+          const content = data.choices?.[0]?.message?.content;
+          if (typeof content !== "string") {
+            return yield* LlmContentError.make({ provider: "openrouter", model });
+          }
+
+          return content.trim();
         });
 
       const makeLanguageModelLayer = (
@@ -230,7 +254,16 @@ export class LlmRouter extends Context.Tag("@agon/LlmRouter")<
             ...(args.thinkingLevel !== undefined ? { reasoningEffort: args.thinkingLevel } : {}),
           }).pipe(
             Effect.timeout("30 seconds"),
-            Effect.mapError((cause) => LlmCallFailed.make({ provider: args.provider, cause })),
+            Effect.mapError((cause) => {
+              const tag =
+                typeof cause === "object" && cause !== null && "_tag" in cause
+                  ? (cause as { readonly _tag?: string })._tag
+                  : undefined;
+
+              return tag === "LlmContentError" || tag === "LlmCallFailed"
+                ? (cause as LlmContentError | LlmCallFailed)
+                : LlmCallFailed.make({ provider: args.provider, cause });
+            }),
           );
         }
 

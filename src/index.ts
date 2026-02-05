@@ -13,7 +13,13 @@ import {
   roomTurnEvents,
   settings,
 } from "./d1/schema.js";
-import { ArenaService, type RoomTurnJob, type TurnJob } from "./services/ArenaService.js";
+import {
+  ArenaService,
+  RoomDbError,
+  type ArenaError,
+  type RoomTurnJob,
+  type TurnJob,
+} from "./services/ArenaService.js";
 import {
   Discord,
   type DiscordAutoArchiveDurationMinutes,
@@ -232,6 +238,20 @@ export class AdminQueueError extends Schema.TaggedError<AdminQueueError>()("Admi
   cause: Schema.Defect,
 }) {}
 
+// Dev-only endpoints (/dev/*)
+export class DevBadRequest extends Schema.TaggedError<DevBadRequest>()("DevBadRequest", {
+  message: Schema.String,
+}) {}
+
+export class DevDbError extends Schema.TaggedError<DevDbError>()("DevDbError", {
+  cause: Schema.Defect,
+}) {}
+
+export class AuthJwtError extends Schema.TaggedError<AuthJwtError>()("AuthJwtError", {
+  operation: Schema.String,
+  cause: Schema.Defect,
+}) {}
+
 const requireAdmin = (request: Request) =>
   Effect.gen(function* () {
     // 1) Bearer token (programmatic access)
@@ -263,10 +283,9 @@ const requireAdmin = (request: Request) =>
         return yield* Effect.fail(AdminMissingConfig.make({ key: "JWT_SECRET" }));
       }
 
-      const payload = (yield* Effect.tryPromise({
-        try: () => verifyJwt(session, Redacted.value(jwtOpt.value)),
-        catch: () => Promise.resolve(null),
-      })) as (Record<string, unknown> & { login?: string }) | null;
+      const payload = (yield* verifyJwt(session, Redacted.value(jwtOpt.value)).pipe(
+        Effect.catchAll(() => Effect.succeed(null)),
+      )) as (Record<string, unknown> & { login?: string }) | null;
 
       if (!payload) {
         return yield* Effect.fail(AdminUnauthorized.make({}));
@@ -395,6 +414,8 @@ export default {
         });
       }
 
+      const jwtSecret = env.JWT_SECRET;
+
       // Exchange code → access token
       const tokenResp = await fetch("https://github.com/login/oauth/access_token", {
         method: "POST",
@@ -482,7 +503,27 @@ export default {
         exp: now + 60 * 60 * 24 * 7,
       };
 
-      const jwt = await signJwt(payload, env.JWT_SECRET);
+      let jwt: string;
+      try {
+        jwt = await runtime.runPromise(
+          signJwt(payload, jwtSecret).pipe(
+            Effect.mapError((e) =>
+              AuthJwtError.make({
+                operation: e.operation,
+                cause: e.cause,
+              }),
+            ),
+          ),
+        );
+      } catch (e) {
+        console.error("auth.jwt.sign.failed", e);
+        const headers = new Headers({ "Content-Type": "application/json" });
+        headers.append("Set-Cookie", clearStateCookie);
+        return new Response(JSON.stringify({ error: "Failed to sign session" }, null, 2), {
+          status: 500,
+          headers,
+        });
+      }
 
       const sessionCookie = serializeCookie("session", jwt, {
         httpOnly: true,
@@ -500,13 +541,23 @@ export default {
       if (!token) return json(401, { error: "Unauthorized" });
       if (!env.JWT_SECRET) return json(500, { error: "Missing JWT_SECRET" });
 
-      const payload = await verifyJwt(token, env.JWT_SECRET);
+      const jwtSecret = env.JWT_SECRET;
+
+      const payload = await runtime.runPromise(
+        verifyJwt(token, jwtSecret).pipe(Effect.catchAll(() => Effect.succeed(null))),
+      );
       if (!payload) return json(401, { error: "Unauthorized" });
 
+      const rec = payload as Record<string, unknown>;
+      const login = typeof rec.login === "string" ? rec.login : null;
+      const avatar_url = typeof rec.avatar_url === "string" ? rec.avatar_url : null;
+      const sub = typeof rec.sub === "string" ? rec.sub : null;
+      if (!login || !avatar_url || !sub) return json(401, { error: "Unauthorized" });
+
       return json(200, {
-        login: payload.login,
-        avatar_url: payload.avatar_url,
-        sub: payload.sub,
+        login,
+        avatar_url,
+        sub,
       });
     }
 
@@ -619,10 +670,9 @@ export default {
               const row = byKey.get(def.key);
 
               if (row) {
-                const decrypted = yield* Effect.tryPromise({
-                  try: () => decrypt(row.value, secret),
-                  catch: (e) => e,
-                }).pipe(Effect.catchAll(() => Effect.succeed(null as string | null)));
+                const decrypted = yield* decrypt(row.value, secret).pipe(
+                  Effect.catchAll(() => Effect.succeed(null as string | null)),
+                );
 
                 if (decrypted === null) {
                   // DB row exists but decryption failed — don't claim it's configured
@@ -1667,7 +1717,7 @@ export default {
         const arena = yield* ArenaService;
         const payload = yield* parseJson<{ channelId: string; topic: string; agentIds?: string[] }>(
           request,
-        ).pipe(Effect.orDie);
+        ).pipe(Effect.mapError(() => DevBadRequest.make({ message: "Invalid JSON body" })));
         const result = yield* arena.startArena(payload);
         return result;
       }).pipe(
@@ -1675,15 +1725,23 @@ export default {
         Effect.withLogSpan("http.dev.arena.start"),
       );
 
-      const result = await runtime.runPromise(program);
-      ctx.waitUntil(env.ARENA_QUEUE.send(result.firstJob));
-      return json(200, {
-        roomId: result.roomId,
-        // Back-compat field name (temporary)
-        arenaId: result.roomId,
-        enqueued: true,
-        firstJob: result.firstJob,
-      });
+      try {
+        const result = await runtime.runPromise(program);
+        ctx.waitUntil(env.ARENA_QUEUE.send(result.firstJob));
+        return json(200, {
+          roomId: result.roomId,
+          // Back-compat field name (temporary)
+          arenaId: result.roomId,
+          enqueued: true,
+          firstJob: result.firstJob,
+        });
+      } catch (e) {
+        if (e instanceof DevBadRequest) {
+          return json(400, { error: e.message, requestId });
+        }
+        console.error("dev.arena.start.failed", e);
+        return json(500, { error: "Internal error", requestId });
+      }
     }
 
     // DEV: create a Discord room as a public thread under a parent channel
@@ -1735,7 +1793,7 @@ export default {
               .where(eq(discordChannels.channelId, parentChannelId))
               .get(),
           catch: (e) => e,
-        }).pipe(Effect.orDie);
+        }).pipe(Effect.mapError((cause) => DevDbError.make({ cause })));
 
         const webhook = existingWebhook
           ? { id: existingWebhook.webhookId, token: existingWebhook.webhookToken }
@@ -1757,7 +1815,7 @@ export default {
               })
               .run(),
           catch: (e) => e,
-        }).pipe(Effect.orDie);
+        }).pipe(Effect.mapError((cause) => DevDbError.make({ cause })));
 
         const threadId = yield* discord.createPublicThread(parentChannelId, {
           name,
@@ -1775,14 +1833,22 @@ export default {
         return { roomId: result.roomId, threadId, firstJob: result.firstJob } as const;
       });
 
-      const result = await runtime.runPromise(
-        program.pipe(
-          Effect.annotateLogs({ requestId, route: "/dev/room/create", parentChannelId }),
-          Effect.withLogSpan("http.dev.room.create"),
-        ),
-      );
-      ctx.waitUntil(env.ARENA_QUEUE.send(result.firstJob));
-      return json(200, { roomId: result.roomId, threadId: result.threadId });
+      try {
+        const result = await runtime.runPromise(
+          program.pipe(
+            Effect.annotateLogs({ requestId, route: "/dev/room/create", parentChannelId }),
+            Effect.withLogSpan("http.dev.room.create"),
+          ),
+        );
+        ctx.waitUntil(env.ARENA_QUEUE.send(result.firstJob));
+        return json(200, { roomId: result.roomId, threadId: result.threadId });
+      } catch (e) {
+        if (e instanceof DevDbError) {
+          return json(500, { error: "DB error", requestId });
+        }
+        console.error("dev.room.create.failed", e);
+        return json(500, { error: "Internal error", requestId });
+      }
     }
 
     if (url.pathname === "/dev/arena/stop" && request.method === "POST") {
@@ -1790,11 +1856,11 @@ export default {
         yield* Effect.logInfo("http.dev.arena.stop");
         const arena = yield* ArenaService;
         const payload = yield* parseJson<{ roomId?: number; arenaId?: number }>(request).pipe(
-          Effect.orDie,
+          Effect.mapError(() => DevBadRequest.make({ message: "Invalid JSON body" })),
         );
         const roomId = payload.roomId ?? payload.arenaId;
         if (roomId === undefined) {
-          return yield* Effect.dieMessage("Missing roomId");
+          return yield* Effect.fail(DevBadRequest.make({ message: "Missing roomId" }));
         }
         yield* arena.stopArena(roomId);
         return { ok: true, roomId };
@@ -1803,7 +1869,15 @@ export default {
         Effect.withLogSpan("http.dev.arena.stop"),
       );
 
-      return json(200, await runtime.runPromise(program));
+      try {
+        return json(200, await runtime.runPromise(program));
+      } catch (e) {
+        if (e instanceof DevBadRequest) {
+          return json(400, { error: e.message, requestId });
+        }
+        console.error("dev.arena.stop.failed", e);
+        return json(500, { error: "Internal error", requestId });
+      }
     }
 
     // Static assets + SPA fallback (admin UI)
@@ -1850,7 +1924,11 @@ export default {
           turnNumber: job.turnNumber,
         };
 
-        const program =
+        const program: Effect.Effect<
+          RoomTurnJob | null,
+          ArenaError,
+          ArenaService | Db | Discord | TurnEventService
+        > =
           job.type === "close_audience_slot"
             ? Effect.gen(function* () {
                 yield* Effect.logInfo("queue.audience_slot.close");
@@ -1862,7 +1940,7 @@ export default {
                 const room = yield* Effect.tryPromise({
                   try: () => db.select().from(rooms).where(eq(rooms.id, job.roomId)).get(),
                   catch: (e) => e,
-                }).pipe(Effect.orDie);
+                }).pipe(Effect.mapError((cause) => RoomDbError.make({ cause })));
 
                 if (!room) return null;
 
@@ -1969,7 +2047,7 @@ export default {
                   try: () =>
                     db.update(rooms).set({ status: "active" }).where(eq(rooms.id, room.id)).run(),
                   catch: (e) => e,
-                }).pipe(Effect.orDie);
+                }).pipe(Effect.mapError((cause) => RoomDbError.make({ cause })));
 
                 yield* turnEvents.write({
                   roomId: room.id,

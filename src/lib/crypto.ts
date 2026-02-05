@@ -5,6 +5,18 @@
 // - ciphertext: variable
 // - tag: appended by Web Crypto to ciphertext (16 bytes for AES-GCM)
 
+import { Effect, Schema } from "effect";
+
+export class CryptoError extends Schema.TaggedError<CryptoError>()("CryptoError", {
+  operation: Schema.String,
+  cause: Schema.Defect,
+}) {}
+
+export class DecryptionError extends Schema.TaggedError<DecryptionError>()("DecryptionError", {
+  reason: Schema.String,
+  cause: Schema.optional(Schema.Defect),
+}) {}
+
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();
 
@@ -25,51 +37,84 @@ const base64Encode = (bytes: Uint8Array): string => {
   return btoa(binary);
 };
 
-const base64DecodeToBytes = (s: string): Uint8Array => {
-  const binary = atob(s);
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-  return bytes;
-};
+const base64DecodeToBytes = (s: string): Effect.Effect<Uint8Array, DecryptionError> =>
+  Effect.gen(function* () {
+    const binary = yield* Effect.try({
+      try: () => atob(s),
+      catch: (cause) =>
+        DecryptionError.make({
+          reason: "Invalid base64 string",
+          cause,
+        }),
+    });
 
-export async function deriveKey(secret: string): Promise<CryptoKey> {
-  // Derive 32 bytes from the secret. We use SHA-256 to keep things simple.
-  const digest = await crypto.subtle.digest("SHA-256", textEncoder.encode(secret));
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    return bytes;
+  });
 
-  return crypto.subtle.importKey("raw", digest, { name: "AES-GCM" }, false, [
-    "encrypt",
-    "decrypt",
-  ] as KeyUsage[]);
-}
+export const deriveKey = (secret: string): Effect.Effect<CryptoKey, CryptoError> =>
+  Effect.gen(function* () {
+    // Derive 32 bytes from the secret. We use SHA-256 to keep things simple.
+    const digest = yield* Effect.tryPromise({
+      try: () => crypto.subtle.digest("SHA-256", textEncoder.encode(secret)),
+      catch: (cause) => CryptoError.make({ operation: "digest", cause }),
+    });
 
-export async function encrypt(plaintext: string, secret: string): Promise<string> {
-  const key = await deriveKey(secret);
-  const iv = crypto.getRandomValues(new Uint8Array(12));
-  const encoded = textEncoder.encode(plaintext);
+    return yield* Effect.tryPromise({
+      try: () =>
+        crypto.subtle.importKey("raw", digest, { name: "AES-GCM" }, false, [
+          "encrypt",
+          "decrypt",
+        ] as KeyUsage[]),
+      catch: (cause) => CryptoError.make({ operation: "importKey", cause }),
+    });
+  });
 
-  const ciphertext = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, encoded);
-  const cipherBytes = new Uint8Array(ciphertext);
+export const encrypt = (plaintext: string, secret: string): Effect.Effect<string, CryptoError> =>
+  Effect.gen(function* () {
+    const key = yield* deriveKey(secret);
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const encoded = textEncoder.encode(plaintext);
 
-  const out = new Uint8Array(iv.length + cipherBytes.length);
-  out.set(iv, 0);
-  out.set(cipherBytes, iv.length);
+    const ciphertext = yield* Effect.tryPromise({
+      try: () => crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, encoded),
+      catch: (cause) => CryptoError.make({ operation: "encrypt", cause }),
+    });
 
-  return base64Encode(out);
-}
+    const cipherBytes = new Uint8Array(ciphertext);
 
-export async function decrypt(encrypted: string, secret: string): Promise<string> {
-  const key = await deriveKey(secret);
-  const bytes = base64DecodeToBytes(encrypted);
+    const out = new Uint8Array(iv.length + cipherBytes.length);
+    out.set(iv, 0);
+    out.set(cipherBytes, iv.length);
 
-  // AES-GCM: 12 bytes IV + 16 bytes auth tag = 28 bytes minimum (empty plaintext)
-  if (bytes.length < 28) {
-    throw new Error("Invalid encrypted payload");
-  }
+    return base64Encode(out);
+  });
 
-  const iv = bytes.slice(0, 12);
-  const cipherBytes = bytes.slice(12);
+export const decrypt = (
+  encrypted: string,
+  secret: string,
+): Effect.Effect<string, DecryptionError | CryptoError> =>
+  Effect.gen(function* () {
+    const key = yield* deriveKey(secret);
+    const bytes = yield* base64DecodeToBytes(encrypted);
 
-  const plaintext = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, cipherBytes);
+    // AES-GCM: 12 bytes IV + 16 bytes auth tag = 28 bytes minimum (empty plaintext)
+    if (bytes.length < 28) {
+      return yield* DecryptionError.make({ reason: "Invalid encrypted payload" });
+    }
 
-  return textDecoder.decode(plaintext);
-}
+    const iv = bytes.slice(0, 12);
+    const cipherBytes = bytes.slice(12);
+
+    const plaintext = yield* Effect.tryPromise({
+      try: () => crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, cipherBytes),
+      catch: (cause) =>
+        DecryptionError.make({
+          reason: "Decryption failed",
+          cause,
+        }),
+    });
+
+    return textDecoder.decode(plaintext);
+  });
