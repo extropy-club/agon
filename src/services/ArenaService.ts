@@ -250,6 +250,7 @@ export class ArenaService extends Context.Tag("@agon/ArenaService")<
       audienceSlotDurationSeconds?: number;
       audienceTokenLimit?: number;
       roomTokenLimit?: number;
+      maxTurns?: number;
     }) => Effect.Effect<{ roomId: number; firstJob: TurnJob }, ArenaError>;
 
     readonly stopArena: (roomId: number) => Effect.Effect<void, ArenaError>;
@@ -270,7 +271,7 @@ export class ArenaService extends Context.Tag("@agon/ArenaService")<
       const webhookPoster = yield* DiscordWebhookPoster;
       const turnEvents = yield* TurnEventService;
 
-      const maxTurns = yield* Config.integer("ARENA_MAX_TURNS").pipe(
+      const defaultMaxTurns = yield* Config.integer("ARENA_MAX_TURNS").pipe(
         Effect.orElseSucceed(() => 30),
       );
       const historyLimit = yield* Config.integer("ARENA_HISTORY_LIMIT").pipe(
@@ -298,6 +299,7 @@ export class ArenaService extends Context.Tag("@agon/ArenaService")<
         audienceSlotDurationSeconds?: number;
         audienceTokenLimit?: number;
         roomTokenLimit?: number;
+        maxTurns?: number;
       }) {
         yield* seedAgents();
 
@@ -336,6 +338,7 @@ export class ArenaService extends Context.Tag("@agon/ArenaService")<
                 audienceSlotDurationSeconds: args.audienceSlotDurationSeconds ?? 60,
                 audienceTokenLimit: args.audienceTokenLimit ?? 4096,
                 roomTokenLimit: args.roomTokenLimit ?? 32000,
+                maxTurns: args.maxTurns ?? defaultMaxTurns,
                 currentTurnAgentId: firstAgentId,
                 currentTurnNumber: 0,
                 lastEnqueuedTurnNumber: 0,
@@ -359,6 +362,7 @@ export class ArenaService extends Context.Tag("@agon/ArenaService")<
               audienceSlotDurationSeconds: args.audienceSlotDurationSeconds ?? 60,
               audienceTokenLimit: args.audienceTokenLimit ?? 4096,
               roomTokenLimit: args.roomTokenLimit ?? 32000,
+              maxTurns: args.maxTurns ?? defaultMaxTurns,
               currentTurnAgentId: firstAgentId,
               currentTurnNumber: 0,
               lastEnqueuedTurnNumber: 0,
@@ -406,6 +410,7 @@ export class ArenaService extends Context.Tag("@agon/ArenaService")<
         audienceSlotDurationSeconds?: number;
         audienceTokenLimit?: number;
         roomTokenLimit?: number;
+        maxTurns?: number;
       }) {
         const providedTitle = args.title?.trim();
         const hasProvidedTitle = providedTitle !== undefined && providedTitle.length > 0;
@@ -424,6 +429,7 @@ export class ArenaService extends Context.Tag("@agon/ArenaService")<
             ? { audienceTokenLimit: args.audienceTokenLimit }
             : {}),
           ...(args.roomTokenLimit !== undefined ? { roomTokenLimit: args.roomTokenLimit } : {}),
+          ...(args.maxTurns !== undefined ? { maxTurns: args.maxTurns } : {}),
         });
 
         const fetchedTitle = hasProvidedTitle
@@ -805,6 +811,8 @@ export class ArenaService extends Context.Tag("@agon/ArenaService")<
             const localTurnDedupeWindowMs = 30 * 60 * 1000;
             const localTurnDedupeAllowEarlyMs = 30 * 1000;
 
+            // rawHistory is DESC (newest-first) so LIMIT gives us the *last N* messages.
+            // Reverse to chronological order for the prompt.
             const promptHistory = rawHistory
               .slice()
               .reverse()
@@ -1134,7 +1142,7 @@ export class ArenaService extends Context.Tag("@agon/ArenaService")<
               yield* Effect.logDebug("discord.webhook.skip_missing");
             }
 
-            if (job.turnNumber >= maxTurns) {
+            if (job.turnNumber >= room.maxTurns) {
               yield* dbTry(() =>
                 db
                   .update(rooms)
