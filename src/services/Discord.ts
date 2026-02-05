@@ -10,14 +10,14 @@ export class MissingDiscordConfig extends Schema.TaggedError<MissingDiscordConfi
 
 export class DiscordApiError extends Schema.TaggedError<DiscordApiError>()("DiscordApiError", {
   endpoint: Schema.String,
-  status: Schema.Number,
+  status: Schema.Int.pipe(Schema.nonNegative(), Schema.finite(), Schema.nonNaN()),
   body: Schema.String,
 }) {}
 
 export class DiscordRateLimited extends Schema.TaggedError<DiscordRateLimited>()(
   "DiscordRateLimited",
   {
-    retryAfterMs: Schema.Number,
+    retryAfterMs: Schema.Int.pipe(Schema.nonNegative(), Schema.finite(), Schema.nonNaN()),
   },
 ) {}
 

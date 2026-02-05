@@ -37,7 +37,7 @@ export type CloseAudienceSlotJob = {
 export type RoomTurnJob = TurnJob | CloseAudienceSlotJob;
 
 export class RoomNotFound extends Schema.TaggedError<RoomNotFound>()("RoomNotFound", {
-  roomId: Schema.Number,
+  roomId: Schema.Int.pipe(Schema.nonNegative(), Schema.finite(), Schema.nonNaN()),
 }) {}
 
 export class AgentNotFound extends Schema.TaggedError<AgentNotFound>()("AgentNotFound", {

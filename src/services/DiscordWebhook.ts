@@ -3,7 +3,7 @@ import { Context, Effect, Layer, Schema } from "effect";
 export class DiscordWebhookPostFailed extends Schema.TaggedError<DiscordWebhookPostFailed>()(
   "DiscordWebhookPostFailed",
   {
-    status: Schema.Number,
+    status: Schema.Int.pipe(Schema.nonNegative(), Schema.finite(), Schema.nonNaN()),
     body: Schema.String,
   },
 ) {}
