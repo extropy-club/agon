@@ -270,6 +270,9 @@ export class ArenaService extends Context.Tag("@agon/ArenaService")<
       const webhookPoster = yield* DiscordWebhookPoster;
       const turnEvents = yield* TurnEventService;
 
+      const maxTurns = yield* Config.integer("ARENA_MAX_TURNS").pipe(
+        Effect.orElseSucceed(() => 30),
+      );
       const historyLimit = yield* Config.integer("ARENA_HISTORY_LIMIT").pipe(
         Effect.orElseSucceed(() => 20),
       );
@@ -1129,6 +1132,26 @@ export class ArenaService extends Context.Tag("@agon/ArenaService")<
               yield* Effect.logDebug("discord.webhook.skip_duplicate");
             } else {
               yield* Effect.logDebug("discord.webhook.skip_missing");
+            }
+
+            if (job.turnNumber >= maxTurns) {
+              yield* dbTry(() =>
+                db
+                  .update(rooms)
+                  .set({ status: "paused", currentTurnNumber: job.turnNumber })
+                  .where(eq(rooms.id, room.id))
+                  .run(),
+              );
+
+              yield* turnEvents.write({
+                roomId: room.id,
+                turnNumber: job.turnNumber,
+                phase: "finish",
+                status: "ok",
+                data: { stopped: true, reason: "max_turns_reached" },
+              });
+
+              return null;
             }
 
             const participants = yield* dbTry(() =>
