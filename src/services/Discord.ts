@@ -527,33 +527,43 @@ export class Discord extends Context.Tag("@agon/Discord")<
           ),
         );
 
-      const deleteMessage = (channelId: string, messageId: string) =>
-        requireBotToken(botToken).pipe(
+      const deleteMessage = (channelId: string, messageId: string) => {
+        const endpoint = `/channels/${channelId}/messages/${messageId}`;
+        return requireBotToken(botToken).pipe(
           Effect.map(authHeader),
           Effect.flatMap((Authorization) =>
-            Effect.tryPromise({
-              try: async () => {
-                const res = await fetch(
-                  `${DISCORD_API}/channels/${channelId}/messages/${messageId}`,
-                  {
+            Effect.gen(function* () {
+              const res = yield* Effect.tryPromise({
+                try: () =>
+                  fetch(`${DISCORD_API}${endpoint}`, {
                     method: "DELETE",
                     headers: { Authorization },
-                  },
-                );
-                if (!res.ok && res.status !== 404) {
-                  const body = await res.text().catch(() => "");
-                  throw DiscordApiError.make({
-                    endpoint: `/channels/${channelId}/messages/${messageId}`,
-                    status: res.status,
-                    body,
-                  });
-                }
-              },
-              catch: (cause) => cause as DiscordError,
+                  }),
+                catch: (e) => DiscordApiError.make({ endpoint, status: 0, body: String(e) }),
+              });
+
+              // 204 No Content = success, 404 = already deleted — both fine.
+              if (res.status === 204 || res.status === 404) return;
+
+              const body = yield* Effect.tryPromise({
+                try: () => res.text(),
+                catch: (e) =>
+                  DiscordApiError.make({ endpoint, status: res.status, body: String(e) }),
+              });
+
+              if (res.status === 429) {
+                const retryAfterMs = parseSecondsHeaderMs(res.headers.get("Retry-After")) ?? 1000;
+                return yield* DiscordRateLimited.make({ retryAfterMs });
+              }
+
+              if (!res.ok) {
+                return yield* DiscordApiError.make({ endpoint, status: res.status, body });
+              }
             }),
           ),
           Effect.mapError((e) => e as DiscordError),
         );
+      };
 
       return Discord.of({
         createWebhook,
