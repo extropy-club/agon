@@ -863,7 +863,7 @@ export class ArenaService extends Context.Tag("@agon/ArenaService")<
 
             const prompt = buildPrompt(
               { title: room.title, topic: room.topic },
-              { systemPrompt: agent.systemPrompt },
+              { id: agent.id, name: agent.name, systemPrompt: agent.systemPrompt },
               promptHistory.map((m) => ({
                 authorType: m.authorType,
                 authorName:

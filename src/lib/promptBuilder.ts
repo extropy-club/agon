@@ -6,6 +6,8 @@ export type PromptBuilderRoom = {
 };
 
 export type PromptBuilderAgent = {
+  readonly id: string;
+  readonly name: string;
   readonly systemPrompt: string;
 };
 
@@ -53,7 +55,7 @@ You are posting in a Discord thread.
 </format>`;
 
 const buildSystemPrompt = (agent: PromptBuilderAgent): string =>
-  `${agent.systemPrompt}\n\n${houseRules}\n\n${discordFormat}`;
+  `You are ${agent.name}.\n\n${agent.systemPrompt}\n\n${houseRules}\n\n${discordFormat}`;
 
 const buildModeratorContent = (room: PromptBuilderRoom): string =>
   `Room title: ${room.title}\nTopic: ${room.topic}`;
