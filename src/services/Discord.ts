@@ -55,6 +55,16 @@ export type DiscordAutoArchiveDurationMinutes = 60 | 1440 | 4320 | 10080;
 
 const DISCORD_API = "https://discord.com/api/v10";
 
+export const DiscordResponseSchema = Schema.Union(
+  Schema.Record({ key: Schema.String, value: Schema.Unknown }),
+  Schema.Array(Schema.Unknown),
+);
+export type DiscordResponse = typeof DiscordResponseSchema.Type;
+
+const DiscordRateLimitedBodySchema = Schema.Struct({
+  retry_after: Schema.Number.pipe(Schema.nonNegative(), Schema.finite(), Schema.nonNaN()),
+});
+
 const requireBotToken = (
   botToken: Option.Option<Redacted.Redacted>,
 ): Effect.Effect<Redacted.Redacted, MissingDiscordConfig> =>
@@ -80,13 +90,10 @@ const parseRetryAfterMsFromBody = (body: string): number | null => {
   if (body.trim().length === 0) return null;
   try {
     const parsed: unknown = JSON.parse(body);
-    if (typeof parsed !== "object" || parsed === null) return null;
-    const rec = parsed as Record<string, unknown>;
-    const ra = rec["retry_after"];
-    if (typeof ra !== "number" || !Number.isFinite(ra)) return null;
+    const decoded = Schema.decodeUnknownSync(DiscordRateLimitedBodySchema)(parsed);
 
     // Discord documents retry_after in seconds.
-    return Math.max(0, Math.ceil(ra * 1000));
+    return Math.max(0, Math.ceil(decoded.retry_after * 1000));
   } catch {
     return null;
   }

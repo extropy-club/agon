@@ -2,7 +2,7 @@ import * as LanguageModel from "@effect/ai/LanguageModel";
 import * as Model from "@effect/ai/Model";
 import type * as Prompt from "@effect/ai/Prompt";
 import { AnthropicClient, AnthropicLanguageModel } from "@effect/ai-anthropic";
-import { GoogleClient, GoogleLanguageModel } from "@effect/ai-google";
+import { Generated as GoogleGenerated, GoogleClient, GoogleLanguageModel } from "@effect/ai-google";
 import { OpenAiClient, OpenAiLanguageModel } from "@effect/ai-openai";
 import * as FetchHttpClient from "@effect/platform/FetchHttpClient";
 import { Context, Effect, Layer, Option, Redacted, Schema } from "effect";
@@ -275,38 +275,55 @@ export class LlmRouter extends Context.Tag("@agon/LlmRouter")<
 
         const base = LanguageModel.generateText({ prompt: args.prompt });
 
+        const isGoogleThinkingLevel = Schema.is(GoogleGenerated.ThinkingConfigThinkingLevel);
+
+        const normalizeGoogleConfig = (
+          u: GoogleLanguageModel.Config.Service | undefined,
+        ): GoogleLanguageModel.Config.Service => ({
+          ...(u ?? {}),
+          toolConfig: u?.toolConfig ?? {},
+        });
+
         const withGoogleConfigOverride = <A, E, R>(
           self: Effect.Effect<A, E, R>,
           overrides: GoogleLanguageModel.Config.Service,
         ): Effect.Effect<A, E, R> =>
           Effect.flatMap(GoogleLanguageModel.Config.getOrUndefined, (current) => {
-            const cur = (current ?? {}) as unknown as Record<string, unknown>;
-            const next = { ...cur, ...(overrides as unknown as Record<string, unknown>) };
+            const cur = normalizeGoogleConfig(current);
 
             // Merge nested generationConfig when present on both sides.
-            if ("generationConfig" in overrides) {
-              const curGen = cur["generationConfig"] as Record<string, unknown> | undefined;
-              const overrideGen = (overrides as unknown as Record<string, unknown>)[
-                "generationConfig"
-              ] as Record<string, unknown> | undefined;
-              if (overrideGen) {
-                next["generationConfig"] = { ...curGen, ...overrideGen };
-              }
-            }
+            const overrideGen = overrides.generationConfig;
+            const curGen = cur.generationConfig;
 
-            return Effect.provideService(self, GoogleLanguageModel.Config, next as never);
+            const mergedGenerationConfig =
+              overrideGen !== undefined && overrideGen !== null
+                ? typeof curGen === "object" && curGen !== null
+                  ? { ...curGen, ...overrideGen }
+                  : overrideGen
+                : undefined;
+
+            const next: GoogleLanguageModel.Config.Service = {
+              ...cur,
+              ...overrides,
+              toolConfig: { ...cur.toolConfig, ...overrides.toolConfig },
+              ...(mergedGenerationConfig !== undefined && {
+                generationConfig: mergedGenerationConfig,
+              }),
+            };
+
+            return Effect.provideService(self, GoogleLanguageModel.Config, next);
           });
 
         const withOverrides = (() => {
           switch (args.provider) {
             case "openai": {
-              // OpenAI reasoning_effort: none | minimal | low | medium | high
-              // Passed through directly — UI enforces valid values.
+              // OpenAI Responses API uses `reasoning.effort` (not `reasoning_effort`).
+              // Valid values: none | minimal | low | medium | high.
               const overrides = {
                 ...(args.temperature !== undefined && { temperature: args.temperature }),
                 ...(args.maxTokens !== undefined && { max_output_tokens: args.maxTokens }),
                 ...(args.thinkingLevel !== undefined && {
-                  reasoning_effort: args.thinkingLevel,
+                  reasoning: { effort: args.thinkingLevel },
                 }),
               };
 
@@ -349,7 +366,7 @@ export class LlmRouter extends Context.Tag("@agon/LlmRouter")<
               const thinkingConfig =
                 args.thinkingBudgetTokens !== undefined
                   ? { thinkingBudget: args.thinkingBudgetTokens }
-                  : args.thinkingLevel !== undefined
+                  : args.thinkingLevel !== undefined && isGoogleThinkingLevel(args.thinkingLevel)
                     ? { thinkingLevel: args.thinkingLevel }
                     : undefined;
 
@@ -357,10 +374,11 @@ export class LlmRouter extends Context.Tag("@agon/LlmRouter")<
                 Object.keys(generationConfig).length > 0 || thinkingConfig !== undefined;
               if (!hasOverrides) return base;
 
-              const overrides = {
+              const overrides: GoogleLanguageModel.Config.Service = {
+                toolConfig: {},
                 ...(Object.keys(generationConfig).length > 0 && { generationConfig }),
                 ...(thinkingConfig !== undefined && { thinkingConfig }),
-              } as unknown as GoogleLanguageModel.Config.Service;
+              };
 
               return withGoogleConfigOverride(base, overrides);
             }
