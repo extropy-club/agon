@@ -264,6 +264,36 @@ export class AuthJwtError extends Schema.TaggedError<AuthJwtError>()("AuthJwtErr
   cause: Schema.Defect,
 }) {}
 
+export class GitHubTokenExchangeError extends Schema.TaggedError<GitHubTokenExchangeError>()(
+  "GitHubTokenExchangeError",
+  {
+    cause: Schema.Defect,
+    details: Schema.optional(Schema.Unknown),
+  },
+) {}
+
+export class GitHubUserFetchError extends Schema.TaggedError<GitHubUserFetchError>()(
+  "GitHubUserFetchError",
+  {
+    cause: Schema.Defect,
+    details: Schema.optional(Schema.Unknown),
+  },
+) {}
+
+export class OAuthStateError extends Schema.TaggedError<OAuthStateError>()("OAuthStateError", {}) {}
+
+export class OAuthMissingConfigError extends Schema.TaggedError<OAuthMissingConfigError>()(
+  "OAuthMissingConfigError",
+  {
+    key: Schema.String,
+  },
+) {}
+
+export class OAuthForbiddenError extends Schema.TaggedError<OAuthForbiddenError>()(
+  "OAuthForbiddenError",
+  {},
+) {}
+
 const requireAdmin = (request: Request) =>
   Effect.gen(function* () {
     // 1) Bearer token (programmatic access)
@@ -389,163 +419,230 @@ export default {
         maxAge: 0,
       });
 
-      const cookieState = getCookie(request, "oauth_state") ?? "";
-      if (!code || !state || !cookieState || cookieState !== state) {
+      const makeErrorResponse = (status: number, body: unknown, clearCookie = clearStateCookie) => {
         const headers = new Headers({ "Content-Type": "application/json" });
-        headers.append("Set-Cookie", clearStateCookie);
-        return new Response(JSON.stringify({ error: "Invalid state" }, null, 2), {
-          status: 400,
-          headers,
-        });
-      }
-
-      if (!env.GITHUB_CLIENT_ID) {
-        const headers = new Headers({ "Content-Type": "application/json" });
-        headers.append("Set-Cookie", clearStateCookie);
-        return new Response(JSON.stringify({ error: "Missing GITHUB_CLIENT_ID" }, null, 2), {
-          status: 500,
-          headers,
-        });
-      }
-
-      if (!env.GITHUB_CLIENT_SECRET) {
-        const headers = new Headers({ "Content-Type": "application/json" });
-        headers.append("Set-Cookie", clearStateCookie);
-        return new Response(JSON.stringify({ error: "Missing GITHUB_CLIENT_SECRET" }, null, 2), {
-          status: 500,
-          headers,
-        });
-      }
-
-      if (!env.JWT_SECRET) {
-        const headers = new Headers({ "Content-Type": "application/json" });
-        headers.append("Set-Cookie", clearStateCookie);
-        return new Response(JSON.stringify({ error: "Missing JWT_SECRET" }, null, 2), {
-          status: 500,
-          headers,
-        });
-      }
-
-      const jwtSecret = env.JWT_SECRET;
-
-      // Exchange code → access token
-      const tokenResp = await fetch("https://github.com/login/oauth/access_token", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/x-www-form-urlencoded",
-          Accept: "application/json",
-        },
-        body: new URLSearchParams({
-          client_id: env.GITHUB_CLIENT_ID,
-          client_secret: env.GITHUB_CLIENT_SECRET,
-          code,
-        }).toString(),
-      });
-
-      const tokenJson = (await tokenResp.json().catch(() => null)) as {
-        access_token?: string;
-        error?: string;
-        error_description?: string;
-      } | null;
-
-      const accessToken = tokenJson?.access_token;
-      if (!tokenResp.ok || !accessToken) {
-        const headers = new Headers({ "Content-Type": "application/json" });
-        headers.append("Set-Cookie", clearStateCookie);
-        return new Response(
-          JSON.stringify(
-            {
-              error: "Failed to exchange code",
-              details: tokenJson,
-            },
-            null,
-            2,
-          ),
-          { status: 502, headers },
-        );
-      }
-
-      // Fetch user
-      const userResp = await fetch("https://api.github.com/user", {
-        headers: {
-          Authorization: `Bearer ${accessToken}`,
-          Accept: "application/vnd.github+json",
-          "User-Agent": "agon",
-        },
-      });
-
-      const userJson = (await userResp.json().catch(() => null)) as {
-        id: number;
-        login: string;
-        avatar_url: string;
-      } | null;
-
-      if (!userResp.ok || !userJson?.login || userJson.id === undefined) {
-        const headers = new Headers({ "Content-Type": "application/json" });
-        headers.append("Set-Cookie", clearStateCookie);
-        return new Response(
-          JSON.stringify({ error: "Failed to fetch user", details: userJson }, null, 2),
-          { status: 502, headers },
-        );
-      }
-
-      // Optional allowlist
-      const allowRaw = env.AUTH_ALLOWED_USERS?.trim() ?? "";
-      if (allowRaw.length > 0) {
-        const allow = allowRaw
-          .split(",")
-          .map((s) => s.trim().toLowerCase())
-          .filter(Boolean);
-
-        if (!allow.includes(userJson.login.toLowerCase())) {
-          const headers = new Headers({ "Content-Type": "application/json" });
-          headers.append("Set-Cookie", clearStateCookie);
-          return new Response(JSON.stringify({ error: "Forbidden" }, null, 2), {
-            status: 403,
-            headers,
-          });
-        }
-      }
-
-      const now = Math.floor(Date.now() / 1000);
-      const payload = {
-        sub: String(userJson.id),
-        login: userJson.login,
-        avatar_url: userJson.avatar_url,
-        exp: now + 60 * 60 * 24 * 7,
+        headers.append("Set-Cookie", clearCookie);
+        return new Response(JSON.stringify(body, null, 2), { status, headers });
       };
 
-      let jwt: string;
-      try {
-        jwt = await runtime.runPromise(
-          signJwt(payload, jwtSecret).pipe(
-            Effect.mapError((e) =>
-              AuthJwtError.make({
-                operation: e.operation,
-                cause: e.cause,
-              }),
-            ),
+      const program = Effect.gen(function* () {
+        const cookieState = getCookie(request, "oauth_state") ?? "";
+        if (!code || !state || !cookieState || cookieState !== state) {
+          return yield* OAuthStateError.make({});
+        }
+
+        if (!env.GITHUB_CLIENT_ID) {
+          return yield* OAuthMissingConfigError.make({ key: "GITHUB_CLIENT_ID" });
+        }
+
+        if (!env.GITHUB_CLIENT_SECRET) {
+          return yield* OAuthMissingConfigError.make({ key: "GITHUB_CLIENT_SECRET" });
+        }
+
+        if (!env.JWT_SECRET) {
+          return yield* OAuthMissingConfigError.make({ key: "JWT_SECRET" });
+        }
+
+        const jwtSecret = env.JWT_SECRET;
+
+        const accessToken = yield* Effect.tryPromise({
+          try: async () => {
+            const tokenResp = await fetch("https://github.com/login/oauth/access_token", {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/x-www-form-urlencoded",
+                Accept: "application/json",
+              },
+              body: new URLSearchParams({
+                client_id: env.GITHUB_CLIENT_ID!,
+                client_secret: env.GITHUB_CLIENT_SECRET!,
+                code,
+              }).toString(),
+            });
+
+            const tokenJson = (await tokenResp.json().catch(() => null)) as {
+              access_token?: string;
+              error?: string;
+              error_description?: string;
+            } | null;
+
+            const accessToken = tokenJson?.access_token;
+            if (!tokenResp.ok || !accessToken) {
+              throw { details: tokenJson };
+            }
+
+            return accessToken;
+          },
+          catch: (cause) => {
+            const details =
+              typeof cause === "object" && cause !== null && "details" in cause
+                ? (cause as { details?: unknown }).details
+                : null;
+
+            return GitHubTokenExchangeError.make({
+              cause,
+              details,
+            });
+          },
+        }).pipe(
+          Effect.timeout("10 seconds"),
+          Effect.mapError((cause): GitHubTokenExchangeError => {
+            if (
+              typeof cause === "object" &&
+              cause !== null &&
+              "_tag" in cause &&
+              (cause as unknown as Record<string, unknown>)._tag === "GitHubTokenExchangeError"
+            ) {
+              return cause as GitHubTokenExchangeError;
+            }
+            return GitHubTokenExchangeError.make({ cause, details: null });
+          }),
+          Effect.annotateLogs({ github: "token_exchange" }),
+          Effect.withLogSpan("github.token_exchange"),
+        );
+
+        const userJson = yield* Effect.tryPromise({
+          try: async () => {
+            const userResp = await fetch("https://api.github.com/user", {
+              headers: {
+                Authorization: `Bearer ${accessToken}`,
+                Accept: "application/vnd.github+json",
+                "User-Agent": "agon",
+              },
+            });
+
+            const userJson = (await userResp.json().catch(() => null)) as {
+              id: number;
+              login: string;
+              avatar_url: string;
+            } | null;
+
+            if (!userResp.ok || !userJson?.login || userJson.id === undefined) {
+              throw { details: userJson };
+            }
+
+            return userJson;
+          },
+          catch: (cause) => {
+            const details =
+              typeof cause === "object" && cause !== null && "details" in cause
+                ? (cause as { details?: unknown }).details
+                : null;
+
+            return GitHubUserFetchError.make({
+              cause,
+              details,
+            });
+          },
+        }).pipe(
+          Effect.timeout("10 seconds"),
+          Effect.mapError((cause): GitHubUserFetchError => {
+            if (
+              typeof cause === "object" &&
+              cause !== null &&
+              "_tag" in cause &&
+              (cause as unknown as Record<string, unknown>)._tag === "GitHubUserFetchError"
+            ) {
+              return cause as GitHubUserFetchError;
+            }
+            return GitHubUserFetchError.make({ cause, details: null });
+          }),
+          Effect.annotateLogs({ github: "user_fetch" }),
+          Effect.withLogSpan("github.user_fetch"),
+        );
+
+        // Optional allowlist
+        const allowRaw = env.AUTH_ALLOWED_USERS?.trim() ?? "";
+        if (allowRaw.length > 0) {
+          const allow = allowRaw
+            .split(",")
+            .map((s) => s.trim().toLowerCase())
+            .filter(Boolean);
+
+          if (!allow.includes(userJson.login.toLowerCase())) {
+            return yield* OAuthForbiddenError.make({});
+          }
+        }
+
+        const now = Math.floor(Date.now() / 1000);
+        const payload = {
+          sub: String(userJson.id),
+          login: userJson.login,
+          avatar_url: userJson.avatar_url,
+          exp: now + 60 * 60 * 24 * 7,
+        };
+
+        const jwt = yield* signJwt(payload, jwtSecret).pipe(
+          Effect.mapError((e) =>
+            AuthJwtError.make({
+              operation: e.operation,
+              cause: e.cause,
+            }),
           ),
         );
-      } catch (e) {
-        console.error("auth.jwt.sign.failed", e);
-        const headers = new Headers({ "Content-Type": "application/json" });
-        headers.append("Set-Cookie", clearStateCookie);
-        return new Response(JSON.stringify({ error: "Failed to sign session" }, null, 2), {
-          status: 500,
-          headers,
+
+        const sessionCookie = serializeCookie("session", jwt, {
+          httpOnly: true,
+          secure,
+          sameSite: "Lax",
+          path: "/",
+          maxAge: 60 * 60 * 24 * 7,
         });
+
+        return redirect("/", [clearStateCookie, sessionCookie]);
+      }).pipe(
+        Effect.annotateLogs({ requestId, route: "/auth/callback" }),
+        Effect.withLogSpan("auth.callback"),
+        Effect.catchTag("OAuthStateError", () =>
+          Effect.succeed(makeErrorResponse(400, { error: "Invalid state" })),
+        ),
+        Effect.catchTag("OAuthMissingConfigError", (e) =>
+          Effect.succeed(makeErrorResponse(500, { error: `Missing ${e.key}` })),
+        ),
+        Effect.catchTag("GitHubTokenExchangeError", (e) =>
+          Effect.succeed(
+            makeErrorResponse(502, {
+              error: "Failed to exchange code",
+              details: e.details ?? null,
+            }),
+          ),
+        ),
+        Effect.catchTag("GitHubUserFetchError", (e) =>
+          Effect.succeed(
+            makeErrorResponse(502, {
+              error: "Failed to fetch user",
+              details: e.details ?? null,
+            }),
+          ),
+        ),
+        Effect.catchTag("OAuthForbiddenError", () =>
+          Effect.succeed(makeErrorResponse(403, { error: "Forbidden" })),
+        ),
+        Effect.catchTag("AuthJwtError", (e) =>
+          Effect.gen(function* () {
+            yield* Effect.logError("auth.jwt.sign.failed").pipe(
+              Effect.annotateLogs({ operation: e.operation, cause: String(e.cause) }),
+            );
+            return makeErrorResponse(500, { error: "Failed to sign session" });
+          }),
+        ),
+        Effect.catchAllCause((cause) =>
+          Effect.gen(function* () {
+            yield* Effect.logError("auth.callback.unhandled").pipe(
+              Effect.annotateLogs({ cause: String(cause) }),
+            );
+            return makeErrorResponse(500, { error: "Internal error" });
+          }),
+        ),
+      );
+
+      try {
+        return await runtime.runPromise(program);
+      } catch (e) {
+        // Should be unreachable (handled above), but ensure we always clear the state cookie.
+        console.error("auth.callback.runtime.failed", e);
+        return makeErrorResponse(500, { error: "Internal error" });
       }
-
-      const sessionCookie = serializeCookie("session", jwt, {
-        httpOnly: true,
-        secure,
-        sameSite: "Lax",
-        path: "/",
-        maxAge: 60 * 60 * 24 * 7,
-      });
-
-      return redirect("/", [clearStateCookie, sessionCookie]);
     }
 
     if (url.pathname === "/auth/me" && request.method === "GET") {
