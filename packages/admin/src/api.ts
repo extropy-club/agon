@@ -59,6 +59,7 @@ export type Agent = {
 export type Room = {
   readonly id: number;
   readonly status: "active" | "paused" | "audience_slot";
+  readonly title: string;
   readonly topic: string;
   readonly parentChannelId: string;
   readonly threadId: string;

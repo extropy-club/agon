@@ -76,7 +76,7 @@ export default function RoomDetail() {
               "margin-bottom": "2rem",
             }}
           >
-            <h1>Room: {d().room.topic}</h1>
+            <h1>Room: {d().room.title || d().room.topic}</h1>
             <div style={{ display: "flex", gap: "0.5rem" }}>
               <button class="btn" onClick={toggleStatus}>
                 {d().room.status === "active" ? "Pause" : "Resume"}
