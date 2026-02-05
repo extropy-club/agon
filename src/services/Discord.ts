@@ -95,18 +95,26 @@ const parseRateLimitRemaining = (raw: string | null): number | null => {
   return Number.isFinite(n) ? n : null;
 };
 
-const parseRetryAfterMsFromBody = (body: string): number | null => {
-  if (body.trim().length === 0) return null;
-  try {
-    const parsed: unknown = JSON.parse(body);
-    const decoded = Schema.decodeUnknownSync(DiscordRateLimitedBodySchema)(parsed);
+const parseRetryAfterMsFromBody = (body: string): Effect.Effect<number | null, never> =>
+  Effect.gen(function* () {
+    if (body.trim().length === 0) return null;
+
+    const parsed = yield* Effect.try({
+      try: () => JSON.parse(body) as unknown,
+      catch: () => "Invalid JSON",
+    }).pipe(Effect.catchAll(() => Effect.succeed<unknown | null>(null)));
+
+    if (parsed === null) return null;
+
+    const decoded = yield* Schema.decodeUnknown(DiscordRateLimitedBodySchema)(parsed).pipe(
+      Effect.catchAll(() => Effect.succeed<typeof DiscordRateLimitedBodySchema.Type | null>(null)),
+    );
+
+    if (decoded === null) return null;
 
     // Discord documents retry_after in seconds.
     return Math.max(0, Math.ceil(decoded.retry_after * 1000));
-  } catch {
-    return null;
-  }
-};
+  });
 
 const requestJson = <A extends DiscordResponse>(
   endpoint: string,
@@ -132,9 +140,11 @@ const requestJson = <A extends DiscordResponse>(
     const remaining = parseRateLimitRemaining(res.headers.get("X-RateLimit-Remaining"));
     const resetAfterMs = parseSecondsHeaderMs(res.headers.get("X-RateLimit-Reset-After"));
 
+    const retryAfterMsFromBody = yield* parseRetryAfterMsFromBody(body);
+
     const retryAfterMs =
       parseSecondsHeaderMs(res.headers.get("Retry-After")) ??
-      parseRetryAfterMsFromBody(body) ??
+      retryAfterMsFromBody ??
       resetAfterMs ??
       1000;
 

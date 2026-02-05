@@ -3,7 +3,14 @@
 
 import { Effect, Schema } from "effect";
 
-export type JwtPayload = Record<string, unknown> & { exp?: number };
+export const JwtHeaderSchema = Schema.Struct({
+  alg: Schema.String,
+  typ: Schema.optional(Schema.String),
+});
+export type JwtHeader = typeof JwtHeaderSchema.Type;
+
+export const JwtPayloadSchema = Schema.Record({ key: Schema.String, value: Schema.Unknown });
+export type JwtPayload = typeof JwtPayloadSchema.Type & { exp?: number };
 
 export class JwtDecodeError extends Schema.TaggedError<JwtDecodeError>()("JwtDecodeError", {
   reason: Schema.String,
@@ -140,6 +147,17 @@ export const verifyJwt = (
             }),
         }),
       ),
+      Effect.flatMap((u) =>
+        Schema.decodeUnknown(JwtHeaderSchema)(u).pipe(
+          Effect.mapError((cause) =>
+            JwtDecodeError.make({
+              reason: "Invalid JWT header",
+              input: headerPart,
+              cause,
+            }),
+          ),
+        ),
+      ),
     );
 
     const payload = yield* base64UrlDecodeToBytes(payloadPart).pipe(
@@ -155,17 +173,20 @@ export const verifyJwt = (
             }),
         }),
       ),
+      Effect.flatMap((u) =>
+        Schema.decodeUnknown(JwtPayloadSchema)(u).pipe(
+          Effect.mapError((cause) =>
+            JwtDecodeError.make({
+              reason: "Invalid JWT payload",
+              input: payloadPart,
+              cause,
+            }),
+          ),
+        ),
+      ),
     );
 
-    if (
-      typeof header !== "object" ||
-      header === null ||
-      (header as Record<string, unknown>).alg !== "HS256"
-    ) {
-      return null;
-    }
-
-    if (typeof payload !== "object" || payload === null) return null;
+    if (header.alg !== "HS256") return null;
 
     const signingInput = `${headerPart}.${payloadPart}`;
     const signatureBytes = yield* base64UrlDecodeToBytes(signaturePart);
