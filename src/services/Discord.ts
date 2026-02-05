@@ -65,6 +65,15 @@ const DiscordRateLimitedBodySchema = Schema.Struct({
   retry_after: Schema.Number.pipe(Schema.nonNegative(), Schema.finite(), Schema.nonNaN()),
 });
 
+const DiscordUnknownObjectSchema = Schema.Record({
+  key: Schema.String,
+  value: Schema.Unknown,
+}).pipe(
+  Schema.filter((u): u is Record<string, unknown> => !Array.isArray(u), {
+    message: () => "Expected object",
+  }),
+);
+
 const requireBotToken = (
   botToken: Option.Option<Redacted.Redacted>,
 ): Effect.Effect<Redacted.Redacted, MissingDiscordConfig> =>
@@ -99,92 +108,71 @@ const parseRetryAfterMsFromBody = (body: string): number | null => {
   }
 };
 
-type DiscordRequestResult<A> =
-  | {
-      readonly _tag: "Ok";
-      readonly value: A;
-      readonly remaining: number | null;
-      readonly resetAfterMs: number | null;
-    }
-  | { readonly _tag: "RateLimited"; readonly retryAfterMs: number }
-  | { readonly _tag: "Error"; readonly status: number; readonly body: string };
-
-const requestJson = <A>(
+const requestJson = <A extends DiscordResponse>(
   endpoint: string,
   init: RequestInit,
 ): Effect.Effect<A, DiscordApiError | DiscordRateLimited> =>
-  Effect.tryPromise({
-    try: async () => {
-      const res = await fetch(`${DISCORD_API}${endpoint}`, init);
-      const body = await res.text();
-
-      const remaining = parseRateLimitRemaining(res.headers.get("X-RateLimit-Remaining"));
-      const resetAfterMs = parseSecondsHeaderMs(res.headers.get("X-RateLimit-Reset-After"));
-
-      const retryAfterMs =
-        parseSecondsHeaderMs(res.headers.get("Retry-After")) ??
-        parseRetryAfterMsFromBody(body) ??
-        resetAfterMs ??
-        1000;
-
-      if (res.status === 429) {
-        return { _tag: "RateLimited", retryAfterMs } as const;
-      }
-
-      if (!res.ok) {
-        return { _tag: "Error", status: res.status, body } as const;
-      }
-
-      if (body.length === 0) {
-        return { _tag: "Ok", value: undefined as A, remaining, resetAfterMs } as const;
-      }
-
-      try {
-        const parsed = JSON.parse(body) as A;
-        return { _tag: "Ok", value: parsed, remaining, resetAfterMs } as const;
-      } catch {
-        return { _tag: "Error", status: res.status, body } as const;
-      }
-    },
-    catch: (e) => {
-      const rec = typeof e === "object" && e !== null ? (e as Record<string, unknown>) : undefined;
-      const status = rec && "status" in rec ? Number(rec.status) : 0;
-      const body = rec && "body" in rec ? String(rec.body) : String(e);
-      return DiscordApiError.make({ endpoint, status, body });
-    },
-  }).pipe(
-    // Widen error type so downstream combinators can emit rate limit errors.
-    Effect.mapError((e): DiscordApiError | DiscordRateLimited => e),
-    Effect.flatMap(
-      (result: DiscordRequestResult<A>): Effect.Effect<A, DiscordApiError | DiscordRateLimited> => {
-        switch (result._tag) {
-          case "RateLimited":
-            return Effect.fail<DiscordApiError | DiscordRateLimited>(
-              DiscordRateLimited.make({ retryAfterMs: result.retryAfterMs }),
-            );
-
-          case "Error":
-            return Effect.fail<DiscordApiError | DiscordRateLimited>(
-              DiscordApiError.make({ endpoint, status: result.status, body: result.body }),
-            );
-
-          case "Ok": {
-            if (result.remaining === 0 && result.resetAfterMs !== null && result.resetAfterMs > 0) {
-              const waitMs = result.resetAfterMs ?? 0;
-              return Effect.gen(function* () {
-                yield* Effect.logWarning("discord.rate_limit.bucket_exhausted").pipe(
-                  Effect.annotateLogs({ endpoint, retryAfterMs: waitMs }),
-                );
-                yield* Effect.sleep(Duration.millis(waitMs));
-                return result.value;
-              });
-            }
-
-            return Effect.succeed(result.value);
-          }
-        }
+  Effect.gen(function* () {
+    const res = yield* Effect.tryPromise({
+      try: () => fetch(`${DISCORD_API}${endpoint}`, init),
+      catch: (e) => {
+        const rec =
+          typeof e === "object" && e !== null ? (e as Record<string, unknown>) : undefined;
+        const status = rec && "status" in rec ? Number(rec.status) : 0;
+        const body = rec && "body" in rec ? String(rec.body) : String(e);
+        return DiscordApiError.make({ endpoint, status, body });
       },
-    ),
+    });
+
+    const body = yield* Effect.tryPromise({
+      try: () => res.text(),
+      catch: (e) => DiscordApiError.make({ endpoint, status: res.status, body: String(e) }),
+    });
+
+    const remaining = parseRateLimitRemaining(res.headers.get("X-RateLimit-Remaining"));
+    const resetAfterMs = parseSecondsHeaderMs(res.headers.get("X-RateLimit-Reset-After"));
+
+    const retryAfterMs =
+      parseSecondsHeaderMs(res.headers.get("Retry-After")) ??
+      parseRetryAfterMsFromBody(body) ??
+      resetAfterMs ??
+      1000;
+
+    if (res.status === 429) {
+      return yield* DiscordRateLimited.make({ retryAfterMs });
+    }
+
+    if (!res.ok) {
+      return yield* DiscordApiError.make({ endpoint, status: res.status, body });
+    }
+
+    if (body.length === 0) {
+      return yield* DiscordApiError.make({
+        endpoint,
+        status: res.status,
+        body: "Empty response body",
+      });
+    }
+
+    const parsed = yield* Effect.try({
+      try: () => JSON.parse(body) as unknown,
+      catch: () => DiscordApiError.make({ endpoint, status: res.status, body }),
+    });
+
+    const value = (yield* Schema.decodeUnknown(DiscordResponseSchema)(parsed).pipe(
+      Effect.mapError(() => DiscordApiError.make({ endpoint, status: res.status, body })),
+    )) as A;
+
+    if (remaining === 0 && resetAfterMs !== null && resetAfterMs > 0) {
+      const waitMs = resetAfterMs ?? 0;
+      yield* Effect.logWarning("discord.rate_limit.bucket_exhausted").pipe(
+        Effect.annotateLogs({ endpoint, retryAfterMs: waitMs }),
+      );
+      yield* Effect.sleep(Duration.millis(waitMs));
+    }
+
+    return value;
+  }).pipe(
     Effect.tapError((e) => {
       if (e._tag === "DiscordRateLimited") {
         return Effect.logWarning("discord.rate_limited").pipe(
@@ -464,53 +452,62 @@ export class Discord extends Context.Tag("@agon/Discord")<
             }),
           ),
           Effect.flatMap((Authorization) =>
-            Effect.tryPromise({
-              try: async () => {
-                const endpoint = "/users/@me/guilds";
-                const res = await fetch(`${DISCORD_API}${endpoint}`, {
-                  method: "GET",
-                  headers: { Authorization },
-                });
+            Effect.gen(function* () {
+              const endpoint = "/users/@me/guilds";
+              const res = yield* Effect.tryPromise({
+                try: () =>
+                  fetch(`${DISCORD_API}${endpoint}`, {
+                    method: "GET",
+                    headers: { Authorization },
+                  }),
+                catch: (cause) =>
+                  DiscordApiError.make({
+                    endpoint,
+                    status: 0,
+                    body: String(cause),
+                  }),
+              });
 
-                const body = await res.text();
+              const body = yield* Effect.tryPromise({
+                try: () => res.text(),
+                catch: (cause) =>
+                  DiscordApiError.make({
+                    endpoint,
+                    status: res.status,
+                    body: String(cause),
+                  }),
+              });
 
-                if (!res.ok) {
-                  throw { status: res.status, body };
-                }
+              if (!res.ok) {
+                return yield* DiscordApiError.make({ endpoint, status: res.status, body });
+              }
 
-                if (body.trim().length === 0) return [];
+              if (body.trim().length === 0) return [];
 
-                const parsed: unknown = JSON.parse(body);
-                if (!Array.isArray(parsed)) return [];
+              const parsed = yield* Effect.try({
+                try: () => JSON.parse(body) as unknown,
+                catch: () => DiscordApiError.make({ endpoint, status: res.status, body }),
+              });
 
-                return parsed
-                  .map((g): DiscordGuild | null => {
-                    if (typeof g !== "object" || g === null) return null;
-                    const rec = g as Record<string, unknown>;
+              const decoded = yield* Schema.decodeUnknown(Schema.Array(DiscordUnknownObjectSchema))(
+                parsed,
+              ).pipe(
+                Effect.catchAll(() => Effect.succeed<ReadonlyArray<Record<string, unknown>>>([])),
+              );
 
-                    const id = typeof rec.id === "string" ? rec.id : "";
-                    const name = typeof rec.name === "string" ? rec.name : "";
-                    const iconRaw = rec.icon;
-                    const icon =
-                      iconRaw === null ? null : typeof iconRaw === "string" ? iconRaw : null;
-                    const owner = rec.owner === true;
+              return decoded
+                .map((rec): DiscordGuild | null => {
+                  const id = typeof rec.id === "string" ? rec.id : "";
+                  const name = typeof rec.name === "string" ? rec.name : "";
+                  const iconRaw = rec.icon;
+                  const icon =
+                    iconRaw === null ? null : typeof iconRaw === "string" ? iconRaw : null;
+                  const owner = rec.owner === true;
 
-                    if (!id || !name) return null;
-                    return { id, name, icon, owner };
-                  })
-                  .filter((x): x is DiscordGuild => x !== null);
-              },
-              catch: (e) => {
-                const rec =
-                  typeof e === "object" && e !== null ? (e as Record<string, unknown>) : {};
-                const status = "status" in rec ? Number(rec.status) : 0;
-                const body = "body" in rec ? String(rec.body) : String(e);
-                return DiscordApiError.make({
-                  endpoint: "/users/@me/guilds",
-                  status: Number.isFinite(status) ? status : 0,
-                  body,
-                });
-              },
+                  if (!id || !name) return null;
+                  return { id, name, icon, owner };
+                })
+                .filter((x): x is DiscordGuild => x !== null);
             }),
           ),
         );

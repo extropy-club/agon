@@ -8,5 +8,5 @@
     "types": ["node", "@cloudflare/workers-types"],
     "lib": ["ES2022"]
   },
-  "include": ["src/lib/promptBuilder.ts", "test/**/*.ts"]
+  "include": ["src/lib/promptBuilder.ts", "src/lib/llmOverrides.ts", "test/**/*.ts"]
 }

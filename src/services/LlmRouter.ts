@@ -6,6 +6,12 @@ import { Generated as GoogleGenerated, GoogleClient, GoogleLanguageModel } from 
 import { OpenAiClient, OpenAiLanguageModel } from "@effect/ai-openai";
 import * as FetchHttpClient from "@effect/platform/FetchHttpClient";
 import { Context, Effect, Layer, Option, Redacted, Schema } from "effect";
+import {
+  buildAnthropicOverrides,
+  buildGeminiOverrides,
+  buildOpenAiOverrides,
+  buildOpenRouterBody,
+} from "../lib/llmOverrides.js";
 import { Settings } from "./Settings.js";
 
 export const LlmProviderSchema = Schema.Literal("openai", "anthropic", "gemini", "openrouter");
@@ -158,16 +164,7 @@ export class LlmRouter extends Context.Tag("@agon/LlmRouter")<
           }
 
           const body = yield* Effect.try({
-            try: () =>
-              JSON.stringify({
-                model,
-                messages,
-                ...(options?.temperature !== undefined && { temperature: options.temperature }),
-                ...(options?.maxTokens !== undefined && { max_tokens: options.maxTokens }),
-                ...(options?.reasoningEffort !== undefined && {
-                  reasoning_effort: options.reasoningEffort,
-                }),
-              }),
+            try: () => JSON.stringify(buildOpenRouterBody(model, messages, options)),
             catch: (cause) => LlmCallFailed.make({ provider: "openrouter", cause }),
           });
 
@@ -280,7 +277,7 @@ export class LlmRouter extends Context.Tag("@agon/LlmRouter")<
         const normalizeGoogleConfig = (
           u: GoogleLanguageModel.Config.Service | undefined,
         ): GoogleLanguageModel.Config.Service => ({
-          ...(u ?? {}),
+          ...u,
           toolConfig: u?.toolConfig ?? {},
         });
 
@@ -317,67 +314,31 @@ export class LlmRouter extends Context.Tag("@agon/LlmRouter")<
         const withOverrides = (() => {
           switch (args.provider) {
             case "openai": {
-              // OpenAI Responses API uses `reasoning.effort` (not `reasoning_effort`).
-              // Valid values: none | minimal | low | medium | high.
-              const overrides = {
-                ...(args.temperature !== undefined && { temperature: args.temperature }),
-                ...(args.maxTokens !== undefined && { max_output_tokens: args.maxTokens }),
-                ...(args.thinkingLevel !== undefined && {
-                  reasoning: { effort: args.thinkingLevel },
-                }),
-              };
-
               return base.pipe(
                 OpenAiLanguageModel.withConfigOverride(
-                  overrides as OpenAiLanguageModel.Config.Service,
+                  buildOpenAiOverrides(args) as OpenAiLanguageModel.Config.Service,
                 ),
               );
             }
 
             case "anthropic": {
-              // Anthropic: thinkingBudgetTokens (integer ≥1024) for extended thinking.
-              // thinkingLevel is not used — UI only shows budget input for Anthropic.
-              const overrides = {
-                ...(args.temperature !== undefined && { temperature: args.temperature }),
-                ...(args.maxTokens !== undefined && { max_tokens: args.maxTokens }),
-                ...(args.thinkingBudgetTokens !== undefined && {
-                  thinking: {
-                    type: "enabled" as const,
-                    budget_tokens: args.thinkingBudgetTokens,
-                  },
-                }),
-              };
-
               return base.pipe(
                 AnthropicLanguageModel.withConfigOverride(
-                  overrides as AnthropicLanguageModel.Config.Service,
+                  buildAnthropicOverrides(args) as AnthropicLanguageModel.Config.Service,
                 ),
               );
             }
 
             case "gemini": {
-              // Gemini 3: thinkingLevel LOW | HIGH (passed through directly)
-              // Gemini 2.5: thinkingBudget (integer)
-              const generationConfig = {
-                ...(args.temperature !== undefined && { temperature: args.temperature }),
-                ...(args.maxTokens !== undefined && { maxOutputTokens: args.maxTokens }),
-              };
-
-              const thinkingConfig =
-                args.thinkingBudgetTokens !== undefined
-                  ? { thinkingBudget: args.thinkingBudgetTokens }
-                  : args.thinkingLevel !== undefined && isGoogleThinkingLevel(args.thinkingLevel)
-                    ? { thinkingLevel: args.thinkingLevel }
-                    : undefined;
-
+              const geminiOverrides = buildGeminiOverrides(args, isGoogleThinkingLevel);
               const hasOverrides =
-                Object.keys(generationConfig).length > 0 || thinkingConfig !== undefined;
+                geminiOverrides.generationConfig !== undefined ||
+                geminiOverrides.thinkingConfig !== undefined;
               if (!hasOverrides) return base;
 
               const overrides: GoogleLanguageModel.Config.Service = {
                 toolConfig: {},
-                ...(Object.keys(generationConfig).length > 0 && { generationConfig }),
-                ...(thinkingConfig !== undefined && { thinkingConfig }),
+                ...geminiOverrides,
               };
 
               return withGoogleConfigOverride(base, overrides);
