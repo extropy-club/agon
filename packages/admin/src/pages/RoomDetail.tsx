@@ -37,7 +37,7 @@ export default function RoomDetail() {
     const d = detail();
     if (!d) return;
 
-    if (d.room.status === "active") {
+    if (d.room.status !== "paused") {
       await roomsApi.pause(d.room.id);
     } else {
       await roomsApi.resume(d.room.id);
@@ -79,7 +79,7 @@ export default function RoomDetail() {
             <h1>Room: {d().room.title || d().room.topic}</h1>
             <div style={{ display: "flex", gap: "0.5rem" }}>
               <button class="btn" onClick={toggleStatus}>
-                {d().room.status === "active" ? "Pause" : "Resume"}
+                {d().room.status !== "paused" ? "Pause" : "Resume"}
               </button>
               <Show when={d().room.status === "active"}>
                 <button class="btn btn-primary" onClick={kick} disabled={kicking()}>
