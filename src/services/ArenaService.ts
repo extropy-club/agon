@@ -116,7 +116,7 @@ const errorDetail = (e: unknown): Record<string, unknown> => {
   return detail;
 };
 
-const turnFailedNotification = "⚠️ Turn failed after retries. Please use /kick to restart.";
+const turnFailedNotification = "⚠️ Turn failed — skipping to next agent.";
 
 const isRetryableDiscordError = (e: DiscordError): boolean => {
   switch (e._tag) {
@@ -925,17 +925,50 @@ export class ArenaService extends Context.Tag("@agon/ArenaService")<
 
                 yield* notifyFinalFailure("llm", e);
 
-                // Return normally so the queue does not keep retrying forever.
-                // The operator can restart via /kick.
+                // Turn failed, but the turn loop should continue. Skip to the next agent.
+                const participants = yield* dbTry(() =>
+                  db
+                    .select()
+                    .from(roomAgents)
+                    .where(eq(roomAgents.roomId, room.id))
+                    .orderBy(asc(roomAgents.turnOrder))
+                    .all(),
+                );
+
+                const idx = Math.max(
+                  0,
+                  participants.findIndex((p) => p.agentId === agent.id),
+                );
+                const next = participants[(idx + 1) % participants.length];
+
+                yield* dbTry(() =>
+                  db
+                    .update(rooms)
+                    .set({
+                      status: "active",
+                      currentTurnNumber: job.turnNumber,
+                      currentTurnAgentId: next.agentId,
+                    })
+                    .where(eq(rooms.id, room.id))
+                    .run(),
+                );
+
                 yield* turnEvents.write({
                   roomId: room.id,
                   turnNumber: job.turnNumber,
                   phase: "finish",
                   status: "fail",
-                  data: { error: errorLabel(e), source: "llm", detail: errorDetail(e) },
+                  data: {
+                    error: errorLabel(e),
+                    source: "llm",
+                    detail: errorDetail(e),
+                    skippedToNextAgent: true,
+                    nextTurnNumber: job.turnNumber + 1,
+                    nextAgentId: next.agentId,
+                  },
                 });
 
-                return null;
+                return { type: "turn", roomId: room.id, turnNumber: job.turnNumber + 1 } as const;
               }
 
               reply = llmResult.right;
@@ -1083,17 +1116,18 @@ export class ArenaService extends Context.Tag("@agon/ArenaService")<
                   data: { error: errorLabel(e), source: "webhook_post", detail: errorDetail(e) },
                 });
 
-                return null;
+                // Do not return: the reply is already persisted in D1. We'll advance the turn
+                // normally so the loop continues, and Discord will catch up on the next sync.
+              } else {
+                yield* turnEvents.write({
+                  roomId: room.id,
+                  turnNumber: job.turnNumber,
+                  phase: "webhook_post_ok",
+                  status: "ok",
+                });
+
+                yield* Effect.logInfo("discord.webhook.posted");
               }
-
-              yield* turnEvents.write({
-                roomId: room.id,
-                turnNumber: job.turnNumber,
-                phase: "webhook_post_ok",
-                status: "ok",
-              });
-
-              yield* Effect.logInfo("discord.webhook.posted");
             } else if (webhook) {
               yield* Effect.logDebug("discord.webhook.skip_duplicate");
             } else {

@@ -18,6 +18,9 @@ queue = "arena-turns"
 max_batch_size = 1
 max_retries = 3
 
+[triggers]
+crons = ["* * * * *"]
+
 [vars]
 # Non-secret defaults (override in .dev.vars / Wrangler secrets)
 ARENA_MAX_TURNS = "30"

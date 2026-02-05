@@ -1,4 +1,4 @@
-import { asc, desc, eq, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, or, sql } from "drizzle-orm";
 import * as ConfigProvider from "effect/ConfigProvider";
 import { Config, Effect, Layer, Option, Redacted, Schema } from "effect";
 import * as ManagedRuntime from "effect/ManagedRuntime";
@@ -1913,6 +1913,125 @@ export default {
     }
 
     return text(404, "Not Found");
+  },
+
+  async scheduled(_event: ScheduledEvent, env: Env, _ctx: ExecutionContext): Promise<void> {
+    const runtime = makeRuntime(env);
+
+    try {
+      const program = Effect.gen(function* () {
+        const { db } = yield* Db;
+
+        const candidateRooms = yield* Effect.tryPromise({
+          try: () =>
+            db
+              .select()
+              .from(rooms)
+              .where(inArray(rooms.status, ["active", "audience_slot"]))
+              .all(),
+          catch: (cause) => RoomDbError.make({ cause }),
+        });
+
+        yield* Effect.logDebug("cron.stall_watchdog.tick").pipe(
+          Effect.annotateLogs({ roomCount: candidateRooms.length }),
+        );
+
+        for (const room of candidateRooms) {
+          const roomProgram = Effect.gen(function* () {
+            const last = yield* Effect.tryPromise({
+              try: () =>
+                db
+                  .select({
+                    lastMessageMs: sql<number | null>`max(${messages.createdAtMs})`.as(
+                      "lastMessageMs",
+                    ),
+                  })
+                  .from(messages)
+                  .where(eq(messages.roomId, room.id))
+                  .get(),
+              catch: (cause) => RoomDbError.make({ cause }),
+            });
+
+            const lastMessageMs =
+              last?.lastMessageMs === null || last?.lastMessageMs === undefined
+                ? 0
+                : Number(last.lastMessageMs);
+
+            const thresholdSeconds =
+              room.status === "active" ? 120 : room.audienceSlotDurationSeconds + 60;
+
+            const now = Date.now();
+            if (now - lastMessageMs <= thresholdSeconds * 1000) return;
+
+            const nextTurnNumber = room.currentTurnNumber + 1;
+            if (room.lastEnqueuedTurnNumber >= nextTurnNumber) return;
+
+            if (room.status === "audience_slot") {
+              yield* Effect.tryPromise({
+                try: () =>
+                  db
+                    .update(rooms)
+                    .set({ status: "active" })
+                    .where(and(eq(rooms.id, room.id), eq(rooms.status, "audience_slot")))
+                    .run(),
+                catch: (cause) => RoomDbError.make({ cause }),
+              });
+            }
+
+            const job: TurnJob = { type: "turn", roomId: room.id, turnNumber: nextTurnNumber };
+
+            yield* Effect.tryPromise({
+              try: () => env.ARENA_QUEUE.send(job),
+              catch: (cause) => RoomDbError.make({ cause }),
+            });
+
+            yield* Effect.tryPromise({
+              try: () =>
+                db
+                  .update(rooms)
+                  .set({
+                    lastEnqueuedTurnNumber: sql`max(${rooms.lastEnqueuedTurnNumber}, ${nextTurnNumber})`,
+                  })
+                  .where(
+                    and(
+                      eq(rooms.id, room.id),
+                      or(eq(rooms.status, "active"), eq(rooms.status, "audience_slot")),
+                    ),
+                  )
+                  .run(),
+              catch: (cause) => RoomDbError.make({ cause }),
+            });
+
+            yield* Effect.logInfo("cron.stall_watchdog.recovered").pipe(
+              Effect.annotateLogs({
+                roomId: room.id,
+                fromStatus: room.status,
+                currentTurnNumber: room.currentTurnNumber,
+                nextTurnNumber,
+                lastMessageMs,
+                thresholdSeconds,
+              }),
+            );
+          }).pipe(
+            Effect.catchAll((e) =>
+              Effect.logWarning("cron.stall_watchdog.room_failed").pipe(
+                Effect.annotateLogs({
+                  roomId: room.id,
+                  error: e instanceof Error ? (e.stack ?? e.message) : String(e),
+                }),
+                Effect.asVoid,
+              ),
+            ),
+          );
+
+          yield* roomProgram;
+        }
+      }).pipe(Effect.withLogSpan("cron.stall_watchdog"));
+
+      await runtime.runPromise(program);
+    } catch (e) {
+      console.error("scheduled.stall_watchdog.failed", e);
+    }
   },
 
   async queue(batch: MessageBatch<RoomTurnJob>, env: Env, _ctx: ExecutionContext): Promise<void> {
