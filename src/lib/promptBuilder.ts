@@ -54,8 +54,16 @@ You are posting in a Discord thread.
 - No HTML. No LaTeX. No embeds.
 </format>`;
 
+const buildIdentity = (agent: PromptBuilderAgent): string => `<identity>
+Your name is ${agent.name}. Your id is ${agent.id}.
+Messages are tagged with an author attribute — use it to know who is speaking.
+When someone addresses you by name, respond directly to them.
+When the audience (audience="true") asks you a question or challenges your point, engage with it.
+You are one of several participants in a structured debate.
+</identity>`;
+
 const buildSystemPrompt = (agent: PromptBuilderAgent): string =>
-  `You are ${agent.name}.\n\n${agent.systemPrompt}\n\n${houseRules}\n\n${discordFormat}`;
+  `${buildIdentity(agent)}\n\n${agent.systemPrompt}\n\n${houseRules}\n\n${discordFormat}`;
 
 const buildModeratorContent = (room: PromptBuilderRoom): string =>
   `Room title: ${room.title}\nTopic: ${room.topic}`;
