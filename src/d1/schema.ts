@@ -70,6 +70,16 @@ export const messages = sqliteTable("messages", {
    */
   authorName: text("author_name"),
   content: text("content").notNull(),
+  /**
+   * Reasoning / thinking text, when the provider exposes it.
+   *
+   * NOTE: stored separately from `content` so we can keep message content clean.
+   */
+  thinkingText: text("thinking_text"),
+  /** Prompt tokens (when available). */
+  inputTokens: integer("input_tokens"),
+  /** Completion tokens (when available). */
+  outputTokens: integer("output_tokens"),
   // store unix epoch millis
   createdAtMs: integer("created_at_ms").notNull(),
 });

@@ -12,7 +12,7 @@ import {
   MissingDiscordConfig,
 } from "./Discord.js";
 import { DiscordWebhookPostFailed, DiscordWebhookPoster } from "./DiscordWebhook.js";
-import { type LlmRouterError, LlmRouter } from "./LlmRouter.js";
+import { type LlmResult, type LlmRouterError, LlmRouter } from "./LlmRouter.js";
 import { TurnEventService } from "./TurnEventService.js";
 
 export type TurnJob = {
@@ -897,7 +897,13 @@ export class ArenaService extends Context.Tag("@agon/ArenaService")<
 
             const existingReply = yield* dbTry(() =>
               db
-                .select({ content: messages.content, createdAtMs: messages.createdAtMs })
+                .select({
+                  content: messages.content,
+                  createdAtMs: messages.createdAtMs,
+                  thinkingText: messages.thinkingText,
+                  inputTokens: messages.inputTokens,
+                  outputTokens: messages.outputTokens,
+                })
                 .from(messages)
                 .where(eq(messages.discordMessageId, discordMessageId))
                 .get(),
@@ -911,7 +917,11 @@ export class ArenaService extends Context.Tag("@agon/ArenaService")<
               reply = stripMessageXml(existingReply.content);
               replyCreatedAtMs = existingReply.createdAtMs;
               yield* Effect.logDebug("llm.generate.skip_existing").pipe(
-                Effect.annotateLogs({ replyChars: reply.length }),
+                Effect.annotateLogs({
+                  replyChars: reply.length,
+                  inputTokens: existingReply.inputTokens ?? undefined,
+                  outputTokens: existingReply.outputTokens ?? undefined,
+                }),
               );
             } else {
               // Post a "thinking" indicator; guaranteed cleanup via acquireRelease finalizer.
@@ -1015,14 +1025,20 @@ export class ArenaService extends Context.Tag("@agon/ArenaService")<
                 return { type: "turn", roomId: room.id, turnNumber: job.turnNumber + 1 } as const;
               }
 
-              reply = stripMessageXml(llmResult.right);
+              const ok: LlmResult = llmResult.right;
+
+              reply = stripMessageXml(ok.text);
 
               yield* turnEvents.write({
                 roomId: room.id,
                 turnNumber: job.turnNumber,
                 phase: "llm_ok",
                 status: "ok",
-                data: { replyChars: reply.length },
+                data: {
+                  replyChars: reply.length,
+                  inputTokens: ok.inputTokens,
+                  outputTokens: ok.outputTokens,
+                },
               });
 
               yield* Effect.logInfo("llm.generate.ok").pipe(
@@ -1030,6 +1046,8 @@ export class ArenaService extends Context.Tag("@agon/ArenaService")<
                   llmProvider: agent.llmProvider,
                   llmModel: agent.llmModel,
                   replyChars: reply.length,
+                  inputTokens: ok.inputTokens ?? undefined,
+                  outputTokens: ok.outputTokens ?? undefined,
                 }),
               );
 
@@ -1045,6 +1063,9 @@ export class ArenaService extends Context.Tag("@agon/ArenaService")<
                     authorType: "agent",
                     authorAgentId: agent.id,
                     content: reply,
+                    thinkingText: ok.reasoningText,
+                    inputTokens: ok.inputTokens,
+                    outputTokens: ok.outputTokens,
                     createdAtMs: now,
                   })
                   .onConflictDoNothing({ target: messages.discordMessageId })

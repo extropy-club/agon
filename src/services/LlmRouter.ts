@@ -34,6 +34,13 @@ export class LlmContentError extends Schema.TaggedError<LlmContentError>()("LlmC
 
 export type LlmRouterError = MissingLlmApiKey | LlmCallFailed | LlmContentError;
 
+export type LlmResult = {
+  readonly text: string;
+  readonly reasoningText: string | null;
+  readonly inputTokens: number | null;
+  readonly outputTokens: number | null;
+};
+
 export class LlmRouter extends Context.Tag("@agon/LlmRouter")<
   LlmRouter,
   {
@@ -45,7 +52,7 @@ export class LlmRouter extends Context.Tag("@agon/LlmRouter")<
       readonly maxTokens?: number;
       readonly thinkingLevel?: string;
       readonly thinkingBudgetTokens?: number;
-    }) => Effect.Effect<string, LlmRouterError>;
+    }) => Effect.Effect<LlmResult, LlmRouterError>;
   }
 >() {
   static readonly layer = Layer.effect(
@@ -194,7 +201,10 @@ export class LlmRouter extends Context.Tag("@agon/LlmRouter")<
             try: () => res.json(),
             catch: (cause) => LlmCallFailed.make({ provider: "openrouter", cause }),
           })) as {
-            choices?: Array<{ message?: { content?: string } }>;
+            choices?: Array<{
+              message?: { content?: string; reasoning?: string; reasoning_content?: string };
+            }>;
+            usage?: { prompt_tokens?: number; completion_tokens?: number };
           };
 
           const content = data.choices?.[0]?.message?.content;
@@ -202,7 +212,20 @@ export class LlmRouter extends Context.Tag("@agon/LlmRouter")<
             return yield* LlmContentError.make({ provider: "openrouter", model });
           }
 
-          return content.trim();
+          const reasoningRaw =
+            data.choices?.[0]?.message?.reasoning ?? data.choices?.[0]?.message?.reasoning_content;
+
+          const inputTokens =
+            typeof data.usage?.prompt_tokens === "number" ? data.usage.prompt_tokens : null;
+          const outputTokens =
+            typeof data.usage?.completion_tokens === "number" ? data.usage.completion_tokens : null;
+
+          return {
+            text: content.trim(),
+            reasoningText: typeof reasoningRaw === "string" ? reasoningRaw.trim() : null,
+            inputTokens,
+            outputTokens,
+          };
         });
 
       const makeLanguageModelLayer = (
@@ -351,7 +374,12 @@ export class LlmRouter extends Context.Tag("@agon/LlmRouter")<
 
         return yield* withOverrides.pipe(
           Effect.provide(modelLayer),
-          Effect.map((r) => r.text.trim()),
+          Effect.map((r) => ({
+            text: r.text.trim(),
+            reasoningText: typeof r.reasoningText === "string" ? r.reasoningText.trim() : null,
+            inputTokens: typeof r.usage?.inputTokens === "number" ? r.usage.inputTokens : null,
+            outputTokens: typeof r.usage?.outputTokens === "number" ? r.usage.outputTokens : null,
+          })),
           Effect.timeout("10 minutes"),
           Effect.mapError((cause) => LlmCallFailed.make({ provider: args.provider, cause })),
         );
