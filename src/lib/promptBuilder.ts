@@ -70,6 +70,16 @@ const buildModeratorContent = (room: PromptBuilderRoom): string =>
 
 const textPart = (text: string): Prompt.TextPartEncoded => ({ type: "text", text });
 
+const messageToXml = (m: PromptBuilderMessage): string =>
+  wrapXmlMessage({
+    authorName: m.authorName,
+    isAudience: m.authorType === "audience",
+    content: m.content,
+  });
+
+const isOwnMessage = (m: PromptBuilderMessage, agent: PromptBuilderAgent): boolean =>
+  m.authorType === "agent" && m.authorName === agent.name;
+
 export const buildPrompt = (
   room: PromptBuilderRoom,
   agent: PromptBuilderAgent,
@@ -97,46 +107,37 @@ export const buildPrompt = (
     });
   }
 
+  // Build a flat list of {role, xml} entries, then merge consecutive same-role
+  // entries to guarantee strict user/assistant alternation.
+  const entries: Array<{ role: "user" | "assistant"; xml: string }> = [];
+  for (const m of messages) {
+    entries.push({
+      role: isOwnMessage(m, agent) ? "assistant" : "user",
+      xml: messageToXml(m),
+    });
+  }
+
+  // Merge consecutive same-role entries
   let i = 0;
-  while (i < messages.length) {
-    const m = messages[i];
-    const isAudience = m.authorType === "audience";
-
-    if (!isAudience) {
-      prompt.push({
-        role: "user",
-        content: [
-          textPart(
-            wrapXmlMessage({
-              authorName: m.authorName,
-              isAudience: false,
-              content: m.content,
-            }),
-          ),
-        ],
-      });
-      i += 1;
-      continue;
-    }
-
-    // batch consecutive audience messages into one user message with multiple parts
+  while (i < entries.length) {
+    const role = entries[i].role;
     const parts: Array<Prompt.TextPartEncoded> = [];
 
-    while (i < messages.length && messages[i].authorType === "audience") {
-      const a = messages[i];
-      parts.push(
-        textPart(
-          wrapXmlMessage({
-            authorName: a.authorName,
-            isAudience: true,
-            content: a.content,
-          }),
-        ),
-      );
-      i += 1;
+    while (i < entries.length && entries[i].role === role) {
+      parts.push(textPart(entries[i].xml));
+      i++;
     }
 
-    prompt.push({ role: "user", content: parts });
+    if (role === "assistant") {
+      // Assistant content is string | Array<TextPart | ...>
+      // Use string for single, parts array for multiple
+      prompt.push({
+        role: "assistant",
+        content: parts.length === 1 ? parts[0].text : parts.map((p) => p),
+      });
+    } else {
+      prompt.push({ role: "user", content: parts });
+    }
   }
 
   return prompt;

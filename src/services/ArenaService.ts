@@ -771,6 +771,7 @@ export class ArenaService extends Context.Tag("@agon/ArenaService")<
                       threadId: room.threadId,
                       authorType,
                       authorAgentId: authorAgentId ?? null,
+                      authorName: m.author.username,
                       content: m.content,
                       createdAtMs,
                     })
@@ -781,6 +782,7 @@ export class ArenaService extends Context.Tag("@agon/ArenaService")<
                         threadId: room.threadId,
                         authorType,
                         authorAgentId: authorAgentId ?? null,
+                        authorName: m.author.username,
                         content: m.content,
                         createdAtMs,
                       },
