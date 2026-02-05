@@ -203,10 +203,17 @@ const makeRuntime = (env: Env) => {
   return ManagedRuntime.make(appLayer);
 };
 
-const parseJson = <A>(request: Request): Effect.Effect<A, unknown> =>
+export class RequestJsonParseError extends Schema.TaggedError<RequestJsonParseError>()(
+  "RequestJsonParseError",
+  {
+    cause: Schema.Defect,
+  },
+) {}
+
+const parseJson = <A>(request: Request): Effect.Effect<A, RequestJsonParseError> =>
   Effect.tryPromise({
     try: () => request.json() as Promise<A>,
-    catch: (e) => e,
+    catch: (cause) => RequestJsonParseError.make({ cause }),
   });
 
 export class AdminUnauthorized extends Schema.TaggedError<AdminUnauthorized>()(
@@ -266,7 +273,7 @@ const requireAdmin = (request: Request) =>
       // When it's NOT configured, fall through to cookie/session auth below.
       if (Option.isSome(opt)) {
         if (Redacted.value(opt.value) !== match[1]) {
-          return yield* Effect.fail(AdminUnauthorized.make({}));
+          return yield* AdminUnauthorized.make({});
         }
         return;
       }
@@ -280,7 +287,7 @@ const requireAdmin = (request: Request) =>
       );
 
       if (Option.isNone(jwtOpt)) {
-        return yield* Effect.fail(AdminMissingConfig.make({ key: "JWT_SECRET" }));
+        return yield* AdminMissingConfig.make({ key: "JWT_SECRET" });
       }
 
       const payload = (yield* verifyJwt(session, Redacted.value(jwtOpt.value)).pipe(
@@ -288,7 +295,7 @@ const requireAdmin = (request: Request) =>
       )) as (Record<string, unknown> & { login?: string }) | null;
 
       if (!payload) {
-        return yield* Effect.fail(AdminUnauthorized.make({}));
+        return yield* AdminUnauthorized.make({});
       }
 
       const allowOpt = yield* Config.option(Config.string("AUTH_ALLOWED_USERS")).pipe(
@@ -299,7 +306,7 @@ const requireAdmin = (request: Request) =>
         const allowed = allowOpt.value.split(",").map((s) => s.trim().toLowerCase());
         const login = payload.login;
         if (typeof login !== "string" || !allowed.includes(login.toLowerCase())) {
-          return yield* Effect.fail(AdminUnauthorized.make({}));
+          return yield* AdminUnauthorized.make({});
         }
       }
 
@@ -307,7 +314,7 @@ const requireAdmin = (request: Request) =>
     }
 
     // 3) Nothing
-    return yield* Effect.fail(AdminUnauthorized.make({}));
+    return yield* AdminUnauthorized.make({});
   });
 
 const decodeBody = <A>(request: Request, schema: Schema.Schema<A>) =>
@@ -765,9 +772,7 @@ export default {
 
             const value = body.value.trim();
             if (value.length === 0) {
-              return yield* Effect.fail(
-                AdminBadRequest.make({ message: "Value must be non-empty" }),
-              );
+              return yield* AdminBadRequest.make({ message: "Value must be non-empty" });
             }
 
             yield* settingsService
@@ -855,11 +860,9 @@ export default {
             if (temperatureOrNull !== null) {
               const t = Number.parseFloat(temperatureOrNull);
               if (!Number.isFinite(t) || t < 0.0 || t > 2.0) {
-                return yield* Effect.fail(
-                  AdminBadRequest.make({
-                    message: "temperature must be a number between 0.0 and 2.0",
-                  }),
-                );
+                return yield* AdminBadRequest.make({
+                  message: "temperature must be a number between 0.0 and 2.0",
+                });
               }
             }
 
@@ -872,31 +875,27 @@ export default {
 
             if (body.maxTokens != null) {
               const err = validatePositiveInt(body.maxTokens, "maxTokens");
-              if (err) return yield* Effect.fail(err);
+              if (err) return yield* err;
             }
 
             if (body.thinkingBudgetTokens != null) {
               const err = validatePositiveInt(body.thinkingBudgetTokens, "thinkingBudgetTokens");
-              if (err) return yield* Effect.fail(err);
+              if (err) return yield* err;
             }
 
             if (
               body.thinkingLevel != null &&
               !(provider === "openai" || provider === "anthropic")
             ) {
-              return yield* Effect.fail(
-                AdminBadRequest.make({
-                  message: "thinkingLevel is only supported for OpenAI and Anthropic",
-                }),
-              );
+              return yield* AdminBadRequest.make({
+                message: "thinkingLevel is only supported for OpenAI and Anthropic",
+              });
             }
 
             if (body.thinkingBudgetTokens != null && provider !== "anthropic") {
-              return yield* Effect.fail(
-                AdminBadRequest.make({
-                  message: "thinkingBudgetTokens is only supported for Anthropic",
-                }),
-              );
+              return yield* AdminBadRequest.make({
+                message: "thinkingBudgetTokens is only supported for Anthropic",
+              });
             }
 
             yield* dbTry(() =>
@@ -949,7 +948,7 @@ export default {
               db.select().from(agents).where(eq(agents.id, agentId)).get(),
             );
             if (!agent) {
-              return yield* Effect.fail(AdminNotFound.make({ resource: "agent", id: agentId }));
+              return yield* AdminNotFound.make({ resource: "agent", id: agentId });
             }
             return json(200, { agent });
           }
@@ -961,7 +960,7 @@ export default {
               db.select().from(agents).where(eq(agents.id, agentId)).get(),
             );
             if (!existing) {
-              return yield* Effect.fail(AdminNotFound.make({ resource: "agent", id: agentId }));
+              return yield* AdminNotFound.make({ resource: "agent", id: agentId });
             }
 
             const provider = body.llmProvider ?? existing.llmProvider;
@@ -977,11 +976,9 @@ export default {
             if (temperatureOrNull !== undefined && temperatureOrNull !== null) {
               const t = Number.parseFloat(temperatureOrNull);
               if (!Number.isFinite(t) || t < 0.0 || t > 2.0) {
-                return yield* Effect.fail(
-                  AdminBadRequest.make({
-                    message: "temperature must be a number between 0.0 and 2.0",
-                  }),
-                );
+                return yield* AdminBadRequest.make({
+                  message: "temperature must be a number between 0.0 and 2.0",
+                });
               }
             }
 
@@ -994,31 +991,27 @@ export default {
 
             if (body.maxTokens != null) {
               const err = validatePositiveInt(body.maxTokens, "maxTokens");
-              if (err) return yield* Effect.fail(err);
+              if (err) return yield* err;
             }
 
             if (body.thinkingBudgetTokens != null) {
               const err = validatePositiveInt(body.thinkingBudgetTokens, "thinkingBudgetTokens");
-              if (err) return yield* Effect.fail(err);
+              if (err) return yield* err;
             }
 
             if (
               body.thinkingLevel != null &&
               !(provider === "openai" || provider === "anthropic")
             ) {
-              return yield* Effect.fail(
-                AdminBadRequest.make({
-                  message: "thinkingLevel is only supported for OpenAI and Anthropic",
-                }),
-              );
+              return yield* AdminBadRequest.make({
+                message: "thinkingLevel is only supported for OpenAI and Anthropic",
+              });
             }
 
             if (body.thinkingBudgetTokens != null && provider !== "anthropic") {
-              return yield* Effect.fail(
-                AdminBadRequest.make({
-                  message: "thinkingBudgetTokens is only supported for Anthropic",
-                }),
-              );
+              return yield* AdminBadRequest.make({
+                message: "thinkingBudgetTokens is only supported for Anthropic",
+              });
             }
 
             yield* dbTry(() =>
@@ -1188,9 +1181,7 @@ export default {
               db.select().from(rooms).where(eq(rooms.id, roomId)).get(),
             );
             if (!room) {
-              return yield* Effect.fail(
-                AdminNotFound.make({ resource: "room", id: String(roomId) }),
-              );
+              return yield* AdminNotFound.make({ resource: "room", id: String(roomId) });
             }
 
             const participants = yield* dbTry(() =>
@@ -1257,9 +1248,7 @@ export default {
               db.select().from(rooms).where(eq(rooms.id, roomId)).get(),
             );
             if (!room) {
-              return yield* Effect.fail(
-                AdminNotFound.make({ resource: "room", id: String(roomId) }),
-              );
+              return yield* AdminNotFound.make({ resource: "room", id: String(roomId) });
             }
 
             const threadId = room.threadId;
@@ -1285,9 +1274,7 @@ export default {
               db.select().from(rooms).where(eq(rooms.id, roomId)).get(),
             );
             if (!room) {
-              return yield* Effect.fail(
-                AdminNotFound.make({ resource: "room", id: String(roomId) }),
-              );
+              return yield* AdminNotFound.make({ resource: "room", id: String(roomId) });
             }
 
             yield* dbTry(() =>
@@ -1301,9 +1288,7 @@ export default {
               db.select().from(rooms).where(eq(rooms.id, roomId)).get(),
             );
             if (!room) {
-              return yield* Effect.fail(
-                AdminNotFound.make({ resource: "room", id: String(roomId) }),
-              );
+              return yield* AdminNotFound.make({ resource: "room", id: String(roomId) });
             }
 
             yield* dbTry(() =>
@@ -1345,9 +1330,7 @@ export default {
               db.select().from(rooms).where(eq(rooms.id, roomId)).get(),
             );
             if (!room) {
-              return yield* Effect.fail(
-                AdminNotFound.make({ resource: "room", id: String(roomId) }),
-              );
+              return yield* AdminNotFound.make({ resource: "room", id: String(roomId) });
             }
 
             if (room.status !== "active") {
@@ -1792,8 +1775,8 @@ export default {
               .from(discordChannels)
               .where(eq(discordChannels.channelId, parentChannelId))
               .get(),
-          catch: (e) => e,
-        }).pipe(Effect.mapError((cause) => DevDbError.make({ cause })));
+          catch: (cause) => DevDbError.make({ cause }),
+        });
 
         const webhook = existingWebhook
           ? { id: existingWebhook.webhookId, token: existingWebhook.webhookToken }
@@ -1814,8 +1797,8 @@ export default {
                 set: { webhookId: webhook.id, webhookToken: webhook.token },
               })
               .run(),
-          catch: (e) => e,
-        }).pipe(Effect.mapError((cause) => DevDbError.make({ cause })));
+          catch: (cause) => DevDbError.make({ cause }),
+        });
 
         const threadId = yield* discord.createPublicThread(parentChannelId, {
           name,
@@ -1860,7 +1843,7 @@ export default {
         );
         const roomId = payload.roomId ?? payload.arenaId;
         if (roomId === undefined) {
-          return yield* Effect.fail(DevBadRequest.make({ message: "Missing roomId" }));
+          return yield* DevBadRequest.make({ message: "Missing roomId" });
         }
         yield* arena.stopArena(roomId);
         return { ok: true, roomId };
@@ -1939,8 +1922,8 @@ export default {
 
                 const room = yield* Effect.tryPromise({
                   try: () => db.select().from(rooms).where(eq(rooms.id, job.roomId)).get(),
-                  catch: (e) => e,
-                }).pipe(Effect.mapError((cause) => RoomDbError.make({ cause })));
+                  catch: (cause) => RoomDbError.make({ cause }),
+                });
 
                 if (!room) return null;
 
@@ -1967,7 +1950,7 @@ export default {
                       .from(agents)
                       .where(eq(agents.id, room.currentTurnAgentId))
                       .get(),
-                  catch: (e) => e,
+                  catch: (cause) => RoomDbError.make({ cause }),
                 }).pipe(
                   Effect.map((row) => row?.name ?? "Unknown"),
                   Effect.catchAll((e) =>
@@ -2017,7 +2000,7 @@ export default {
                       })
                       .onConflictDoNothing({ target: messages.discordMessageId })
                       .run(),
-                  catch: (e) => e,
+                  catch: (cause) => RoomDbError.make({ cause }),
                 }).pipe(
                   Effect.catchAll((e) =>
                     Effect.logWarning("db.notification_insert.failed").pipe(
@@ -2046,8 +2029,8 @@ export default {
                 yield* Effect.tryPromise({
                   try: () =>
                     db.update(rooms).set({ status: "active" }).where(eq(rooms.id, room.id)).run(),
-                  catch: (e) => e,
-                }).pipe(Effect.mapError((cause) => RoomDbError.make({ cause })));
+                  catch: (cause) => RoomDbError.make({ cause }),
+                });
 
                 yield* turnEvents.write({
                   roomId: room.id,
@@ -2096,8 +2079,16 @@ export default {
                     })
                     .where(eq(rooms.id, next.roomId))
                     .run(),
-                catch: () => null,
-              });
+                catch: (cause) => RoomDbError.make({ cause }),
+              }).pipe(
+                Effect.asVoid,
+                Effect.catchAll((e) =>
+                  Effect.logWarning("db.mark_enqueued.failed").pipe(
+                    Effect.annotateLogs({ error: String(e) }),
+                    Effect.asVoid,
+                  ),
+                ),
+              );
             }).pipe(Effect.annotateLogs(annotations), Effect.withLogSpan("queue.mark_enqueued"));
 
             await runtime.runPromise(markEnqueued);
