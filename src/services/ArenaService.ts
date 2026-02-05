@@ -762,6 +762,8 @@ export class ArenaService extends Context.Tag("@agon/ArenaService")<
                 const authorAgentId =
                   authorType === "agent" ? agentNameToId.get(m.author.username) : undefined;
 
+                const authorName = m.author.global_name ?? m.author.username;
+
                 yield* dbTry(() =>
                   db
                     .insert(messages)
@@ -771,7 +773,7 @@ export class ArenaService extends Context.Tag("@agon/ArenaService")<
                       threadId: room.threadId,
                       authorType,
                       authorAgentId: authorAgentId ?? null,
-                      authorName: m.author.username,
+                      authorName,
                       content: m.content,
                       createdAtMs,
                     })
@@ -782,7 +784,7 @@ export class ArenaService extends Context.Tag("@agon/ArenaService")<
                         threadId: room.threadId,
                         authorType,
                         authorAgentId: authorAgentId ?? null,
-                        authorName: m.author.username,
+                        authorName,
                         content: m.content,
                         createdAtMs,
                       },

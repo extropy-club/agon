@@ -48,7 +48,12 @@ export type DiscordMessage = {
   /** ISO timestamp or null when the message was never edited. */
   readonly edited_timestamp?: string | null;
 
-  readonly author: { readonly id: string; readonly username: string; readonly bot?: boolean };
+  readonly author: {
+    readonly id: string;
+    readonly username: string;
+    readonly global_name?: string | null;
+    readonly bot?: boolean;
+  };
 };
 
 export type DiscordAutoArchiveDurationMinutes = 60 | 1440 | 4320 | 10080;
