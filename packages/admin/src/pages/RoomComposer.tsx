@@ -16,6 +16,7 @@ export default function RoomComposer() {
   const [audienceSlotDurationSeconds, setAudienceSlotDurationSeconds] = createSignal("30");
   const [audienceTokenLimit, setAudienceTokenLimit] = createSignal("4096");
   const [roomTokenLimit, setRoomTokenLimit] = createSignal("32000");
+  const [maxTurns, setMaxTurns] = createSignal("30");
 
   const toggleAgent = (id: string) => {
     if (selectedAgentIds().includes(id)) {
@@ -37,6 +38,7 @@ export default function RoomComposer() {
       audienceSlotDurationSeconds: Number(audienceSlotDurationSeconds()),
       audienceTokenLimit: Number(audienceTokenLimit()),
       roomTokenLimit: Number(roomTokenLimit()),
+      maxTurns: Number(maxTurns()),
       ...(threadId().trim().length > 0 ? { threadId: threadId().trim() } : {}),
       ...(threadId().trim().length === 0 && title().trim().length > 0
         ? { threadName: title().trim() }
@@ -169,6 +171,22 @@ export default function RoomComposer() {
             style={{ "font-size": "0.875rem", color: "var(--text-muted)", "margin-top": "0.5rem" }}
           >
             Max tokens for room context.
+          </div>
+        </div>
+
+        <div class="form-group">
+          <label>Max Turns</label>
+          <input
+            type="number"
+            class="form-control"
+            value={maxTurns()}
+            onInput={(e) => setMaxTurns(e.currentTarget.value)}
+            min="1"
+          />
+          <div
+            style={{ "font-size": "0.875rem", color: "var(--text-muted)", "margin-top": "0.5rem" }}
+          >
+            Room auto-pauses after this many turns.
           </div>
         </div>
 

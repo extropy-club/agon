@@ -732,6 +732,7 @@ export default {
         audienceSlotDurationSeconds: Schema.optional(NonNegativeIntSchema),
         audienceTokenLimit: Schema.optional(NonNegativeIntSchema),
         roomTokenLimit: Schema.optional(NonNegativeIntSchema),
+        maxTurns: Schema.optional(NonNegativeIntSchema),
         autoArchiveDurationMinutes: Schema.optional(NonNegativeIntSchema),
         agentIds: Schema.Array(Schema.NonEmptyString),
         // Provide threadId to bind to an existing thread. If omitted, we will create a thread.
@@ -1244,6 +1245,7 @@ export default {
                 ? { audienceTokenLimit: body.audienceTokenLimit }
                 : {}),
               ...(body.roomTokenLimit !== undefined ? { roomTokenLimit: body.roomTokenLimit } : {}),
+              ...(body.maxTurns !== undefined ? { maxTurns: body.maxTurns } : {}),
             });
 
             yield* Effect.tryPromise({

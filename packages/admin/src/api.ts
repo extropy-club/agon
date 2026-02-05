@@ -67,6 +67,7 @@ export type Room = {
   readonly currentTurnAgentId: string;
   readonly currentTurnNumber: number;
   readonly lastEnqueuedTurnNumber: number;
+  readonly maxTurns: number;
 };
 
 export type Message = {

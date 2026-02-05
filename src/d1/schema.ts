@@ -32,6 +32,7 @@ export const rooms = sqliteTable("rooms", {
   audienceSlotDurationSeconds: integer("audience_slot_duration_seconds").notNull().default(30),
   audienceTokenLimit: integer("audience_token_limit").notNull().default(4096),
   roomTokenLimit: integer("room_token_limit").notNull().default(32000),
+  maxTurns: integer("max_turns").notNull().default(30),
   currentTurnAgentId: text("current_turn_agent_id").notNull(),
   currentTurnNumber: integer("current_turn_number").notNull().default(0),
   lastEnqueuedTurnNumber: integer("last_enqueued_turn_number").notNull().default(0),
