@@ -37,10 +37,26 @@ const wrapXmlMessage = (args: {
   return `<message author="${authorNameEscaped}" audience="${audience}">${contentEscaped}</message>`;
 };
 
-const moderatorRules = `Rules:\n- Stay on topic.\n- No meta talk about being an AI.\n- Aim for 5-10 sentences.`;
+const houseRules = `<rules>
+- Stay on topic.
+- Aim for 5-10 sentences per reply.
+- Address other participants by name when responding to their points.
+- Do not discuss being an AI, a language model, or your own limitations.
+- Use plain text for math (e.g. x^2, sqrt(x), a/b). Never use LaTeX notation.
+</rules>`;
+
+const discordFormat = `<format>
+You are posting in a Discord thread.
+- Use Markdown: **bold**, *italic*, \`code\`, \`\`\`code blocks\`\`\`.
+- Use line breaks for readability. Avoid walls of text.
+- No HTML. No LaTeX. No embeds.
+</format>`;
+
+const buildSystemPrompt = (agent: PromptBuilderAgent): string =>
+  `${agent.systemPrompt}\n\n${houseRules}\n\n${discordFormat}`;
 
 const buildModeratorContent = (room: PromptBuilderRoom): string =>
-  `Room title: ${room.title}\nTopic: ${room.topic}\n\n${moderatorRules}`;
+  `Room title: ${room.title}\nTopic: ${room.topic}`;
 
 const textPart = (text: string): Prompt.TextPartEncoded => ({ type: "text", text });
 
@@ -49,7 +65,9 @@ export const buildPrompt = (
   agent: PromptBuilderAgent,
   messages: ReadonlyArray<PromptBuilderMessage>,
 ): Prompt.RawInput => {
-  const prompt: Array<Prompt.MessageEncoded> = [{ role: "system", content: agent.systemPrompt }];
+  const prompt: Array<Prompt.MessageEncoded> = [
+    { role: "system", content: buildSystemPrompt(agent) },
+  ];
 
   const hasModeratorMessage = messages.some((m) => m.authorType === "moderator");
 
