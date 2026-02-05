@@ -234,7 +234,7 @@ export class AdminBadRequest extends Schema.TaggedError<AdminBadRequest>()("Admi
 
 export class AdminNotFound extends Schema.TaggedError<AdminNotFound>()("AdminNotFound", {
   resource: Schema.String,
-  id: Schema.String,
+  id: Schema.NonEmptyString,
 }) {}
 
 export class AdminDbError extends Schema.TaggedError<AdminDbError>()("AdminDbError", {
@@ -596,8 +596,10 @@ export default {
         Schema.nonNaN(),
       );
 
+      const DiscordSnowflakeSchema = Schema.NonEmptyString.pipe(Schema.pattern(/^[0-9]{17,20}$/));
+
       const AgentCreateSchema = Schema.Struct({
-        id: Schema.optional(Schema.String),
+        id: Schema.optional(Schema.NonEmptyString),
         name: Schema.String,
         avatarUrl: Schema.optional(Schema.String),
         systemPrompt: Schema.String,
@@ -622,16 +624,16 @@ export default {
       });
 
       const CreateRoomSchema = Schema.Struct({
-        parentChannelId: Schema.String,
+        parentChannelId: DiscordSnowflakeSchema,
         topic: Schema.String,
         title: Schema.optional(Schema.String),
         audienceSlotDurationSeconds: Schema.optional(NonNegativeIntSchema),
         audienceTokenLimit: Schema.optional(NonNegativeIntSchema),
         roomTokenLimit: Schema.optional(NonNegativeIntSchema),
         autoArchiveDurationMinutes: Schema.optional(NonNegativeIntSchema),
-        agentIds: Schema.Array(Schema.String),
+        agentIds: Schema.Array(Schema.NonEmptyString),
         // Provide threadId to bind to an existing thread. If omitted, we will create a thread.
-        threadId: Schema.optional(Schema.String),
+        threadId: Schema.optional(DiscordSnowflakeSchema),
         threadName: Schema.optional(Schema.String),
       });
 

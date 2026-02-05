@@ -253,7 +253,7 @@ export class LlmRouter extends Context.Tag("@agon/LlmRouter")<
             ...(args.maxTokens !== undefined ? { maxTokens: args.maxTokens } : {}),
             ...(args.thinkingLevel !== undefined ? { reasoningEffort: args.thinkingLevel } : {}),
           }).pipe(
-            Effect.timeout(args.thinkingLevel ? "120 seconds" : "30 seconds"),
+            Effect.timeout("10 minutes"),
             Effect.mapError((cause) => {
               const tag =
                 typeof cause === "object" && cause !== null && "_tag" in cause
@@ -373,9 +373,7 @@ export class LlmRouter extends Context.Tag("@agon/LlmRouter")<
         return yield* withOverrides.pipe(
           Effect.provide(modelLayer),
           Effect.map((r) => r.text.trim()),
-          Effect.timeout(
-            args.thinkingLevel || args.thinkingBudgetTokens ? "120 seconds" : "30 seconds",
-          ),
+          Effect.timeout("10 minutes"),
           Effect.mapError((cause) => LlmCallFailed.make({ provider: args.provider, cause })),
         );
       });
