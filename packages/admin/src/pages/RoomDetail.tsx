@@ -1,6 +1,284 @@
-import { createMemo, createResource, For, Show, createSignal } from "solid-js";
+import { createMemo, createResource, For, Show, createSignal, onMount } from "solid-js";
 import { useNavigate, useParams } from "@solidjs/router";
-import { roomsApi } from "../api";
+import { createVirtualizer } from "@tanstack/solid-virtual";
+import { roomsApi, type Message } from "../api";
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/** Resolve a human-readable author name for a message. */
+const authorDisplay = (msg: Message): string => {
+  if (msg.authorType === "agent") {
+    return msg.authorName ?? msg.authorAgentId ?? "agent";
+  }
+  return msg.authorName ?? msg.authorType;
+};
+
+// ---------------------------------------------------------------------------
+// Export helpers
+// ---------------------------------------------------------------------------
+
+const downloadBlob = (blob: Blob, filename: string) => {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(() => {
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }, 0);
+};
+
+const exportJson = (roomId: number, messages: readonly Message[]) => {
+  const data = messages.map((m) => ({
+    id: m.id,
+    roomId: m.roomId,
+    authorType: m.authorType,
+    authorAgentId: m.authorAgentId,
+    authorName: m.authorName,
+    content: m.content,
+    thinkingText: m.thinkingText,
+    inputTokens: m.inputTokens,
+    outputTokens: m.outputTokens,
+    createdAtMs: m.createdAtMs,
+    createdAt: new Date(m.createdAtMs).toISOString(),
+  }));
+
+  const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+  downloadBlob(blob, `room-${roomId}-messages.json`);
+};
+
+const exportMarkdown = (roomId: number, messages: readonly Message[]) => {
+  const lines: string[] = [];
+
+  for (const msg of messages) {
+    const name = authorDisplay(msg);
+    lines.push(`[name] ${name}`);
+
+    if (msg.thinkingText) {
+      lines.push(`[thinking] ${msg.thinkingText}`);
+    }
+
+    lines.push(`[message] ${msg.content}`);
+    lines.push("");
+  }
+
+  const blob = new Blob([lines.join("\n")], { type: "text/markdown" });
+  downloadBlob(blob, `room-${roomId}-messages.md`);
+};
+
+// ---------------------------------------------------------------------------
+// MessageItem component (accordion)
+// ---------------------------------------------------------------------------
+
+function MessageItem(props: { msg: Message; onResize?: () => void }) {
+  const [expanded, setExpanded] = createSignal(false);
+
+  const toggle = () => {
+    setExpanded(!expanded());
+    // Notify virtualizer of height change after DOM update
+    requestAnimationFrame(() => props.onResize?.());
+  };
+
+  return (
+    <div
+      style={{
+        "border-bottom": "1px solid var(--border)",
+        "padding-bottom": "0.5rem",
+        "padding-top": "0.5rem",
+      }}
+    >
+      {/* Author + timestamp header */}
+      <div
+        style={{
+          "font-size": "0.875rem",
+          color: "var(--text-muted)",
+          "margin-bottom": "0.25rem",
+          display: "flex",
+          "align-items": "center",
+          gap: "0.5rem",
+        }}
+      >
+        <strong>{authorDisplay(props.msg)}</strong>
+        <span>•</span>
+        <span>{new Date(props.msg.createdAtMs).toLocaleString()}</span>
+        <Show when={props.msg.inputTokens != null || props.msg.outputTokens != null}>
+          <span style={{ "font-size": "0.75rem", opacity: 0.7 }}>
+            ({props.msg.inputTokens ?? "?"}→{props.msg.outputTokens ?? "?"} tok)
+          </span>
+        </Show>
+      </div>
+
+      {/* Thinking accordion (only shown when thinking text exists) */}
+      <Show when={props.msg.thinkingText}>
+        <div style={{ "margin-bottom": "0.5rem" }}>
+          <button
+            onClick={toggle}
+            style={{
+              background: "none",
+              border: "1px solid var(--border)",
+              "border-radius": "0.25rem",
+              padding: "0.25rem 0.5rem",
+              cursor: "pointer",
+              "font-size": "0.75rem",
+              color: "var(--text-muted)",
+              display: "flex",
+              "align-items": "center",
+              gap: "0.25rem",
+            }}
+          >
+            <span style={{ "font-size": "0.6rem", "line-height": 1 }}>
+              {expanded() ? "▼" : "▶"}
+            </span>
+            Thinking
+          </button>
+
+          <Show when={expanded()}>
+            <div
+              style={{
+                "margin-top": "0.5rem",
+                padding: "0.75rem",
+                "background-color": "#f8fafc",
+                "border-left": "3px solid var(--primary)",
+                "border-radius": "0 0.25rem 0.25rem 0",
+                "font-size": "0.85rem",
+                "white-space": "pre-wrap",
+                color: "var(--text-muted)",
+                "max-height": "400px",
+                overflow: "auto",
+              }}
+            >
+              {props.msg.thinkingText}
+            </div>
+          </Show>
+        </div>
+      </Show>
+
+      {/* Message content */}
+      <div style={{ "white-space": "pre-wrap" }}>{props.msg.content}</div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// VirtualMessageList component
+// ---------------------------------------------------------------------------
+
+function VirtualMessageList(props: { messages: readonly Message[]; roomId: number }) {
+  // eslint-disable-next-line no-unassigned-vars -- assigned via JSX ref
+  let scrollRef!: HTMLDivElement;
+
+  // Messages are returned newest-first from API; reverse for chronological display
+  const chronological = createMemo(() => [...props.messages].reverse());
+
+  const virtualizer = createVirtualizer({
+    get count() {
+      return chronological().length;
+    },
+    getScrollElement: () => scrollRef,
+    estimateSize: () => 120,
+    overscan: 5,
+  });
+
+  // Scroll to bottom on initial load
+  onMount(() => {
+    requestAnimationFrame(() => {
+      if (scrollRef) {
+        scrollRef.scrollTop = scrollRef.scrollHeight;
+      }
+    });
+  });
+
+  return (
+    <div>
+      <div
+        style={{
+          display: "flex",
+          "justify-content": "space-between",
+          "align-items": "center",
+          "margin-bottom": "0.75rem",
+        }}
+      >
+        <h3 style={{ margin: 0 }}>Recent Messages</h3>
+        <div style={{ display: "flex", gap: "0.5rem" }}>
+          <button
+            class="btn"
+            style={{ "font-size": "0.8rem", padding: "0.25rem 0.75rem" }}
+            onClick={() => exportJson(props.roomId, chronological())}
+          >
+            Export JSON
+          </button>
+          <button
+            class="btn"
+            style={{ "font-size": "0.8rem", padding: "0.25rem 0.75rem" }}
+            onClick={() => exportMarkdown(props.roomId, chronological())}
+          >
+            Export Markdown
+          </button>
+        </div>
+      </div>
+
+      <div
+        ref={scrollRef}
+        style={{
+          height: "600px",
+          overflow: "auto",
+          position: "relative",
+          "-webkit-overflow-scrolling": "touch",
+        }}
+      >
+        <div
+          style={{
+            height: `${virtualizer.getTotalSize()}px`,
+            width: "100%",
+            position: "relative",
+          }}
+        >
+          <For each={virtualizer.getVirtualItems()}>
+            {(vItem) => {
+              const msg = () => chronological()[vItem.index];
+              let rowRef: HTMLDivElement | undefined;
+              return (
+                <div
+                  data-index={vItem.index}
+                  ref={(el) => {
+                    rowRef = el;
+                    queueMicrotask(() => virtualizer.measureElement(el));
+                  }}
+                  style={{
+                    position: "absolute",
+                    top: 0,
+                    left: 0,
+                    width: "100%",
+                    transform: `translateY(${vItem.start}px)`,
+                  }}
+                >
+                  <Show when={msg()}>
+                    {(m) => (
+                      <MessageItem
+                        msg={m()}
+                        onResize={() => {
+                          if (rowRef) virtualizer.measureElement(rowRef);
+                        }}
+                      />
+                    )}
+                  </Show>
+                </div>
+              );
+            }}
+          </For>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// RoomDetail page
+// ---------------------------------------------------------------------------
 
 export default function RoomDetail() {
   const params = useParams();
@@ -143,35 +421,7 @@ export default function RoomDetail() {
               </section>
 
               <section class="card">
-                <h3>Recent Messages</h3>
-                <div style={{ display: "flex", "flex-direction": "column", gap: "1rem" }}>
-                  <For each={d().recentMessages}>
-                    {(msg) => (
-                      <div
-                        style={{
-                          "border-bottom": "1px solid var(--border)",
-                          "padding-bottom": "0.5rem",
-                        }}
-                      >
-                        <div
-                          style={{
-                            "font-size": "0.875rem",
-                            color: "var(--text-muted)",
-                            "margin-bottom": "0.25rem",
-                          }}
-                        >
-                          <strong>
-                            {msg.authorType === "agent"
-                              ? (msg.authorAgentId ?? "agent")
-                              : msg.authorType}
-                          </strong>{" "}
-                          • {new Date(msg.createdAtMs).toLocaleString()}
-                        </div>
-                        <div style={{ "white-space": "pre-wrap" }}>{msg.content}</div>
-                      </div>
-                    )}
-                  </For>
-                </div>
+                <VirtualMessageList messages={d().recentMessages} roomId={d().room.id} />
               </section>
 
               <section class="card">

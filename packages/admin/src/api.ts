@@ -75,9 +75,13 @@ export type Message = {
   readonly roomId: number;
   readonly discordMessageId: string;
   readonly threadId: string;
-  readonly authorType: "human" | "agent" | "bot_other";
+  readonly authorType: "moderator" | "agent" | "audience" | "notification";
   readonly authorAgentId: string | null;
+  readonly authorName: string | null;
   readonly content: string;
+  readonly thinkingText: string | null;
+  readonly inputTokens: number | null;
+  readonly outputTokens: number | null;
   readonly createdAtMs: number;
 };
 
