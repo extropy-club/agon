@@ -21,6 +21,13 @@ export class DiscordRateLimited extends Schema.TaggedError<DiscordRateLimited>()
   },
 ) {}
 
+export class DiscordVerifyError extends Schema.TaggedError<DiscordVerifyError>()(
+  "DiscordVerifyError",
+  {
+    message: Schema.String,
+  },
+) {}
+
 export type DiscordError = MissingDiscordConfig | DiscordApiError | DiscordRateLimited;
 
 export type DiscordWebhook = {
@@ -177,7 +184,7 @@ const requestJson = <A>(
           Effect.annotateLogs({ endpoint, retryAfterMs: e.retryAfterMs }),
         );
       }
-      return Effect.succeed(void 0);
+      return Effect.void;
     }),
   );
 
@@ -549,5 +556,9 @@ export const verifyDiscordInteraction = (args: {
       ]);
       return crypto.subtle.verify({ name: "Ed25519" }, key, sigBytes, msg);
     },
-    catch: () => new Error("verify failed"),
+    catch: (e) => {
+      const rec = typeof e === "object" && e !== null ? (e as Record<string, unknown>) : {};
+      const message = "message" in rec ? String(rec.message) : "verify failed";
+      return DiscordVerifyError.make({ message });
+    },
   }).pipe(Effect.catchAll(() => Effect.succeed(false)));

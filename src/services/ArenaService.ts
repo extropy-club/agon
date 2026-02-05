@@ -72,6 +72,50 @@ const errorLabel = (e: unknown): string => {
   return String(e);
 };
 
+/** Stringify a cause value, handling nested Error objects and Effect failures. */
+const stringifyCause = (c: unknown): string => {
+  if (c instanceof Error) {
+    const base = `${c.name}: ${c.message}`;
+    return c.cause ? `${base} [caused by: ${stringifyCause(c.cause)}]` : base;
+  }
+  if (typeof c === "string") return c;
+  if (typeof c === "object" && c !== null) {
+    // Effect Cause / tagged errors
+    const tag = (c as Record<string, unknown>)._tag;
+    const msg = (c as Record<string, unknown>).message;
+    if (typeof tag === "string") {
+      const inner = (c as Record<string, unknown>).cause;
+      const base = typeof msg === "string" ? `${tag}: ${msg}` : tag;
+      return inner ? `${base} [caused by: ${stringifyCause(inner)}]` : base;
+    }
+    try {
+      const s = JSON.stringify(c);
+      return s.length <= 500 ? s : s.slice(0, 500) + "…";
+    } catch {
+      return String(c);
+    }
+  }
+  return String(c);
+};
+
+/** Richer error serialization for turn event data — captures cause, status, message, etc. */
+const errorDetail = (e: unknown): Record<string, unknown> => {
+  const detail: Record<string, unknown> = { _tag: errorLabel(e) };
+  if (typeof e !== "object" || e === null) {
+    detail.value = String(e);
+    return detail;
+  }
+  const obj = e as Record<string, unknown>;
+  if ("cause" in obj) detail.cause = stringifyCause(obj.cause);
+  if ("status" in obj && typeof obj.status === "number") detail.status = obj.status;
+  if ("provider" in obj) detail.provider = obj.provider;
+  if ("model" in obj) detail.model = obj.model;
+  if ("envVar" in obj) detail.envVar = obj.envVar;
+  if ("message" in obj && typeof obj.message === "string") detail.message = obj.message;
+  if ("retryAfterMs" in obj) detail.retryAfterMs = obj.retryAfterMs;
+  return detail;
+};
+
 const turnFailedNotification = "⚠️ Turn failed after retries. Please use /kick to restart.";
 
 const isRetryableDiscordError = (e: DiscordError): boolean => {
@@ -655,6 +699,7 @@ export class ArenaService extends Context.Tag("@agon/ArenaService")<
                   status: "fail",
                   data: {
                     error: errorLabel(e),
+                    detail: errorDetail(e),
                   },
                 }),
               ),
@@ -875,7 +920,7 @@ export class ArenaService extends Context.Tag("@agon/ArenaService")<
                   turnNumber: job.turnNumber,
                   phase: "llm_fail",
                   status: "fail",
-                  data: { error: errorLabel(e) },
+                  data: { error: errorLabel(e), detail: errorDetail(e) },
                 });
 
                 yield* notifyFinalFailure("llm", e);
@@ -887,7 +932,7 @@ export class ArenaService extends Context.Tag("@agon/ArenaService")<
                   turnNumber: job.turnNumber,
                   phase: "finish",
                   status: "fail",
-                  data: { error: errorLabel(e), source: "llm" },
+                  data: { error: errorLabel(e), source: "llm", detail: errorDetail(e) },
                 });
 
                 return null;
@@ -1025,7 +1070,7 @@ export class ArenaService extends Context.Tag("@agon/ArenaService")<
                   turnNumber: job.turnNumber,
                   phase: "webhook_post_fail",
                   status: "fail",
-                  data: { error: errorLabel(e) },
+                  data: { error: errorLabel(e), detail: errorDetail(e) },
                 });
 
                 yield* notifyFinalFailure("webhook_post", e);
@@ -1035,7 +1080,7 @@ export class ArenaService extends Context.Tag("@agon/ArenaService")<
                   turnNumber: job.turnNumber,
                   phase: "finish",
                   status: "fail",
-                  data: { error: errorLabel(e), source: "webhook_post" },
+                  data: { error: errorLabel(e), source: "webhook_post", detail: errorDetail(e) },
                 });
 
                 return null;
@@ -1247,7 +1292,7 @@ export class ArenaService extends Context.Tag("@agon/ArenaService")<
                 turnNumber: job.turnNumber,
                 phase: "finish",
                 status: "fail",
-                data: { error: errorLabel(e) },
+                data: { error: errorLabel(e), detail: errorDetail(e) },
               }),
             ),
           ),
