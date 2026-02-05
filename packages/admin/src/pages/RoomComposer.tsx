@@ -12,7 +12,6 @@ export default function RoomComposer() {
   const [topic, setTopic] = createSignal("");
   const [parentChannelId, setParentChannelId] = createSignal("");
   const [threadId, setThreadId] = createSignal("");
-  const [threadName, setThreadName] = createSignal("Agon Room");
   const [autoArchiveDurationMinutes, setAutoArchiveDurationMinutes] = createSignal("1440");
   const [audienceSlotDurationSeconds, setAudienceSlotDurationSeconds] = createSignal("30");
   const [audienceTokenLimit, setAudienceTokenLimit] = createSignal("4096");
@@ -39,10 +38,9 @@ export default function RoomComposer() {
       audienceTokenLimit: Number(audienceTokenLimit()),
       roomTokenLimit: Number(roomTokenLimit()),
       ...(threadId().trim().length > 0 ? { threadId: threadId().trim() } : {}),
-      ...(() => {
-        const tn = threadName().trim();
-        return threadId().trim().length === 0 && tn.length > 0 ? { threadName: tn } : {};
-      })(),
+      ...(threadId().trim().length === 0 && title().trim().length > 0
+        ? { threadName: title().trim() }
+        : {}),
     });
 
     navigate(`/rooms/${result.roomId}`);
@@ -62,6 +60,17 @@ export default function RoomComposer() {
             required
             placeholder="Room Title"
           />
+          <Show when={threadId().trim().length === 0}>
+            <div
+              style={{
+                "font-size": "0.875rem",
+                color: "var(--text-muted)",
+                "margin-top": "0.5rem",
+              }}
+            >
+              Also used as the Discord thread name.
+            </div>
+          </Show>
         </div>
 
         <div class="form-group">
@@ -100,17 +109,6 @@ export default function RoomComposer() {
             placeholder="If provided, Agon will not create a new thread"
           />
         </div>
-
-        <Show when={threadId().trim().length === 0}>
-          <div class="form-group">
-            <label>Thread Name</label>
-            <input
-              class="form-control"
-              value={threadName()}
-              onInput={(e) => setThreadName(e.currentTarget.value)}
-            />
-          </div>
-        </Show>
 
         <div class="form-group">
           <label>Auto-Archive Duration</label>
