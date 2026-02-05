@@ -1,5 +1,4 @@
 import { asc, desc, eq, sql } from "drizzle-orm";
-import type { APIInteraction } from "discord-api-types/v10";
 import * as ConfigProvider from "effect/ConfigProvider";
 import { Config, Effect, Layer, Option, Redacted, Schema } from "effect";
 import * as ManagedRuntime from "effect/ManagedRuntime";
@@ -60,6 +59,12 @@ export interface Env {
 
   ARENA_MAX_TURNS?: string;
   ARENA_HISTORY_LIMIT?: string;
+
+  // Optional logging / LLM defaults (mostly for local dev / future use)
+  LOG_LEVEL?: string;
+  LOG_FORMAT?: string;
+  LLM_PROVIDER?: string;
+  LLM_MODEL?: string;
 
   // Admin API auth
   ADMIN_TOKEN?: string;
@@ -167,10 +172,10 @@ const makeConfigLayer = (env: Env) => {
     "CF_WORKER_SERVICE",
     "CF_QUEUE_NAME",
     "CF_D1_NAME",
-  ] as const;
+  ] as const satisfies ReadonlyArray<keyof Env>;
 
   for (const k of secretKeys) {
-    const v = (env as unknown as Record<string, unknown>)[k];
+    const v = env[k];
     if (typeof v === "string") map.set(k, v);
   }
 
@@ -1483,22 +1488,49 @@ export default {
 
       if (!ok) return json(401, { error: "Invalid signature" });
 
-      const interaction = (await request.json()) as APIInteraction;
+      const interactionUnknown: unknown = await request.json();
+
+      const DiscordInteractionTypeSchema = Schema.Struct({
+        type: Schema.Number,
+      });
+
+      let interactionType: number;
+      try {
+        interactionType = (
+          await runtime.runPromise(
+            Schema.decodeUnknown(DiscordInteractionTypeSchema)(interactionUnknown),
+          )
+        ).type;
+      } catch {
+        return respond("Agon: malformed interaction payload.");
+      }
 
       // PING -> PONG
-      if (interaction.type === 1) {
+      if (interactionType === 1) {
         return json(200, { type: 1 });
       }
 
       // APPLICATION_COMMAND
-      if (interaction.type !== 2) {
+      if (interactionType !== 2) {
         return respond("Agon: unsupported interaction type.");
       }
 
-      const threadId = (interaction as unknown as { channel_id?: unknown }).channel_id;
-      const commandName = (interaction as unknown as { data?: { name?: unknown } }).data?.name;
+      const DiscordApplicationCommandSchema = Schema.Struct({
+        channel_id: Schema.String,
+        data: Schema.Struct({
+          name: Schema.String,
+        }),
+      });
 
-      if (typeof threadId !== "string" || typeof commandName !== "string") {
+      let threadId: string;
+      let commandName: string;
+      try {
+        const cmd = await runtime.runPromise(
+          Schema.decodeUnknown(DiscordApplicationCommandSchema)(interactionUnknown),
+        );
+        threadId = cmd.channel_id;
+        commandName = cmd.data.name;
+      } catch {
         return respond("Agon: malformed command payload.");
       }
 

@@ -41,7 +41,7 @@ export class RoomNotFound extends Schema.TaggedError<RoomNotFound>()("RoomNotFou
 }) {}
 
 export class AgentNotFound extends Schema.TaggedError<AgentNotFound>()("AgentNotFound", {
-  agentId: Schema.String,
+  agentId: Schema.NonEmptyString,
 }) {}
 
 export class RoomDbError extends Schema.TaggedError<RoomDbError>()("RoomDbError", {
