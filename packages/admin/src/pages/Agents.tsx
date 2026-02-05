@@ -48,6 +48,7 @@ export default function Agents() {
     if (id) {
       await agentsApi.update(id, data);
     } else {
+      delete data.id;
       await agentsApi.create(data);
     }
     setEditingAgent(null);
@@ -90,16 +91,18 @@ export default function Agents() {
         <div class="card">
           <h3>{editingAgent()?.id ? "Edit Agent" : "New Agent"}</h3>
           <form onSubmit={handleSubmit}>
-            <div class="form-group">
-              <label>ID</label>
-              <input
-                class="form-control"
-                name="id"
-                value={editingAgent()?.id || ""}
-                required
-                disabled={!!editingAgent()?.id}
-              />
-            </div>
+            <Show when={editingAgent()?.id}>
+              <div class="form-group">
+                <label>ID</label>
+                <input
+                  class="form-control"
+                  name="id"
+                  value={editingAgent()?.id || ""}
+                  required
+                  disabled
+                />
+              </div>
+            </Show>
             <div class="form-group">
               <label>Name</label>
               <input class="form-control" name="name" value={editingAgent()?.name || ""} required />
