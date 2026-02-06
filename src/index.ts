@@ -32,6 +32,9 @@ import { TurnEventService } from "./services/TurnEventService.js";
 import { decrypt } from "./lib/crypto.js";
 import { signJwt, verifyJwt } from "./lib/jwt.js";
 
+/** GitHub logins allowed to access the admin panel (lowercase). */
+const ALLOWED_GITHUB_USERS: readonly string[] = ["ribelo", "fableflow", "nasqret"];
+
 export interface Env {
   DB: D1Database;
   ARENA_QUEUE: Queue<RoomTurnJob>;
@@ -73,7 +76,6 @@ export interface Env {
   GITHUB_CLIENT_ID?: string;
   GITHUB_CLIENT_SECRET?: string;
   JWT_SECRET?: string;
-  AUTH_ALLOWED_USERS?: string; // comma-separated GitHub logins
 
   // Cloudflare Workers static assets binding (admin UI)
   ASSETS?: Fetcher;
@@ -152,7 +154,6 @@ const makeConfigLayer = (env: Env) => {
     "GITHUB_CLIENT_ID",
     "GITHUB_CLIENT_SECRET",
     "JWT_SECRET",
-    "AUTH_ALLOWED_USERS",
     "DISCORD_PUBLIC_KEY",
     "DISCORD_BOT_TOKEN",
     "DISCORD_BOT_USER_ID",
@@ -296,6 +297,10 @@ export class OAuthForbiddenError extends Schema.TaggedError<OAuthForbiddenError>
 
 const requireAdmin = (request: Request) =>
   Effect.gen(function* () {
+    // Dev bypass: localhost never requires auth
+    const reqUrl = new URL(request.url);
+    if (isLocalhost(reqUrl.hostname)) return;
+
     // 1) Bearer token (programmatic access)
     const auth = request.headers.get("authorization") ?? "";
     const match = auth.match(/^Bearer\s+(.+)$/i);
@@ -333,16 +338,9 @@ const requireAdmin = (request: Request) =>
         return yield* AdminUnauthorized.make({});
       }
 
-      const allowOpt = yield* Config.option(Config.string("AUTH_ALLOWED_USERS")).pipe(
-        Effect.catchAll(() => Effect.succeed(Option.none())),
-      );
-
-      if (Option.isSome(allowOpt) && allowOpt.value.trim().length > 0) {
-        const allowed = allowOpt.value.split(",").map((s) => s.trim().toLowerCase());
-        const login = payload.login;
-        if (typeof login !== "string" || !allowed.includes(login.toLowerCase())) {
-          return yield* AdminUnauthorized.make({});
-        }
+      const login = payload.login;
+      if (typeof login !== "string" || !ALLOWED_GITHUB_USERS.includes(login.toLowerCase())) {
+        return yield* AdminUnauthorized.make({});
       }
 
       return;
@@ -381,6 +379,11 @@ export default {
 
     // Auth (GitHub OAuth)
     if (url.pathname === "/auth/login" && request.method === "GET") {
+      // Dev bypass: localhost doesn't require GitHub OAuth
+      if (isLocalhost(url.hostname)) {
+        return redirect("/");
+      }
+
       if (!env.GITHUB_CLIENT_ID) {
         return json(500, { error: "Missing GITHUB_CLIENT_ID" });
       }
@@ -551,17 +554,9 @@ export default {
           Effect.withLogSpan("github.user_fetch"),
         );
 
-        // Optional allowlist
-        const allowRaw = env.AUTH_ALLOWED_USERS?.trim() ?? "";
-        if (allowRaw.length > 0) {
-          const allow = allowRaw
-            .split(",")
-            .map((s) => s.trim().toLowerCase())
-            .filter(Boolean);
-
-          if (!allow.includes(userJson.login.toLowerCase())) {
-            return yield* OAuthForbiddenError.make({});
-          }
+        // Hardcoded allowlist
+        if (!ALLOWED_GITHUB_USERS.includes(userJson.login.toLowerCase())) {
+          return yield* OAuthForbiddenError.make({});
         }
 
         const now = Math.floor(Date.now() / 1000);
@@ -646,6 +641,11 @@ export default {
     }
 
     if (url.pathname === "/auth/me" && request.method === "GET") {
+      // Dev bypass: localhost returns a fake user without cookies/JWT
+      if (isLocalhost(url.hostname)) {
+        return json(200, { login: "dev", avatar_url: "", sub: "0" });
+      }
+
       const token = getCookie(request, "session");
       if (!token) return json(401, { error: "Unauthorized" });
       if (!env.JWT_SECRET) return json(500, { error: "Missing JWT_SECRET" });
