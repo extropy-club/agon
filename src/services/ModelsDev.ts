@@ -37,6 +37,31 @@ export class ModelsDev extends Context.Tag("@agon/ModelsDev")<
       let cachedModels: ReadonlyArray<ModelInfo> | null = null;
       let cacheTimestamp: number = 0;
 
+      // Fallback models when API is unavailable
+      const fallbackModels: ReadonlyArray<ModelInfo> = [
+        // OpenAI
+        { id: "gpt-4o-mini", name: "GPT-4o Mini", provider: "openai" },
+        { id: "gpt-4o", name: "GPT-4o", provider: "openai" },
+        { id: "gpt-4-turbo", name: "GPT-4 Turbo", provider: "openai" },
+        { id: "gpt-4", name: "GPT-4", provider: "openai" },
+        { id: "gpt-3.5-turbo", name: "GPT-3.5 Turbo", provider: "openai" },
+        // Anthropic
+        { id: "claude-3-5-sonnet-20241022", name: "Claude 3.5 Sonnet", provider: "anthropic" },
+        { id: "claude-3-opus-20240229", name: "Claude 3 Opus", provider: "anthropic" },
+        { id: "claude-3-sonnet-20240229", name: "Claude 3 Sonnet", provider: "anthropic" },
+        { id: "claude-3-haiku-20240307", name: "Claude 3 Haiku", provider: "anthropic" },
+        // Gemini
+        { id: "gemini-1.5-flash", name: "Gemini 1.5 Flash", provider: "gemini" },
+        { id: "gemini-1.5-pro", name: "Gemini 1.5 Pro", provider: "gemini" },
+        { id: "gemini-pro", name: "Gemini Pro", provider: "gemini" },
+        // OpenRouter
+        { id: "openai/gpt-4o-mini", name: "OpenAI GPT-4o Mini (OR)", provider: "openrouter" },
+        { id: "openai/gpt-4o", name: "OpenAI GPT-4o (OR)", provider: "openrouter" },
+        { id: "anthropic/claude-3.5-sonnet", name: "Claude 3.5 Sonnet (OR)", provider: "openrouter" },
+        { id: "google/gemini-1.5-flash", name: "Gemini 1.5 Flash (OR)", provider: "openrouter" },
+        { id: "meta-llama/llama-3.1-70b-instruct", name: "Llama 3.1 70B (OR)", provider: "openrouter" },
+      ];
+
       const fetchModels = Effect.fn("ModelsDev.fetchModels")(function* () {
         const now = Date.now();
 
@@ -45,30 +70,16 @@ export class ModelsDev extends Context.Tag("@agon/ModelsDev")<
           return cachedModels;
         }
 
-        // Fetch fresh data
-        const response = yield* Effect.tryPromise({
-          try: () => fetch(MODELS_DEV_API),
-          catch: (cause) => ModelsDevError.make({ operation: "fetch", cause }),
-        });
-
-        if (!response.ok) {
-          return yield* Effect.fail(
-            ModelsDevError.make({
-              operation: "fetch",
-              cause: new Error(`HTTP ${response.status}: ${response.statusText}`),
-            }),
-          );
-        }
-
-        const data = yield* Effect.tryPromise({
-          try: () => response.json() as Promise<unknown>,
-          catch: (cause) => ModelsDevError.make({ operation: "parse", cause }),
-        });
-
-        // Parse the models.dev response format
-        // Expected format: { models: [{ id, name, provider }, ...] }
-        const parsed: ReadonlyArray<ModelInfo> = yield* Effect.try({
-          try: () => {
+        // Try to fetch from API, fallback to defaults on error
+        const apiModels = yield* Effect.tryPromise({
+          try: async () => {
+            const response = await fetch(MODELS_DEV_API);
+            if (!response.ok) {
+              throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+            }
+            const data = (await response.json()) as unknown;
+            
+            // Parse the models.dev response format
             if (typeof data !== "object" || data === null || !("models" in data)) {
               throw new Error("Invalid response format: missing 'models' array");
             }
@@ -76,6 +87,7 @@ export class ModelsDev extends Context.Tag("@agon/ModelsDev")<
             if (!Array.isArray(models)) {
               throw new Error("Invalid response format: 'models' is not an array");
             }
+            
             const validModels: ModelInfo[] = [];
             for (const m of models) {
               if (
@@ -95,13 +107,13 @@ export class ModelsDev extends Context.Tag("@agon/ModelsDev")<
             }
             return validModels;
           },
-          catch: (cause) => ModelsDevError.make({ operation: "parse", cause }),
-        });
+          catch: (e) => ModelsDevError.make({ operation: "fetch", cause: e }),
+        }).pipe(Effect.orElse(() => Effect.succeed(fallbackModels)));
 
-        cachedModels = parsed;
+        cachedModels = apiModels;
         cacheTimestamp = now;
 
-        return parsed;
+        return apiModels;
       });
 
       const getModelsByProvider = (provider: string) =>
