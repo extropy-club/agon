@@ -122,15 +122,15 @@ const THINKING_BUDGET_OPTIONS = [
 function getDefaultModel(provider: string): string {
   switch (provider) {
     case "openai":
-      return "gpt-4o-mini";
+      return "gpt-4.1-mini";
     case "anthropic":
-      return "claude-3-sonnet-20240229";
+      return "claude-sonnet-4-0";
     case "gemini":
-      return "gemini-1.5-flash";
+      return "gemini-2.5-flash";
     case "openrouter":
-      return "openai/gpt-4o-mini";
+      return "openai/gpt-4.1-mini";
     default:
-      return "gpt-4o-mini";
+      return "gpt-4.1-mini";
   }
 }
 
