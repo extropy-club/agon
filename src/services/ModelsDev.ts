@@ -23,13 +23,26 @@ const PROVIDER_MAP: Record<string, string> = {
   gemini: "google",
 };
 
-/** Filter out embedding / audio-only models — keep only text-capable chat models. */
-const isChatModel = (m: Record<string, unknown>): boolean => {
-  const mods = m.modalities as { input?: string[]; output?: string[] } | undefined;
-  if (!mods) return true; // If no modalities info, include it
-  const inp = mods.input ?? [];
-  const out = mods.output ?? [];
-  return inp.includes("text") && out.includes("text");
+/** Keep only chat-capable models. Filters out embeddings, codex, previews, dated snapshots, etc. */
+const isChatModel = (id: string, m: Record<string, unknown>): boolean => {
+  // Must support tool calling (rules out embeddings, TTS, image-gen)
+  if (m.tool_call !== true) return false;
+
+  // Name-based exclusions
+  if (id.includes("embedding")) return false;
+  if (id.includes("codex")) return false;
+  if (id.includes("preview")) return false;
+  if (id.includes("deep-research")) return false;
+  if (id.includes("live-")) return false;
+
+  // Skip dated snapshots (e.g. gpt-4o-2024-08-06, claude-opus-4-20250514)
+  if (/\d{4}-\d{2}-\d{2}/.test(id)) return false;
+  if (/-\d{8}$/.test(id)) return false;
+
+  // Skip -latest / -chat-latest aliases (redundant with the canonical id)
+  if (id.endsWith("-latest") || id.endsWith("-chat-latest")) return false;
+
+  return true;
 };
 
 // Fallback models when API is unreachable
@@ -111,7 +124,7 @@ export class ModelsDev extends Context.Tag("@agon/ModelsDev")<
                 const m = modelData as Record<string, unknown>;
 
                 // Skip non-chat models (embeddings, audio-only, etc.)
-                if (!isChatModel(m)) continue;
+                if (!isChatModel(modelId, m)) continue;
 
                 const name = typeof m.name === "string" ? m.name : modelId;
                 result.push({ id: modelId, name, provider: ourProvider });
@@ -131,7 +144,7 @@ export class ModelsDev extends Context.Tag("@agon/ModelsDev")<
               )) {
                 if (typeof modelData !== "object" || modelData === null) continue;
                 const m = modelData as Record<string, unknown>;
-                if (!isChatModel(m)) continue;
+                if (!isChatModel(modelId, m)) continue;
 
                 const name = typeof m.name === "string" ? m.name : modelId;
                 result.push({
