@@ -40,30 +40,30 @@ const endpoint = guildId
 
 const commands = [
   {
-    name: "next",
-    description: "Trigger next turn manually",
-    type: 1,
-  },
-  {
-    name: "stop",
-    description: "Pause the room",
-    type: 1,
-  },
-  {
-    name: "audience",
-    description: "Open the audience slot (unlock the thread)",
-    type: 1,
-  },
-  {
-    name: "continue",
-    description: "Close the audience slot and resume agents",
-    type: 1,
-  },
-  {
     name: "agon",
-    description: "Agon management commands",
+    description: "Agon debate arena commands",
     type: 1,
     options: [
+      {
+        name: "next",
+        description: "Trigger next turn manually",
+        type: 1, // SUB_COMMAND
+      },
+      {
+        name: "stop",
+        description: "Pause the room",
+        type: 1, // SUB_COMMAND
+      },
+      {
+        name: "audience",
+        description: "Open the audience slot (unlock the thread)",
+        type: 1, // SUB_COMMAND
+      },
+      {
+        name: "continue",
+        description: "Close the audience slot and resume agents",
+        type: 1, // SUB_COMMAND
+      },
       {
         name: "agent",
         description: "Agent management",
@@ -72,6 +72,18 @@ const commands = [
           {
             name: "create",
             description: "Create a new agent (opens modal)",
+            type: 1, // SUB_COMMAND
+          },
+        ],
+      },
+      {
+        name: "room",
+        description: "Room management",
+        type: 2, // SUB_COMMAND_GROUP
+        options: [
+          {
+            name: "create",
+            description: "Create a new debate room (opens wizard)",
             type: 1, // SUB_COMMAND
           },
         ],

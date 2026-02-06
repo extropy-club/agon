@@ -34,6 +34,11 @@ import {
   DiscordComponentInteractionSchema,
   type ModelsDevService,
 } from "./services/DiscordAgentCommands.js";
+import {
+  DiscordRoomService,
+  RoomModalSubmitSchema,
+  RoomComponentSchema,
+} from "./services/DiscordRoomCommands.js";
 import { LlmRouterLive } from "./services/LlmRouter.js";
 import { Observability } from "./services/Observability.js";
 import { Settings } from "./services/Settings.js";
@@ -1644,12 +1649,13 @@ export default {
         return json(200, { type: 1 });
       }
 
-      // MODAL_SUBMIT (type 5) - for agent creation wizard
+      // MODAL_SUBMIT (type 5)
       if (interactionType === 5) {
-        const modalResult =
+        // Agent creation modal
+        const agentModalResult =
           Schema.decodeUnknownOption(DiscordModalSubmitSchema)(interactionUnknown);
         if (
-          modalResult._tag === "Some" &&
+          agentModalResult._tag === "Some" &&
           DiscordAgentService.isAgentCreateModalSubmit(interactionUnknown)
         ) {
           const response = await runtime.runPromise(
@@ -1657,7 +1663,7 @@ export default {
               const modelsDev = yield* ModelsDev;
               const { db } = yield* Db;
               const agentService = new DiscordAgentService(db, modelsDev);
-              return yield* agentService.handleModalSubmit(modalResult.value);
+              return yield* agentService.handleModalSubmit(agentModalResult.value);
             }).pipe(
               Effect.catchAll((e) =>
                 Effect.succeed(
@@ -1674,16 +1680,49 @@ export default {
           );
           return response;
         }
+
+        // Room creation modal
+        const roomModalResult =
+          Schema.decodeUnknownOption(RoomModalSubmitSchema)(interactionUnknown);
+        if (
+          roomModalResult._tag === "Some" &&
+          DiscordRoomService.isRoomCreateModalSubmit(interactionUnknown)
+        ) {
+          const { response } = await runtime.runPromise(
+            Effect.gen(function* () {
+              const { db } = yield* Db;
+              const discord = yield* Discord;
+              const arena = yield* ArenaService;
+              const roomService = new DiscordRoomService(db, discord, arena);
+              return yield* roomService.handleModalSubmit(roomModalResult.value);
+            }).pipe(
+              Effect.catchAll((e) =>
+                Effect.succeed({
+                  response: new Response(
+                    JSON.stringify({
+                      type: 4,
+                      data: { content: `Error: ${e.message}`, flags: 64 },
+                    }),
+                    { status: 200, headers: { "Content-Type": "application/json" } },
+                  ),
+                }),
+              ),
+            ),
+          );
+          return response;
+        }
+
         return respond("Agon: unknown modal submission.");
       }
 
       // MESSAGE_COMPONENT (type 3) - for button clicks and selects
       if (interactionType === 3) {
-        const componentResult = Schema.decodeUnknownOption(DiscordComponentInteractionSchema)(
+        // Agent creation components
+        const agentComponentResult = Schema.decodeUnknownOption(DiscordComponentInteractionSchema)(
           interactionUnknown,
         );
         if (
-          componentResult._tag === "Some" &&
+          agentComponentResult._tag === "Some" &&
           DiscordAgentService.isAgentCreateComponent(interactionUnknown)
         ) {
           const response = await runtime.runPromise(
@@ -1691,7 +1730,7 @@ export default {
               const modelsDev = yield* ModelsDev;
               const { db } = yield* Db;
               const agentService = new DiscordAgentService(db, modelsDev);
-              return yield* agentService.handleComponentInteraction(componentResult.value);
+              return yield* agentService.handleComponentInteraction(agentComponentResult.value);
             }).pipe(
               Effect.catchAll((e) =>
                 Effect.succeed(
@@ -1708,6 +1747,42 @@ export default {
           );
           return response;
         }
+
+        // Room creation components
+        const roomComponentResult = Schema.decodeUnknownOption(RoomComponentSchema)(
+          interactionUnknown,
+        );
+        if (
+          roomComponentResult._tag === "Some" &&
+          DiscordRoomService.isRoomCreateComponent(interactionUnknown)
+        ) {
+          const roomResult = await runtime.runPromise(
+            Effect.gen(function* () {
+              const { db } = yield* Db;
+              const discord = yield* Discord;
+              const arena = yield* ArenaService;
+              const roomService = new DiscordRoomService(db, discord, arena);
+              return yield* roomService.handleComponentInteraction(roomComponentResult.value);
+            }).pipe(
+              Effect.catchAll((e) =>
+                Effect.succeed({
+                  response: new Response(
+                    JSON.stringify({
+                      type: 4,
+                      data: { content: `Error: ${e.message}`, flags: 64 },
+                    }),
+                    { status: 200, headers: { "Content-Type": "application/json" } },
+                  ),
+                } satisfies { response: Response }),
+              ),
+            ),
+          );
+          if ("enqueue" in roomResult && roomResult.enqueue) {
+            ctx.waitUntil(env.ARENA_QUEUE.send(roomResult.enqueue));
+          }
+          return roomResult.response;
+        }
+
         return respond("Agon: unknown component interaction.");
       }
 
@@ -1725,6 +1800,16 @@ export default {
         return respond("Agon: malformed agent create command.");
       }
 
+      // Check for /agon room create command (triggers modal)
+      if (interactionType === 2 && DiscordRoomService.isRoomCreateCommand(interactionUnknown)) {
+        const roomService = new DiscordRoomService(
+          {} as DrizzleD1Database,
+          {} as Discord extends { Type: infer T } ? T : never,
+          {} as ArenaService extends { Type: infer T } ? T : never,
+        );
+        return await runtime.runPromise(roomService.handleRoomCreateModal());
+      }
+
       // APPLICATION_COMMAND (room-based commands)
       if (interactionType !== 2) {
         return respond("Agon: unsupported interaction type.");
@@ -1734,6 +1819,14 @@ export default {
         channel_id: Schema.String,
         data: Schema.Struct({
           name: Schema.String,
+          options: Schema.optional(
+            Schema.Array(
+              Schema.Struct({
+                name: Schema.String,
+                type: Schema.Number,
+              }),
+            ),
+          ),
         }),
       });
 
@@ -1744,7 +1837,13 @@ export default {
           Schema.decodeUnknown(DiscordApplicationCommandSchema)(interactionUnknown),
         );
         threadId = cmd.channel_id;
-        commandName = cmd.data.name;
+        // All commands are now subcommands of /agon, so the actual command name
+        // is in data.options[0].name (the first subcommand).
+        if (cmd.data.name === "agon" && cmd.data.options?.[0]) {
+          commandName = cmd.data.options[0].name;
+        } else {
+          commandName = cmd.data.name;
+        }
       } catch {
         return respond("Agon: malformed command payload.");
       }
@@ -1908,7 +2007,7 @@ export default {
 
           default:
             return reply(
-              `Agon: unknown command: /${commandName}. Available: /next, /stop, /audience, /continue.`,
+              `Agon: unknown command: /agon ${commandName}. Available: /agon next, /agon stop, /agon audience, /agon continue.`,
             );
         }
       }).pipe(
