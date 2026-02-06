@@ -59,6 +59,25 @@ const commands = [
     description: "Close the audience slot and resume agents",
     type: 1,
   },
+  {
+    name: "agon",
+    description: "Agon management commands",
+    type: 1,
+    options: [
+      {
+        name: "agent",
+        description: "Agent management",
+        type: 2, // SUB_COMMAND_GROUP
+        options: [
+          {
+            name: "create",
+            description: "Create a new agent (opens modal)",
+            type: 1, // SUB_COMMAND
+          },
+        ],
+      },
+    ],
+  },
 ];
 
 const res = await fetch(endpoint, {

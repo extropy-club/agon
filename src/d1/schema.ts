@@ -105,3 +105,17 @@ export const settings = sqliteTable("settings", {
   value: text("value").notNull(),
   updatedAtMs: integer("updated_at_ms").notNull(),
 });
+
+/**
+ * Command session state for multi-step Discord slash command flows.
+ */
+export const commandSessions = sqliteTable("command_sessions", {
+  id: text("id").primaryKey(),
+  kind: text("kind", {
+    enum: ["agent_create", "agent_delete", "room_create"],
+  }).notNull(),
+  userId: text("user_id").notNull(),
+  stateJson: text("state_json").notNull(),
+  createdAtMs: integer("created_at_ms").notNull(),
+  expiresAtMs: integer("expires_at_ms").notNull(),
+});

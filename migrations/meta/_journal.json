@@ -50,6 +50,20 @@
       "when": 1770246529865,
       "tag": "0006_sour_wallop",
       "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "6",
+      "when": 1770375320552,
+      "tag": "0007_conscious_stryfe",
+      "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "6",
+      "when": 1770376291545,
+      "tag": "0008_known_william_stryker",
+      "breakpoints": true
     }
   ]
 }

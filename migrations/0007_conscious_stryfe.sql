@@ -1,0 +1,1 @@
+ALTER TABLE `rooms` ADD `max_turns` integer DEFAULT 30 NOT NULL;

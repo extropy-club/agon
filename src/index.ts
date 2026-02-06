@@ -12,6 +12,7 @@ import {
   roomTurnEvents,
   settings,
 } from "./d1/schema.js";
+import { ModelsDev } from "./services/ModelsDev.js";
 import {
   ArenaService,
   RoomDbError,
@@ -25,6 +26,14 @@ import {
   verifyDiscordInteraction,
 } from "./services/Discord.js";
 import { DiscordWebhookPoster } from "./services/DiscordWebhook.js";
+import type { DrizzleD1Database } from "drizzle-orm/d1";
+import {
+  DiscordAgentService,
+  DiscordAgentCommandSchema,
+  DiscordModalSubmitSchema,
+  DiscordComponentInteractionSchema,
+  type ModelsDevService,
+} from "./services/DiscordAgentCommands.js";
 import { LlmRouterLive } from "./services/LlmRouter.js";
 import { Observability } from "./services/Observability.js";
 import { Settings } from "./services/Settings.js";
@@ -189,6 +198,7 @@ const makeRuntime = (env: Env) => {
 
   const llmRouterLayer = LlmRouterLive.pipe(Layer.provide(settingsLayer));
   const discordLayer = Discord.layer.pipe(Layer.provide(settingsLayer));
+  const modelsDevLayer = ModelsDev.layer;
 
   const infraLayer = Layer.mergeAll(
     dbLayer,
@@ -198,6 +208,7 @@ const makeRuntime = (env: Env) => {
     llmRouterLayer,
     discordLayer,
     TurnEventService.layer.pipe(Layer.provide(dbLayer)),
+    modelsDevLayer,
   );
 
   const arenaLayer = ArenaService.layer.pipe(Layer.provide(infraLayer));
@@ -996,10 +1007,16 @@ export default {
 
             if (
               body.thinkingLevel != null &&
-              !(provider === "openai" || provider === "anthropic")
+              !(
+                provider === "openai" ||
+                provider === "anthropic" ||
+                provider === "openrouter" ||
+                provider === "gemini"
+              )
             ) {
               return yield* AdminBadRequest.make({
-                message: "thinkingLevel is only supported for OpenAI and Anthropic",
+                message:
+                  "thinkingLevel is only supported for OpenAI, Anthropic, OpenRouter, and Gemini",
               });
             }
 
@@ -1112,10 +1129,16 @@ export default {
 
             if (
               body.thinkingLevel != null &&
-              !(provider === "openai" || provider === "anthropic")
+              !(
+                provider === "openai" ||
+                provider === "anthropic" ||
+                provider === "openrouter" ||
+                provider === "gemini"
+              )
             ) {
               return yield* AdminBadRequest.make({
-                message: "thinkingLevel is only supported for OpenAI and Anthropic",
+                message:
+                  "thinkingLevel is only supported for OpenAI, Anthropic, OpenRouter, and Gemini",
               });
             }
 
@@ -1621,7 +1644,88 @@ export default {
         return json(200, { type: 1 });
       }
 
-      // APPLICATION_COMMAND
+      // MODAL_SUBMIT (type 5) - for agent creation wizard
+      if (interactionType === 5) {
+        const modalResult =
+          Schema.decodeUnknownOption(DiscordModalSubmitSchema)(interactionUnknown);
+        if (
+          modalResult._tag === "Some" &&
+          DiscordAgentService.isAgentCreateModalSubmit(interactionUnknown)
+        ) {
+          const response = await runtime.runPromise(
+            Effect.gen(function* () {
+              const modelsDev = yield* ModelsDev;
+              const { db } = yield* Db;
+              const agentService = new DiscordAgentService(db, modelsDev);
+              return yield* agentService.handleModalSubmit(modalResult.value);
+            }).pipe(
+              Effect.catchAll((e) =>
+                Effect.succeed(
+                  new Response(
+                    JSON.stringify({
+                      type: 4,
+                      data: { content: `Error: ${e.message}`, flags: 64 },
+                    }),
+                    { status: 200, headers: { "Content-Type": "application/json" } },
+                  ),
+                ),
+              ),
+            ),
+          );
+          return response;
+        }
+        return respond("Agon: unknown modal submission.");
+      }
+
+      // MESSAGE_COMPONENT (type 3) - for button clicks and selects
+      if (interactionType === 3) {
+        const componentResult = Schema.decodeUnknownOption(DiscordComponentInteractionSchema)(
+          interactionUnknown,
+        );
+        if (
+          componentResult._tag === "Some" &&
+          DiscordAgentService.isAgentCreateComponent(interactionUnknown)
+        ) {
+          const response = await runtime.runPromise(
+            Effect.gen(function* () {
+              const modelsDev = yield* ModelsDev;
+              const { db } = yield* Db;
+              const agentService = new DiscordAgentService(db, modelsDev);
+              return yield* agentService.handleComponentInteraction(componentResult.value);
+            }).pipe(
+              Effect.catchAll((e) =>
+                Effect.succeed(
+                  new Response(
+                    JSON.stringify({
+                      type: 4,
+                      data: { content: `Error: ${e.message}`, flags: 64 },
+                    }),
+                    { status: 200, headers: { "Content-Type": "application/json" } },
+                  ),
+                ),
+              ),
+            ),
+          );
+          return response;
+        }
+        return respond("Agon: unknown component interaction.");
+      }
+
+      // Check for /agon agent create command (triggers modal)
+      if (interactionType === 2 && DiscordAgentService.isAgentCreateCommand(interactionUnknown)) {
+        const cmdResult = Schema.decodeUnknownOption(DiscordAgentCommandSchema)(interactionUnknown);
+        if (cmdResult._tag === "Some") {
+          // Agent create command doesn't need DB or ModelsDev for the modal trigger
+          const agentService = new DiscordAgentService(
+            {} as DrizzleD1Database,
+            {} as ModelsDevService,
+          );
+          return await runtime.runPromise(agentService.handleAgentCreateModal(cmdResult.value));
+        }
+        return respond("Agon: malformed agent create command.");
+      }
+
+      // APPLICATION_COMMAND (room-based commands)
       if (interactionType !== 2) {
         return respond("Agon: unsupported interaction type.");
       }

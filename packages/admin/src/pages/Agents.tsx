@@ -44,6 +44,26 @@ export default function Agents() {
       data[key] = value;
     }
 
+    // Client-side validation: clear unsupported fields based on provider
+    const provider = data.llmProvider as Provider;
+
+    // thinkingLevel is only supported for openai, anthropic, openrouter, gemini
+    if (
+      !(
+        provider === "openai" ||
+        provider === "anthropic" ||
+        provider === "openrouter" ||
+        provider === "gemini"
+      )
+    ) {
+      data.thinkingLevel = null;
+    }
+
+    // thinkingBudgetTokens is only supported for anthropic
+    if (provider !== "anthropic") {
+      data.thinkingBudgetTokens = null;
+    }
+
     const id = editingAgent()?.id;
     if (id) {
       await agentsApi.update(id, data);
@@ -69,6 +89,36 @@ export default function Agents() {
   const startEdit = (agent: Agent) => {
     setSelectedProvider(agent.llmProvider);
     setEditingAgent(agent);
+  };
+
+  const handleProviderChange = (newProvider: Provider) => {
+    setSelectedProvider(newProvider);
+
+    // Clear incompatible fields when switching providers
+    setEditingAgent((prev) => {
+      if (!prev) return prev;
+
+      const updated = { ...prev, llmProvider: newProvider } as EditingAgent;
+
+      // Clear thinkingLevel if new provider doesn't support it
+      if (
+        !(
+          newProvider === "openai" ||
+          newProvider === "anthropic" ||
+          newProvider === "openrouter" ||
+          newProvider === "gemini"
+        )
+      ) {
+        (updated as Record<string, unknown>).thinkingLevel = null;
+      }
+
+      // Clear thinkingBudgetTokens if not anthropic
+      if (newProvider !== "anthropic") {
+        (updated as Record<string, unknown>).thinkingBudgetTokens = null;
+      }
+
+      return updated;
+    });
   };
 
   return (
@@ -122,7 +172,7 @@ export default function Agents() {
                 name="llmProvider"
                 value={selectedProvider()}
                 onChange={(e) =>
-                  setSelectedProvider((e.target as HTMLSelectElement).value as Provider)
+                  handleProviderChange((e.target as HTMLSelectElement).value as Provider)
                 }
               >
                 <option value="openai">OpenAI</option>
