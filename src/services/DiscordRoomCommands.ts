@@ -99,12 +99,14 @@ export type RoomInteractionResult = {
   readonly response: Response;
   readonly enqueue?: TurnJob | undefined;
   /** Deferred start — index.ts runs this in background and patches the message. */
-  readonly deferredStart?: {
-    readonly applicationId: string;
-    readonly interactionToken: string;
-    readonly sessionId: string;
-    readonly state: RoomCreateState;
-  } | undefined;
+  readonly deferredStart?:
+    | {
+        readonly applicationId: string;
+        readonly interactionToken: string;
+        readonly sessionId: string;
+        readonly state: RoomCreateState;
+      }
+    | undefined;
 };
 
 const SESSION_EXPIRY_MS = 30 * 60 * 1000;
@@ -210,7 +212,9 @@ function buildConfigMessage(
     `> Agents: **${selectedAgents.length > 0 ? selectedAgents.join(", ") : "none selected"}**`,
     `> Max turns: **${maxTurns}** · Audience slot: **${audienceSlot}s** · Auto-archive: **${autoArchive}m**`,
     "",
-    selectedAgents.length < 2 ? "⚠️ Select at least 2 agents to start." : "Configure below, then hit **Start**.",
+    selectedAgents.length < 2
+      ? "⚠️ Select at least 2 agents to start."
+      : "Configure below, then hit **Start**.",
   ];
 
   const maxTurnsOpts = MAX_TURNS_OPTIONS.map((o) => ({
@@ -401,7 +405,9 @@ export class DiscordRoomService {
 
   // ---- Step 2: Modal submitted → config message ----------------------------
 
-  handleModalSubmit(interaction: RoomModalSubmit): Effect.Effect<RoomInteractionResult, Error, never> {
+  handleModalSubmit(
+    interaction: RoomModalSubmit,
+  ): Effect.Effect<RoomInteractionResult, Error, never> {
     return Effect.gen(this, function* () {
       const title =
         interaction.data.components[0]?.components.find((c) => c.custom_id === "room_title")
@@ -467,8 +473,7 @@ export class DiscordRoomService {
       // Cancel
       if (action === "cancel") {
         yield* Effect.tryPromise({
-          try: () =>
-            this.db.delete(commandSessions).where(eq(commandSessions.id, sessionId)).run(),
+          try: () => this.db.delete(commandSessions).where(eq(commandSessions.id, sessionId)).run(),
           catch: () => new Error("ignored"),
         }).pipe(Effect.catchAll(() => Effect.void));
 
@@ -524,8 +529,7 @@ export class DiscordRoomService {
       } else if (action === "start") {
         // Delete session immediately to prevent double-start race
         yield* Effect.tryPromise({
-          try: () =>
-            this.db.delete(commandSessions).where(eq(commandSessions.id, sessionId)).run(),
+          try: () => this.db.delete(commandSessions).where(eq(commandSessions.id, sessionId)).run(),
           catch: () => new Error("ignored"),
         }).pipe(Effect.catchAll(() => Effect.void));
 
@@ -620,9 +624,9 @@ export class DiscordRoomService {
 
       const webhook = existingWebhook
         ? { id: existingWebhook.webhookId, token: existingWebhook.webhookToken }
-        : yield* this.discord.createOrFetchWebhook(parentChannelId).pipe(
-            Effect.mapError((e) => new Error(`Discord webhook error: ${String(e)}`)),
-          );
+        : yield* this.discord
+            .createOrFetchWebhook(parentChannelId)
+            .pipe(Effect.mapError((e) => new Error(`Discord webhook error: ${String(e)}`)));
 
       yield* Effect.tryPromise({
         try: () =>
@@ -693,9 +697,7 @@ export class DiscordRoomService {
   /**
    * Load session state by ID (used by deferred start handler in index.ts).
    */
-  loadSession(
-    sessionId: string,
-  ): Effect.Effect<RoomCreateState | null, Error, never> {
+  loadSession(sessionId: string): Effect.Effect<RoomCreateState | null, Error, never> {
     return Effect.gen(this, function* () {
       const session = yield* Effect.tryPromise({
         try: () =>

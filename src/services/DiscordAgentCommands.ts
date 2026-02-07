@@ -244,9 +244,7 @@ function buildConfigMessage(
 
   // Row 4 (conditional): Thinking budget tokens — Anthropic only
   if (isAnthropic) {
-    const budgetValue = state.thinkingBudgetTokens
-      ? String(state.thinkingBudgetTokens)
-      : "default";
+    const budgetValue = state.thinkingBudgetTokens ? String(state.thinkingBudgetTokens) : "default";
     const budgetOpts = THINKING_BUDGET_OPTIONS.map((b) => ({
       ...b,
       default: b.value === budgetValue,
@@ -438,8 +436,7 @@ export class DiscordAgentService {
       // Cancel — just delete session and acknowledge
       if (action === "cancel") {
         yield* Effect.tryPromise({
-          try: () =>
-            this.db.delete(commandSessions).where(eq(commandSessions.id, sessionId)).run(),
+          try: () => this.db.delete(commandSessions).where(eq(commandSessions.id, sessionId)).run(),
           catch: () => new Error("ignored"),
         }).pipe(Effect.catchAll(() => Effect.void));
 

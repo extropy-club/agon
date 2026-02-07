@@ -32,6 +32,7 @@
     "@effect/ai-google": "^0.12.0",
     "@effect/ai-openai": "^0.37.0",
     "@effect/platform": "^0.94.1",
+    "agents": "^0.3.10",
     "discord-api-types": "^0.37.100",
     "drizzle-orm": "^0.38.0",
     "effect": "^3.19.14"

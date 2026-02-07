@@ -1,8 +1,10 @@
 import { and, asc, desc, eq, inArray, or, sql } from "drizzle-orm";
-import * as ConfigProvider from "effect/ConfigProvider";
-import { Config, Effect, Layer, Option, Redacted, Schema } from "effect";
-import * as ManagedRuntime from "effect/ManagedRuntime";
+import { Config, Effect, Option, Redacted, Schema } from "effect";
 import { Db, nowMs } from "./d1/db.js";
+import { makeRuntime } from "./runtime.js";
+
+export { TurnAgent } from "./do/TurnAgent.js";
+export { TurnWorkflow } from "./do/TurnWorkflow.js";
 import {
   agents,
   discordChannels,
@@ -25,7 +27,6 @@ import {
   type DiscordAutoArchiveDurationMinutes,
   verifyDiscordInteraction,
 } from "./services/Discord.js";
-import { DiscordWebhookPoster } from "./services/DiscordWebhook.js";
 import type { DrizzleD1Database } from "drizzle-orm/d1";
 import {
   DiscordAgentService,
@@ -40,8 +41,6 @@ import {
   RoomComponentSchema,
   editOriginalResponse,
 } from "./services/DiscordRoomCommands.js";
-import { LlmRouterLive } from "./services/LlmRouter.js";
-import { Observability } from "./services/Observability.js";
 import { Settings } from "./services/Settings.js";
 import { TurnEventService } from "./services/TurnEventService.js";
 import { decrypt } from "./lib/crypto.js";
@@ -91,6 +90,10 @@ export interface Env {
   GITHUB_CLIENT_ID?: string;
   GITHUB_CLIENT_SECRET?: string;
   JWT_SECRET?: string;
+
+  // Cloudflare Agents SDK
+  TURN_AGENT: DurableObjectNamespace;
+  TURN_WORKFLOW: Workflow;
 
   // Cloudflare Workers static assets binding (admin UI)
   ASSETS?: Fetcher;
@@ -151,79 +154,6 @@ const redirect = (location: string, cookies: string[] = []) => {
   const headers = new Headers({ Location: location });
   for (const c of cookies) headers.append("Set-Cookie", c);
   return new Response(null, { status: 302, headers });
-};
-
-const makeConfigLayer = (env: Env) => {
-  const map = new Map<string, string>();
-
-  // Wrangler env vars
-  for (const [k, v] of Object.entries(env)) {
-    if (typeof v === "string") map.set(k, v);
-  }
-
-  // IMPORTANT: secrets can be defined as non-enumerable properties on `env`,
-  // so `Object.entries(env)` may miss them. We explicitly copy the ones we use.
-  const secretKeys = [
-    "ENCRYPTION_KEY",
-    "ADMIN_TOKEN",
-    "GITHUB_CLIENT_ID",
-    "GITHUB_CLIENT_SECRET",
-    "JWT_SECRET",
-    "DISCORD_PUBLIC_KEY",
-    "DISCORD_BOT_TOKEN",
-    "DISCORD_BOT_USER_ID",
-    "OPENAI_API_KEY",
-    "OPENROUTER_API_KEY",
-    "OPENROUTER_HTTP_REFERER",
-    "OPENROUTER_TITLE",
-    "ANTHROPIC_API_KEY",
-    "GOOGLE_AI_API_KEY",
-    "LOG_LEVEL",
-    "LOG_FORMAT",
-    "LLM_PROVIDER",
-    "LLM_MODEL",
-    "ARENA_MAX_TURNS",
-    "ARENA_HISTORY_LIMIT",
-    "CF_ACCOUNT_ID",
-    "CF_WORKER_SERVICE",
-    "CF_QUEUE_NAME",
-    "CF_D1_NAME",
-  ] as const satisfies ReadonlyArray<keyof Env>;
-
-  for (const k of secretKeys) {
-    const v = env[k];
-    if (typeof v === "string") map.set(k, v);
-  }
-
-  return Layer.setConfigProvider(ConfigProvider.fromMap(map));
-};
-
-const makeRuntime = (env: Env) => {
-  const dbLayer = Db.layer(env.DB);
-  const settingsLayer = Settings.layer.pipe(Layer.provide(dbLayer));
-
-  const llmRouterLayer = LlmRouterLive.pipe(Layer.provide(settingsLayer));
-  const discordLayer = Discord.layer.pipe(Layer.provide(settingsLayer));
-  const modelsDevLayer = ModelsDev.layer;
-
-  const infraLayer = Layer.mergeAll(
-    dbLayer,
-    settingsLayer,
-    Observability.layer,
-    DiscordWebhookPoster.layer,
-    llmRouterLayer,
-    discordLayer,
-    TurnEventService.layer.pipe(Layer.provide(dbLayer)),
-    modelsDevLayer,
-  );
-
-  const arenaLayer = ArenaService.layer.pipe(Layer.provide(infraLayer));
-
-  const appLayer = Layer.mergeAll(infraLayer, arenaLayer).pipe(
-    Layer.provideMerge(makeConfigLayer(env)),
-  );
-
-  return ManagedRuntime.make(appLayer);
 };
 
 export class RequestJsonParseError extends Schema.TaggedError<RequestJsonParseError>()(
@@ -1750,9 +1680,8 @@ export default {
         }
 
         // Room creation components
-        const roomComponentResult = Schema.decodeUnknownOption(RoomComponentSchema)(
-          interactionUnknown,
-        );
+        const roomComponentResult =
+          Schema.decodeUnknownOption(RoomComponentSchema)(interactionUnknown);
         if (
           roomComponentResult._tag === "Some" &&
           DiscordRoomService.isRoomCreateComponent(interactionUnknown)

@@ -38,3 +38,16 @@ port = 8787
 [assets]
 directory = "./packages/admin/dist"
 binding = "ASSETS"
+
+[[durable_objects.bindings]]
+name = "TURN_AGENT"
+class_name = "TurnAgent"
+
+[[workflows]]
+name = "turn-workflow"
+binding = "TURN_WORKFLOW"
+class_name = "TurnWorkflow"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["TurnAgent"]
