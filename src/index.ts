@@ -2495,18 +2495,25 @@ export default {
                 Effect.withLogSpan("queue.audience_slot.close"),
               )
             : Effect.gen(function* () {
-                yield* Effect.logInfo("queue.turn");
-                const arena = yield* ArenaService;
-                const next = yield* arena.processTurn(job as TurnJob);
-                if (next) {
-                  yield* Effect.logInfo("queue.turn.next").pipe(
-                    Effect.annotateLogs({
-                      nextTurnNumber: next.turnNumber,
-                      nextJobType: next.type,
-                    }),
-                  );
-                }
-                return next;
+                // For 'turn' jobs: dispatch to TurnAgent DO (async durable workflow)
+                yield* Effect.logInfo("queue.turn.dispatch");
+
+                yield* Effect.tryPromise({
+                  try: async () => {
+                    const id = env.TURN_AGENT.idFromName(`room-${job.roomId}`);
+                    const stub = env.TURN_AGENT.get(id) as unknown as {
+                      startTurn: (params: {
+                        readonly roomId: number;
+                        readonly turnNumber: number;
+                      }) => Promise<string>;
+                    };
+
+                    await stub.startTurn({ roomId: job.roomId, turnNumber: job.turnNumber });
+                  },
+                  catch: (cause) => RoomDbError.make({ cause }),
+                });
+
+                return null;
               }).pipe(Effect.annotateLogs(annotations), Effect.withLogSpan("queue.turn"));
 
         const next = await runtime.runPromise(program);

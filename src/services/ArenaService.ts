@@ -58,13 +58,13 @@ export type ArenaError =
   | MissingDiscordConfig
   | DiscordWebhookPostFailed;
 
-const dbTry = <A>(thunk: () => Promise<A>) =>
+export const dbTry = <A>(thunk: () => Promise<A>) =>
   Effect.tryPromise({
     try: thunk,
     catch: (cause) => RoomDbError.make({ cause }),
   });
 
-const errorLabel = (e: unknown): string => {
+export const errorLabel = (e: unknown): string => {
   if (typeof e === "object" && e !== null && "_tag" in e) {
     const t = (e as { readonly _tag?: unknown })._tag;
     if (typeof t === "string") return t;
@@ -73,7 +73,7 @@ const errorLabel = (e: unknown): string => {
 };
 
 /** Stringify a cause value, handling nested Error objects and Effect failures. */
-const stringifyCause = (c: unknown): string => {
+export const stringifyCause = (c: unknown): string => {
   if (c instanceof Error) {
     const base = `${c.name}: ${c.message}`;
     return c.cause ? `${base} [caused by: ${stringifyCause(c.cause)}]` : base;
@@ -99,7 +99,7 @@ const stringifyCause = (c: unknown): string => {
 };
 
 /** Richer error serialization for turn event data — captures cause, status, message, etc. */
-const errorDetail = (e: unknown): Record<string, unknown> => {
+export const errorDetail = (e: unknown): Record<string, unknown> => {
   const detail: Record<string, unknown> = { _tag: errorLabel(e) };
   if (typeof e !== "object" || e === null) {
     detail.value = String(e);
@@ -122,7 +122,7 @@ const messageXmlWrapperRe = /^\s*<message[^>]*>([\s\S]*)<\/message>\s*$/;
  * Safety-net: unwrap accidental <message ...>...</message> wrappers from model output.
  * Applied repeatedly to handle nested wrappers.
  */
-const stripMessageXml = (text: string): string => {
+export const stripMessageXml = (text: string): string => {
   let out = text;
   for (let i = 0; i < 10; i++) {
     const m = messageXmlWrapperRe.exec(out);
@@ -132,9 +132,9 @@ const stripMessageXml = (text: string): string => {
   return out;
 };
 
-const turnFailedNotification = "⚠️ Turn failed — skipping to next agent.";
+export const turnFailedNotification = "⚠️ Turn failed — skipping to next agent.";
 
-const isRetryableDiscordError = (e: DiscordError): boolean => {
+export const isRetryableDiscordError = (e: DiscordError): boolean => {
   switch (e._tag) {
     case "MissingDiscordConfig":
       return false;
@@ -145,13 +145,13 @@ const isRetryableDiscordError = (e: DiscordError): boolean => {
   }
 };
 
-const discordRetryAfterMs = (e: DiscordError): number | undefined =>
+export const discordRetryAfterMs = (e: DiscordError): number | undefined =>
   e._tag === "DiscordRateLimited" ? e.retryAfterMs : undefined;
 
-const isRetryableDiscordWebhookError = (e: DiscordWebhookPostFailed): boolean =>
+export const isRetryableDiscordWebhookError = (e: DiscordWebhookPostFailed): boolean =>
   e.status === 0 || e.status === 429 || e.status >= 500;
 
-const isRetryableLlmError = (e: LlmRouterError): boolean => {
+export const isRetryableLlmError = (e: LlmRouterError): boolean => {
   switch (e._tag) {
     case "MissingLlmApiKey":
       return false;
@@ -233,10 +233,10 @@ const defaultAgents: ReadonlyArray<{
   },
 ];
 
-const formatModeratorMessage = (args: { title: string; topic: string }) =>
+export const formatModeratorMessage = (args: { title: string; topic: string }) =>
   `📢 **${args.title}**\n\n${args.topic}\n\n**Rules:**\n- Stay on topic\n- No meta talk about being an AI\n- Aim for 5-10 sentences\n\nDebate begins now!`;
 
-const isModeratorMessage = (content: string) =>
+export const isModeratorMessage = (content: string) =>
   content.startsWith("📢 **") &&
   content.includes("**Rules:**") &&
   content.includes("Debate begins now!");

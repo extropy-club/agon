@@ -4,7 +4,6 @@ import type { Env } from "../index.js";
 
 export type TurnParams = {
   readonly roomId: number;
-  readonly agentId: number;
   readonly turnNumber: number;
 };
 
@@ -19,6 +18,7 @@ export class TurnAgent extends Agent<Env> {
   }
 
   async startTurn(params: TurnParams): Promise<string> {
-    return this.runWorkflow("TURN_WORKFLOW", params);
+    const workflowId = `turn-${params.roomId}-${params.turnNumber}`;
+    return this.runWorkflow("TURN_WORKFLOW", params, { id: workflowId });
   }
 }
