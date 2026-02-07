@@ -449,14 +449,21 @@ export class DiscordAgentService {
         });
       }
 
-      // Load session
+      // Load session (enforce expiry)
       const session = yield* Effect.tryPromise({
         try: () =>
           this.db.select().from(commandSessions).where(eq(commandSessions.id, sessionId)).get(),
         catch: (e) => new Error(`Failed to load session: ${e}`),
       });
 
-      if (!session) {
+      if (!session || session.expiresAtMs < Date.now()) {
+        if (session) {
+          yield* Effect.tryPromise({
+            try: () =>
+              this.db.delete(commandSessions).where(eq(commandSessions.id, sessionId)).run(),
+            catch: () => new Error("ignored"),
+          }).pipe(Effect.catchAll(() => Effect.void));
+        }
         return ephemeralError("Session expired. Please start over with `/agon agent create`.");
       }
 
@@ -486,7 +493,10 @@ export class DiscordAgentService {
         else state.thinkingLevel = value;
       } else if (action === "budget" && value) {
         if (value === "default") delete state.thinkingBudgetTokens;
-        else state.thinkingBudgetTokens = Number(value);
+        else {
+          const n = Number(value);
+          if (Number.isFinite(n) && n > 0) state.thinkingBudgetTokens = n;
+        }
       } else if (action === "save") {
         return yield* this.saveAgent(sessionId, state);
       }

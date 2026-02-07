@@ -23,10 +23,16 @@ const PROVIDER_MAP: Record<string, string> = {
   gemini: "google",
 };
 
-/** Keep only chat-capable models. Filters out embeddings, codex, previews, dated snapshots, etc. */
+/**
+ * Keep only chat-capable models. Filters out embeddings, codex, previews, etc.
+ *
+ * Treats missing `tool_call` as "unknown" (allow) — only explicitly `false` is rejected.
+ * This avoids dropping everything if models.dev changes the schema.
+ */
 const isChatModel = (id: string, m: Record<string, unknown>): boolean => {
-  // Must support tool calling (rules out embeddings, TTS, image-gen)
-  if (m.tool_call !== true) return false;
+  // Explicitly false → not a chat model (embeddings, TTS, image-gen)
+  // Missing or unknown → allow (defensive against API schema changes)
+  if (m.tool_call === false) return false;
 
   // Name-based exclusions
   if (id.includes("embedding")) return false;
@@ -39,9 +45,6 @@ const isChatModel = (id: string, m: Record<string, unknown>): boolean => {
   if (/\d{4}-\d{2}-\d{2}/.test(id)) return false;
   if (/-\d{8}$/.test(id)) return false;
 
-  // Skip -latest / -chat-latest aliases (redundant with the canonical id)
-  if (id.endsWith("-latest") || id.endsWith("-chat-latest")) return false;
-
   return true;
 };
 
@@ -52,13 +55,11 @@ const FALLBACK_MODELS: ReadonlyArray<ModelInfo> = [
   { id: "gpt-4.1-mini", name: "GPT-4.1 mini", provider: "openai" },
   { id: "gpt-4.1-nano", name: "GPT-4.1 nano", provider: "openai" },
   { id: "o3-mini", name: "o3 Mini", provider: "openai" },
-  { id: "gpt-4o-mini", name: "GPT-4o mini", provider: "openai" },
   // Anthropic
   { id: "claude-opus-4-0", name: "Claude Opus 4", provider: "anthropic" },
   { id: "claude-sonnet-4-0", name: "Claude Sonnet 4", provider: "anthropic" },
+  { id: "claude-sonnet-4-5", name: "Claude Sonnet 4.5", provider: "anthropic" },
   { id: "claude-haiku-4-5", name: "Claude Haiku 4.5", provider: "anthropic" },
-  { id: "claude-3-7-sonnet-latest", name: "Claude Sonnet 3.7", provider: "anthropic" },
-  { id: "claude-3-5-haiku-latest", name: "Claude Haiku 3.5", provider: "anthropic" },
   // Gemini
   { id: "gemini-2.5-flash", name: "Gemini 2.5 Flash", provider: "gemini" },
   { id: "gemini-2.5-pro", name: "Gemini 2.5 Pro", provider: "gemini" },
@@ -152,6 +153,23 @@ export class ModelsDev extends Context.Tag("@agon/ModelsDev")<
                   name: `${name} (OR)`,
                   provider: "openrouter",
                 });
+              }
+            }
+
+            // If filtering was too aggressive and a provider got zero results,
+            // fall back to FALLBACK_MODELS for that provider.
+            for (const ourProvider of Object.keys(PROVIDER_MAP)) {
+              const hasModels = result.some((m) => m.provider === ourProvider);
+              if (!hasModels) {
+                for (const fb of FALLBACK_MODELS) {
+                  if (fb.provider === ourProvider) result.push({ ...fb });
+                }
+              }
+            }
+            // Same for OpenRouter
+            if (!result.some((m) => m.provider === "openrouter")) {
+              for (const fb of FALLBACK_MODELS) {
+                if (fb.provider === "openrouter") result.push({ ...fb });
               }
             }
 

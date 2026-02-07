@@ -156,19 +156,24 @@ export const editOriginalResponse = (
   content: string,
 ): Effect.Effect<void, never, never> =>
   Effect.tryPromise({
-    try: () =>
-      fetch(
+    try: async () => {
+      const res = await fetch(
         `${DISCORD_API}/webhooks/${applicationId}/${interactionToken}/messages/@original`,
         {
           method: "PATCH",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ content, components: [] }),
         },
-      ),
-    catch: () => new Error("Failed to edit interaction response"),
+      );
+      if (!res.ok) {
+        const body = await res.text().catch(() => "<no body>");
+        throw new Error(`Discord PATCH failed (${res.status}): ${body}`);
+      }
+    },
+    catch: (e) => new Error(String(e)),
   }).pipe(
     Effect.catchAll((e) =>
-      Effect.logWarning("discord.edit_original_response.failed").pipe(
+      Effect.logError("discord.edit_original_response.failed").pipe(
         Effect.annotateLogs({ error: String(e) }),
         Effect.asVoid,
       ),
@@ -475,14 +480,22 @@ export class DiscordRoomService {
         );
       }
 
-      // Load session
+      // Load session (enforce expiry)
       const session = yield* Effect.tryPromise({
         try: () =>
           this.db.select().from(commandSessions).where(eq(commandSessions.id, sessionId)).get(),
         catch: (e) => new Error(`Failed to load session: ${e}`),
       });
 
-      if (!session) {
+      if (!session || session.expiresAtMs < Date.now()) {
+        // Clean up expired session if it exists
+        if (session) {
+          yield* Effect.tryPromise({
+            try: () =>
+              this.db.delete(commandSessions).where(eq(commandSessions.id, sessionId)).run(),
+            catch: () => new Error("ignored"),
+          }).pipe(Effect.catchAll(() => Effect.void));
+        }
         return result(
           ephemeralError("Session expired. Please start over with `/agon room create`."),
         );
@@ -500,12 +513,22 @@ export class DiscordRoomService {
       if (action === "agents" && values && values.length > 0) {
         state.agentIds = [...values];
       } else if (action === "maxturns" && values?.[0]) {
-        state.maxTurns = Number(values[0]);
+        const n = Number(values[0]);
+        if (Number.isFinite(n) && n > 0) state.maxTurns = n;
       } else if (action === "audience" && values?.[0]) {
-        state.audienceSlotDurationSeconds = Number(values[0]);
+        const n = Number(values[0]);
+        if (Number.isFinite(n) && n >= 0) state.audienceSlotDurationSeconds = n;
       } else if (action === "archive" && values?.[0]) {
-        state.autoArchiveDurationMinutes = Number(values[0]);
+        const n = Number(values[0]);
+        if (Number.isFinite(n) && n > 0) state.autoArchiveDurationMinutes = n;
       } else if (action === "start") {
+        // Delete session immediately to prevent double-start race
+        yield* Effect.tryPromise({
+          try: () =>
+            this.db.delete(commandSessions).where(eq(commandSessions.id, sessionId)).run(),
+          catch: () => new Error("ignored"),
+        }).pipe(Effect.catchAll(() => Effect.void));
+
         // Return type 6 (DEFERRED_UPDATE_MESSAGE) immediately.
         // Actual room creation is handled by index.ts via deferredStart.
         return {
@@ -647,7 +670,7 @@ export class DiscordRoomService {
         })
         .pipe(Effect.mapError((e) => new Error(`Arena error: ${String(e)}`)));
 
-      // Clean up session
+      // Clean up session (best-effort; may already be deleted by the deferred handler)
       yield* Effect.tryPromise({
         try: () => this.db.delete(commandSessions).where(eq(commandSessions.id, sessionId)).run(),
         catch: () => new Error("ignored"),
