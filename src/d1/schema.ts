@@ -36,6 +36,10 @@ export const rooms = sqliteTable("rooms", {
   currentTurnAgentId: text("current_turn_agent_id").notNull(),
   currentTurnNumber: integer("current_turn_number").notNull().default(0),
   lastEnqueuedTurnNumber: integer("last_enqueued_turn_number").notNull().default(0),
+
+  // Room summary (generated periodically for long threads)
+  summaryMd: text("summary_md"),
+  summaryUpdatedAtMs: integer("summary_updated_at_ms"),
 });
 
 export const roomAgents = sqliteTable("room_agents", {
@@ -81,6 +85,21 @@ export const messages = sqliteTable("messages", {
   /** Completion tokens (when available). */
   outputTokens: integer("output_tokens"),
   // store unix epoch millis
+  createdAtMs: integer("created_at_ms").notNull(),
+});
+
+export const memories = sqliteTable("memories", {
+  id: text("id").primaryKey(), // UUID
+  agentId: text("agent_id")
+    .notNull()
+    .references(() => agents.id, { onDelete: "cascade" }),
+  roomId: integer("room_id")
+    .notNull()
+    .references(() => rooms.id, { onDelete: "cascade" }),
+  content: text("content").notNull(),
+  createdBy: text("created_by", { enum: ["agent", "auto"] })
+    .notNull()
+    .default("agent"),
   createdAtMs: integer("created_at_ms").notNull(),
 });
 
