@@ -38,6 +38,7 @@ import {
   DiscordRoomService,
   RoomModalSubmitSchema,
   RoomComponentSchema,
+  editOriginalResponse,
 } from "./services/DiscordRoomCommands.js";
 import { LlmRouterLive } from "./services/LlmRouter.js";
 import { Observability } from "./services/Observability.js";
@@ -1777,9 +1778,55 @@ export default {
               ),
             ),
           );
+
+          // Synchronous enqueue (for non-deferred interactions)
           if ("enqueue" in roomResult && roomResult.enqueue) {
             ctx.waitUntil(env.ARENA_QUEUE.send(roomResult.enqueue));
           }
+
+          // Deferred start: room creation runs in background, patches message when done
+          if ("deferredStart" in roomResult && roomResult.deferredStart) {
+            const ds = roomResult.deferredStart;
+            const backgroundWork = runtime.runPromise(
+              Effect.gen(function* () {
+                const { db } = yield* Db;
+                const discord = yield* Discord;
+                const arena = yield* ArenaService;
+                const roomService = new DiscordRoomService(db, discord, arena);
+
+                const { content, firstJob } = yield* roomService
+                  .executeStart(ds.sessionId, ds.state)
+                  .pipe(
+                    Effect.catchAll((e) =>
+                      editOriginalResponse(
+                        ds.applicationId,
+                        ds.interactionToken,
+                        `❌ Failed to create room: ${e instanceof Error ? e.message : String(e)}`,
+                      ).pipe(Effect.flatMap(() => Effect.fail(e))),
+                    ),
+                  );
+
+                yield* editOriginalResponse(ds.applicationId, ds.interactionToken, content);
+                yield* Effect.tryPromise({
+                  try: () => env.ARENA_QUEUE.send(firstJob),
+                  catch: () => new Error("Queue send failed"),
+                }).pipe(Effect.catchAll(() => Effect.void));
+              }).pipe(
+                Effect.catchAll((e) =>
+                  Effect.logError("discord.room.deferred_start.failed").pipe(
+                    Effect.annotateLogs({
+                      requestId,
+                      sessionId: ds.sessionId,
+                      error: String(e),
+                    }),
+                    Effect.asVoid,
+                  ),
+                ),
+              ),
+            );
+            ctx.waitUntil(backgroundWork);
+          }
+
           return roomResult.response;
         }
 

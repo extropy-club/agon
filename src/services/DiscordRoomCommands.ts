@@ -61,6 +61,8 @@ export type RoomModalSubmit = typeof RoomModalSubmitSchema.Type;
 export const RoomComponentSchema = Schema.Struct({
   id: Schema.String,
   type: Schema.Literal(3),
+  token: Schema.String,
+  application_id: Schema.String,
   channel_id: Schema.String,
   member: Schema.Struct({
     user: Schema.Struct({
@@ -96,6 +98,13 @@ export type RoomCreateState = {
 export type RoomInteractionResult = {
   readonly response: Response;
   readonly enqueue?: TurnJob | undefined;
+  /** Deferred start — index.ts runs this in background and patches the message. */
+  readonly deferredStart?: {
+    readonly applicationId: string;
+    readonly interactionToken: string;
+    readonly sessionId: string;
+    readonly state: RoomCreateState;
+  } | undefined;
 };
 
 const SESSION_EXPIRY_MS = 30 * 60 * 1000;
@@ -132,11 +141,40 @@ const AUTO_ARCHIVE_OPTIONS = [
 // Helpers
 // ---------------------------------------------------------------------------
 
+const DISCORD_API = "https://discord.com/api/v10";
+
 const jsonResponse = (body: unknown) =>
   new Response(JSON.stringify(body), {
     status: 200,
     headers: { "Content-Type": "application/json" },
   });
+
+/** Edit the original interaction response (for deferred interactions). */
+export const editOriginalResponse = (
+  applicationId: string,
+  interactionToken: string,
+  content: string,
+): Effect.Effect<void, never, never> =>
+  Effect.tryPromise({
+    try: () =>
+      fetch(
+        `${DISCORD_API}/webhooks/${applicationId}/${interactionToken}/messages/@original`,
+        {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ content, components: [] }),
+        },
+      ),
+    catch: () => new Error("Failed to edit interaction response"),
+  }).pipe(
+    Effect.catchAll((e) =>
+      Effect.logWarning("discord.edit_original_response.failed").pipe(
+        Effect.annotateLogs({ error: String(e) }),
+        Effect.asVoid,
+      ),
+    ),
+    Effect.asVoid,
+  );
 
 const ephemeralMessage = (content: string) =>
   jsonResponse({ type: 4, data: { content, flags: 64 } });
@@ -468,7 +506,17 @@ export class DiscordRoomService {
       } else if (action === "archive" && values?.[0]) {
         state.autoArchiveDurationMinutes = Number(values[0]);
       } else if (action === "start") {
-        return yield* this.startRoom(sessionId, state);
+        // Return type 6 (DEFERRED_UPDATE_MESSAGE) immediately.
+        // Actual room creation is handled by index.ts via deferredStart.
+        return {
+          response: jsonResponse({ type: 6 }),
+          deferredStart: {
+            applicationId: interaction.application_id,
+            interactionToken: interaction.token,
+            sessionId,
+            state,
+          },
+        };
       }
 
       // Persist state
@@ -512,14 +560,18 @@ export class DiscordRoomService {
     );
   }
 
-  private startRoom(
+  /**
+   * Execute room creation (webhook + thread + DB + arena).
+   * Returns success message and first turn job to enqueue.
+   */
+  executeStart(
     sessionId: string,
     state: RoomCreateState,
-  ): Effect.Effect<RoomInteractionResult, Error, never> {
+  ): Effect.Effect<{ content: string; firstJob: TurnJob }, Error, never> {
     return Effect.gen(this, function* () {
       const agentIds = state.agentIds;
       if (!agentIds || agentIds.length < 2) {
-        return result(ephemeralError("Select at least 2 agents."));
+        return yield* Effect.fail(new Error("Select at least 2 agents."));
       }
 
       const parentChannelId = state.parentChannelId;
@@ -611,13 +663,30 @@ export class DiscordRoomService {
         `**Audience slot:** ${state.audienceSlotDurationSeconds ?? 30}s`,
       ];
 
-      return result(
-        jsonResponse({
-          type: 7,
-          data: { content: lines.join("\n"), components: [], flags: 64 },
-        }),
-        roomResult.firstJob,
-      );
+      return { content: lines.join("\n"), firstJob: roomResult.firstJob };
+    });
+  }
+
+  /**
+   * Load session state by ID (used by deferred start handler in index.ts).
+   */
+  loadSession(
+    sessionId: string,
+  ): Effect.Effect<RoomCreateState | null, Error, never> {
+    return Effect.gen(this, function* () {
+      const session = yield* Effect.tryPromise({
+        try: () =>
+          this.db.select().from(commandSessions).where(eq(commandSessions.id, sessionId)).get(),
+        catch: (e) => new Error(`Failed to load session: ${e}`),
+      });
+
+      if (!session) return null;
+
+      try {
+        return JSON.parse(session.stateJson as string) as RoomCreateState;
+      } catch {
+        return null;
+      }
     });
   }
 }
