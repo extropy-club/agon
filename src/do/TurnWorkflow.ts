@@ -5,6 +5,7 @@ import {
   type DefaultProgress,
 } from "agents/workflows";
 import { and, asc, desc, eq, lt, or, sql } from "drizzle-orm";
+import type * as Prompt from "@effect/ai/Prompt";
 import { Config, Effect, Either } from "effect";
 import { Db, nowMs } from "../d1/db.js";
 import { agents, discordChannels, messages, roomAgents, rooms } from "../d1/schema.js";
@@ -31,6 +32,7 @@ import {
 import { Discord } from "../services/Discord.js";
 import { DiscordWebhookPoster } from "../services/DiscordWebhook.js";
 import { LlmRouter } from "../services/LlmRouter.js";
+import { MemoryService } from "../services/MemoryService.js";
 import { TurnEventService } from "../services/TurnEventService.js";
 import type { Env } from "../index.js";
 import { TurnAgent, type TurnParams } from "./TurnAgent.js";
@@ -448,214 +450,530 @@ export class TurnWorkflow extends AgentWorkflow<TurnAgent, TurnParams, DefaultPr
       () => false,
     );
 
-    const llmResult = await stepEffect(
-      runtime,
-      step,
-      "llm-call",
-      LLM_STEP_CONFIG,
-      Effect.gen(function* () {
-        const { db } = yield* Db;
-        const llmRouter = yield* LlmRouter;
-        const discord = yield* Discord;
-        const turnEvents = yield* TurnEventService;
-
-        if (ctx.existingReply) {
-          const reply = stripMessageXml(ctx.existingReply.content);
-          const out: LlmOkResult = {
-            ok: true,
-            source: "existing",
-            reply,
-            replyCreatedAtMs: ctx.existingReply.createdAtMs,
-            thinkingText: ctx.existingReply.thinkingText,
-            inputTokens: ctx.existingReply.inputTokens,
-            outputTokens: ctx.existingReply.outputTokens,
-            isAgentExit: false,
-            exitSummary: null,
-          };
-          return out;
-        }
-
-        // bounded history (timestamp-based due to sync inserts)
-        const rawHistoryLimit = Math.max(ctx.historyLimit * 3, 60);
-        const rawHistory = yield* dbTry(() =>
-          db
-            .select()
-            .from(messages)
-            .where(eq(messages.roomId, ctx.room.id))
-            .orderBy(desc(messages.createdAtMs), desc(messages.id))
-            .limit(rawHistoryLimit)
-            .all(),
-        );
-
-        const nonLocalAgentMessages = rawHistory.filter(
-          (m) => m.authorType === "agent" && !m.discordMessageId.startsWith("local-turn:"),
-        );
-
-        const localTurnDedupeWindowMs = 30 * 60 * 1000;
-        const localTurnDedupeAllowEarlyMs = 30 * 1000;
-
-        const promptHistory = rawHistory
-          .slice()
-          .reverse()
-          .filter((m) => m.authorType !== "notification")
-          .filter((m) => {
-            if (m.authorType !== "agent") return true;
-            if (!m.discordMessageId.startsWith("local-turn:")) return true;
-
-            const isDuplicate = nonLocalAgentMessages.some((x) => {
-              if (x.content !== m.content) return false;
-              const dt = x.createdAtMs - m.createdAtMs;
-              if (dt < -localTurnDedupeAllowEarlyMs) return false;
-              if (dt > localTurnDedupeWindowMs) return false;
-              if (m.authorAgentId && x.authorAgentId && x.authorAgentId !== m.authorAgentId) {
-                return false;
-              }
-              return true;
-            });
-
-            return !isDuplicate;
-          })
-          .slice(-ctx.historyLimit);
-
-        const agentNameById = new Map(
-          (yield* dbTry(() =>
-            db.select({ id: agents.id, name: agents.name }).from(agents).all(),
-          )).map((a) => [a.id, a.name] as const),
-        );
-
-        const getAgentName = (agentId: string | null | undefined): string =>
-          (agentId ? agentNameById.get(agentId) : undefined) ?? "Unknown";
-
-        const getNonAgentName = (
-          m: { readonly authorType: string } & Record<string, unknown>,
-        ): string => {
-          const explicit = m["authorName"];
-          if (typeof explicit === "string" && explicit.trim().length > 0) return explicit;
-          if (m.authorType === "audience") return "Audience";
-          if (m.authorType === "moderator") return "Moderator";
-          return "Unknown";
+    const normalizePromptMessages = (prompt: Prompt.RawInput): Array<Prompt.MessageEncoded> => {
+      if (typeof prompt === "string") {
+        const msg: Prompt.UserMessageEncoded = {
+          role: "user",
+          content: [{ type: "text", text: prompt }],
         };
+        return [msg];
+      }
 
-        const prompt = buildPrompt(
-          { title: ctx.room.title, topic: ctx.room.topic },
-          { id: ctx.agent.id, name: ctx.agent.name, systemPrompt: ctx.agent.systemPrompt },
-          promptHistory.map((m) => ({
-            authorType: m.authorType,
-            authorName:
-              m.authorType === "agent" ? getAgentName(m.authorAgentId) : getNonAgentName(m),
-            content: m.content,
-          })),
-        );
+      const items: Iterable<Prompt.MessageEncoded> =
+        (prompt as { content?: ReadonlyArray<Prompt.MessageEncoded> }).content ??
+        (prompt as Iterable<Prompt.MessageEncoded>);
 
-        yield* turnEvents.write({
-          roomId: ctx.room.id,
-          turnNumber: params.turnNumber,
-          phase: "llm_start",
-          status: "info",
-          data: { llmProvider: ctx.agent.llmProvider, llmModel: ctx.agent.llmModel },
-        });
+      return Array.from(items);
+    };
 
-        const llmEither = yield* retryWithBackoff(
-          llmRouter.generate({
-            provider: ctx.agent.llmProvider,
-            model: ctx.agent.llmModel,
-            prompt,
-            ...(ctx.agent.temperature ? { temperature: parseFloat(ctx.agent.temperature) } : {}),
-            ...(ctx.agent.maxTokens != null ? { maxTokens: ctx.agent.maxTokens } : {}),
-            ...(ctx.agent.thinkingLevel != null ? { thinkingLevel: ctx.agent.thinkingLevel } : {}),
-            ...(ctx.agent.thinkingBudgetTokens != null
-              ? { thinkingBudgetTokens: ctx.agent.thinkingBudgetTokens }
-              : {}),
-          }),
-          { maxRetries: 3, isRetryable: isRetryableLlmError },
-        ).pipe(Effect.withLogSpan("llm.generate"), Effect.either);
+    const makeAssistantToolCallMessage = (args: {
+      readonly text: string;
+      readonly toolCalls: ReadonlyArray<{
+        readonly id: string;
+        readonly name: string;
+        readonly arguments: Record<string, unknown>;
+      }>;
+    }): Prompt.AssistantMessageEncoded => {
+      const text = args.text.trim();
 
-        if (Either.isLeft(llmEither)) {
-          const e = llmEither.left;
+      return {
+        role: "assistant",
+        content: [
+          ...(text.length > 0
+            ? ([{ type: "text", text }] satisfies Array<Prompt.TextPartEncoded>)
+            : []),
+          ...args.toolCalls.map(
+            (c) =>
+              ({
+                type: "tool-call",
+                id: c.id,
+                name: c.name,
+                params: c.arguments,
+                providerExecuted: false,
+              }) satisfies Prompt.ToolCallPartEncoded,
+          ),
+        ],
+      };
+    };
 
+    const makeToolResultsMessage = (
+      results: ReadonlyArray<{
+        readonly toolCallId: string;
+        readonly name: string;
+        readonly result: unknown;
+      }>,
+    ): Prompt.ToolMessageEncoded => ({
+      role: "tool",
+      content: results.map(
+        (r) =>
+          ({
+            type: "tool-result",
+            id: r.toolCallId,
+            name: r.name,
+            isFailure: false,
+            result: r.result,
+            providerExecuted: false,
+          }) satisfies Prompt.ToolResultPartEncoded,
+      ),
+    });
+
+    const executeToolCall = (
+      toolCall: {
+        readonly id: string;
+        readonly name: string;
+        readonly arguments: Record<string, unknown>;
+      },
+      agentId: string,
+      roomId: number,
+    ) =>
+      Effect.gen(function* () {
+        const memoryService = yield* MemoryService;
+        const name = toolCall.name;
+        const args = toolCall.arguments;
+
+        switch (name) {
+          case "memory_add": {
+            const memoriesRaw = args["memories"];
+            const memories = Array.isArray(memoriesRaw)
+              ? memoriesRaw
+                  .map((m) => {
+                    if (!m || typeof m !== "object") return null;
+                    const content = (m as { content?: unknown }).content;
+                    return typeof content === "string" ? { content } : null;
+                  })
+                  .filter((m): m is { content: string } => m !== null)
+              : [];
+
+            return yield* memoryService
+              .insertMemories({ agentId, roomId, memories, createdBy: "agent" })
+              .pipe(
+                Effect.map((r) => ({ ok: true as const, inserted: r.inserted })),
+                Effect.catchAll((e) =>
+                  Effect.succeed({ ok: false as const, error: errorLabel(e) }),
+                ),
+              );
+          }
+
+          case "memory_search": {
+            const query = typeof args["query"] === "string" ? args["query"] : "";
+            const limitRaw = args["limit"];
+            const limit =
+              typeof limitRaw === "number" && Number.isFinite(limitRaw)
+                ? Math.max(1, Math.floor(limitRaw))
+                : 5;
+
+            return yield* memoryService
+              .searchMemories({ agentId, query, limit })
+              .pipe(Effect.catchAll((e) => Effect.succeed([{ error: errorLabel(e) }])));
+          }
+
+          case "thread_read": {
+            const roomIdRaw = args["roomId"];
+            const rId =
+              typeof roomIdRaw === "number" && Number.isFinite(roomIdRaw)
+                ? Math.floor(roomIdRaw)
+                : roomId;
+
+            return yield* memoryService
+              .getThreadSummary({ roomId: rId })
+              .pipe(Effect.catchAll((e) => Effect.succeed({ error: errorLabel(e) })));
+          }
+
+          default:
+            return { error: `Unknown tool: ${name}` };
+        }
+      });
+
+    let llmResult: LlmOkResult | LlmFailResult | undefined;
+
+    if (ctx.existingReply) {
+      const reply = stripMessageXml(ctx.existingReply.content);
+      llmResult = {
+        ok: true,
+        source: "existing",
+        reply,
+        replyCreatedAtMs: ctx.existingReply.createdAtMs,
+        thinkingText: ctx.existingReply.thinkingText,
+        inputTokens: ctx.existingReply.inputTokens,
+        outputTokens: ctx.existingReply.outputTokens,
+        isAgentExit: false,
+        exitSummary: null,
+      };
+    } else {
+      const prompt = await stepEffect(
+        runtime,
+        step,
+        "build-prompt",
+        DB_STEP_CONFIG,
+        Effect.gen(function* () {
+          const { db } = yield* Db;
+
+          // bounded history (timestamp-based due to sync inserts)
+          const rawHistoryLimit = Math.max(ctx.historyLimit * 3, 60);
+          const rawHistory = yield* dbTry(() =>
+            db
+              .select()
+              .from(messages)
+              .where(eq(messages.roomId, ctx.room.id))
+              .orderBy(desc(messages.createdAtMs), desc(messages.id))
+              .limit(rawHistoryLimit)
+              .all(),
+          );
+
+          const nonLocalAgentMessages = rawHistory.filter(
+            (m) => m.authorType === "agent" && !m.discordMessageId.startsWith("local-turn:"),
+          );
+
+          const localTurnDedupeWindowMs = 30 * 60 * 1000;
+          const localTurnDedupeAllowEarlyMs = 30 * 1000;
+
+          const promptHistory = rawHistory
+            .slice()
+            .reverse()
+            .filter((m) => m.authorType !== "notification")
+            .filter((m) => {
+              if (m.authorType !== "agent") return true;
+              if (!m.discordMessageId.startsWith("local-turn:")) return true;
+
+              const isDuplicate = nonLocalAgentMessages.some((x) => {
+                if (x.content !== m.content) return false;
+                const dt = x.createdAtMs - m.createdAtMs;
+                if (dt < -localTurnDedupeAllowEarlyMs) return false;
+                if (dt > localTurnDedupeWindowMs) return false;
+                if (m.authorAgentId && x.authorAgentId && x.authorAgentId !== m.authorAgentId) {
+                  return false;
+                }
+                return true;
+              });
+
+              return !isDuplicate;
+            })
+            .slice(-ctx.historyLimit);
+
+          const agentNameById = new Map(
+            (yield* dbTry(() =>
+              db.select({ id: agents.id, name: agents.name }).from(agents).all(),
+            )).map((a) => [a.id, a.name] as const),
+          );
+
+          const getAgentName = (agentId: string | null | undefined): string =>
+            (agentId ? agentNameById.get(agentId) : undefined) ?? "Unknown";
+
+          const getNonAgentName = (
+            m: { readonly authorType: string } & Record<string, unknown>,
+          ): string => {
+            const explicit = m["authorName"];
+            if (typeof explicit === "string" && explicit.trim().length > 0) return explicit;
+            if (m.authorType === "audience") return "Audience";
+            if (m.authorType === "moderator") return "Moderator";
+            return "Unknown";
+          };
+
+          return buildPrompt(
+            { title: ctx.room.title, topic: ctx.room.topic },
+            { id: ctx.agent.id, name: ctx.agent.name, systemPrompt: ctx.agent.systemPrompt },
+            promptHistory.map((m) => ({
+              authorType: m.authorType,
+              authorName:
+                m.authorType === "agent" ? getAgentName(m.authorAgentId) : getNonAgentName(m),
+              content: m.content,
+            })),
+          );
+        }),
+        isRetryableDb,
+      );
+
+      await stepEffect(
+        runtime,
+        step,
+        "llm-start-event",
+        DB_STEP_CONFIG,
+        Effect.gen(function* () {
+          const turnEvents = yield* TurnEventService;
           yield* turnEvents.write({
             roomId: ctx.room.id,
             turnNumber: params.turnNumber,
-            phase: "llm_fail",
-            status: "fail",
-            data: { error: errorLabel(e), detail: errorDetail(e) },
+            phase: "llm_start",
+            status: "info",
+            data: { llmProvider: ctx.agent.llmProvider, llmModel: ctx.agent.llmModel },
           });
+          return true as const;
+        }),
+        isRetryableDb,
+      );
 
-          // Best-effort: notify room.
-          yield* discord.postMessage(ctx.room.threadId, turnFailedNotification).pipe(
-            (eff) =>
-              retryWithBackoff(eff, {
-                maxRetries: 3,
-                isRetryable: isRetryableDiscordError,
-                getRetryAfterMs: discordRetryAfterMs,
+      const conversationMessages = normalizePromptMessages(prompt);
+
+      const MAX_TOOL_ROUNDS = 128;
+      let totalInputTokens = 0;
+      let totalOutputTokens = 0;
+      let finalText = "";
+      let lastReasoningText: string | null = null;
+
+      let isAgentExit = false;
+      let exitSummary: string | null = null;
+
+      let pendingToolResults:
+        | {
+            readonly forRouter: ReadonlyArray<{ toolCallId: string; name: string; result: string }>;
+            readonly forPrompt: ReadonlyArray<{
+              toolCallId: string;
+              name: string;
+              result: unknown;
+            }>;
+          }
+        | undefined = undefined;
+
+      let roundsUsed = 0;
+
+      for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
+        roundsUsed = round + 1;
+
+        const llmRound = await stepEffect(
+          runtime,
+          step,
+          `llm-round-${round}`,
+          LLM_STEP_CONFIG,
+          Effect.gen(function* () {
+            const llmRouter = yield* LlmRouter;
+            const discord = yield* Discord;
+            const turnEvents = yield* TurnEventService;
+
+            const startedAtMs = yield* nowMs;
+
+            const llmEither = yield* retryWithBackoff(
+              llmRouter.generate({
+                provider: ctx.agent.llmProvider,
+                model: ctx.agent.llmModel,
+                prompt: conversationMessages,
+                ...(ctx.agent.temperature
+                  ? { temperature: parseFloat(ctx.agent.temperature) }
+                  : {}),
+                ...(ctx.agent.maxTokens != null ? { maxTokens: ctx.agent.maxTokens } : {}),
+                ...(ctx.agent.thinkingLevel != null
+                  ? { thinkingLevel: ctx.agent.thinkingLevel }
+                  : {}),
+                ...(ctx.agent.thinkingBudgetTokens != null
+                  ? { thinkingBudgetTokens: ctx.agent.thinkingBudgetTokens }
+                  : {}),
+                ...(pendingToolResults ? { toolResults: pendingToolResults.forRouter } : {}),
               }),
-            Effect.tap(() =>
-              turnEvents.write({
+              { maxRetries: 3, isRetryable: isRetryableLlmError },
+            ).pipe(Effect.withLogSpan("llm.generate"), Effect.either);
+
+            const finishedAtMs = yield* nowMs;
+            const latencyMs = Math.max(0, finishedAtMs - startedAtMs);
+
+            if (Either.isLeft(llmEither)) {
+              const e = llmEither.left;
+
+              yield* turnEvents.write({
                 roomId: ctx.room.id,
                 turnNumber: params.turnNumber,
-                phase: "final_failure_notify",
-                status: "ok",
-                data: { source: "llm" },
-              }),
-            ),
-            Effect.catchAll((notifyErr) =>
-              turnEvents
-                .write({
-                  roomId: ctx.room.id,
-                  turnNumber: params.turnNumber,
-                  phase: "final_failure_notify",
-                  status: "fail",
-                  data: {
-                    source: "llm",
-                    error: errorLabel(notifyErr),
-                    originalError: errorLabel(e),
-                  },
-                })
-                .pipe(Effect.asVoid),
-            ),
-            Effect.asVoid,
-          );
+                phase: "llm_fail",
+                status: "fail",
+                data: { round, error: errorLabel(e), detail: errorDetail(e) },
+              });
 
-          const out: LlmFailResult = { ok: false, error: errorLabel(e), detail: errorDetail(e) };
-          return out;
+              // Best-effort: notify room.
+              yield* discord.postMessage(ctx.room.threadId, turnFailedNotification).pipe(
+                (eff) =>
+                  retryWithBackoff(eff, {
+                    maxRetries: 3,
+                    isRetryable: isRetryableDiscordError,
+                    getRetryAfterMs: discordRetryAfterMs,
+                  }),
+                Effect.tap(() =>
+                  turnEvents.write({
+                    roomId: ctx.room.id,
+                    turnNumber: params.turnNumber,
+                    phase: "final_failure_notify",
+                    status: "ok",
+                    data: { source: "llm", round },
+                  }),
+                ),
+                Effect.catchAll((notifyErr) =>
+                  turnEvents
+                    .write({
+                      roomId: ctx.room.id,
+                      turnNumber: params.turnNumber,
+                      phase: "final_failure_notify",
+                      status: "fail",
+                      data: {
+                        source: "llm",
+                        round,
+                        error: errorLabel(notifyErr),
+                        originalError: errorLabel(e),
+                      },
+                    })
+                    .pipe(Effect.asVoid),
+                ),
+                Effect.asVoid,
+              );
+
+              return {
+                ok: false as const,
+                error: errorLabel(e),
+                detail: errorDetail(e),
+                latencyMs,
+              };
+            }
+
+            const ok = llmEither.right;
+
+            yield* Effect.logInfo("llm.round.ok").pipe(
+              Effect.annotateLogs({
+                roomId: ctx.room.id,
+                turnNumber: params.turnNumber,
+                round,
+                latencyMs,
+                toolCalls: ok.toolCalls.length,
+              }),
+            );
+
+            return { ok: true as const, result: ok, latencyMs };
+          }),
+          isRetryableDb,
+        );
+
+        if (!llmRound.ok) {
+          llmResult = { ok: false, error: llmRound.error, detail: llmRound.detail };
+          break;
         }
 
-        const ok = llmEither.right;
-        const exitSummary = ok.exitSummary;
-        const isAgentExit = exitSummary !== null;
-        const reply = stripMessageXml(exitSummary ?? ok.text);
+        // After the LLM consumed pending tool results, persist them into the conversation history.
+        if (pendingToolResults && pendingToolResults.forPrompt.length > 0) {
+          conversationMessages.push(makeToolResultsMessage(pendingToolResults.forPrompt));
+          pendingToolResults = undefined;
+        }
 
-        yield* turnEvents.write({
-          roomId: ctx.room.id,
-          turnNumber: params.turnNumber,
-          phase: "llm_ok",
-          status: "ok",
-          data: {
-            replyChars: reply.length,
-            inputTokens: ok.inputTokens,
-            outputTokens: ok.outputTokens,
-            ...(isAgentExit ? { agentExit: true, exitSummaryChars: reply.length } : {}),
-          },
-        });
+        const ok = llmRound.result;
+        lastReasoningText = ok.reasoningText ?? null;
 
-        const createdAtMs = yield* nowMs;
+        totalInputTokens += ok.inputTokens ?? 0;
+        totalOutputTokens += ok.outputTokens ?? 0;
 
-        const out: LlmOkResult = {
-          ok: true,
-          source: "llm",
-          reply,
-          replyCreatedAtMs: createdAtMs,
-          thinkingText: ok.reasoningText ?? null,
-          inputTokens: ok.inputTokens ?? null,
-          outputTokens: ok.outputTokens ?? null,
-          isAgentExit,
-          exitSummary,
-        };
+        if (ok.exitSummary) {
+          isAgentExit = true;
+          exitSummary = ok.exitSummary;
+          finalText = ok.exitSummary;
+          break;
+        }
 
-        return out;
-      }),
-      isRetryableDb,
-    );
+        if (ok.toolCalls.length === 0) {
+          finalText = ok.text;
+          break;
+        }
+
+        // Store the tool calls into the conversation (assistant tool-call message).
+        conversationMessages.push(
+          makeAssistantToolCallMessage({ text: ok.text, toolCalls: ok.toolCalls }),
+        );
+
+        const toolResultsForRouter: Array<{ toolCallId: string; name: string; result: string }> =
+          [];
+        const toolResultsForPrompt: Array<{ toolCallId: string; name: string; result: unknown }> =
+          [];
+
+        for (const toolCall of ok.toolCalls) {
+          const toolRes = await stepEffect(
+            runtime,
+            step,
+            `tool-${round}-${toolCall.id}`,
+            DB_STEP_CONFIG,
+            executeToolCall(toolCall, ctx.agent.id, ctx.room.id).pipe(
+              Effect.catchAll((e) => Effect.succeed({ error: errorLabel(e) })),
+            ),
+            isRetryableDb,
+          );
+
+          toolResultsForPrompt.push({
+            toolCallId: toolCall.id,
+            name: toolCall.name,
+            result: toolRes,
+          });
+
+          let encoded = "";
+          try {
+            encoded = JSON.stringify(toolRes);
+          } catch {
+            encoded = String(toolRes);
+          }
+          toolResultsForRouter.push({
+            toolCallId: toolCall.id,
+            name: toolCall.name,
+            result: encoded,
+          });
+        }
+
+        pendingToolResults = { forRouter: toolResultsForRouter, forPrompt: toolResultsForPrompt };
+      }
+
+      if (!llmResult) {
+        if (finalText.trim().length === 0) {
+          llmResult = {
+            ok: false,
+            error: "ToolLoopExceeded",
+            detail: { rounds: MAX_TOOL_ROUNDS },
+          };
+        } else {
+          const reply = stripMessageXml(exitSummary ?? finalText);
+
+          await stepEffect(
+            runtime,
+            step,
+            "llm-finish-event",
+            DB_STEP_CONFIG,
+            Effect.gen(function* () {
+              const turnEvents = yield* TurnEventService;
+              yield* turnEvents.write({
+                roomId: ctx.room.id,
+                turnNumber: params.turnNumber,
+                phase: "llm_ok",
+                status: "ok",
+                data: {
+                  replyChars: reply.length,
+                  inputTokens: totalInputTokens,
+                  outputTokens: totalOutputTokens,
+                  rounds: roundsUsed,
+                  ...(isAgentExit ? { agentExit: true, exitSummaryChars: reply.length } : {}),
+                },
+              });
+              return true as const;
+            }),
+            isRetryableDb,
+          );
+
+          const createdAtMs = await stepEffect(
+            runtime,
+            step,
+            "llm-created-at",
+            DB_STEP_CONFIG,
+            Effect.gen(function* () {
+              return yield* nowMs;
+            }),
+            isRetryableDb,
+          );
+
+          llmResult = {
+            ok: true,
+            source: "llm",
+            reply,
+            replyCreatedAtMs: createdAtMs,
+            thinkingText: lastReasoningText,
+            inputTokens: totalInputTokens,
+            outputTokens: totalOutputTokens,
+            isAgentExit,
+            exitSummary,
+          };
+        }
+      }
+    }
+
+    // Safety net: should never happen.
+    if (!llmResult) {
+      llmResult = { ok: false, error: "LlmUnknown", detail: {} };
+    }
 
     const persisted = await stepEffect(
       runtime,

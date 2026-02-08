@@ -76,7 +76,7 @@ export const buildGeminiOverrides = (
 
 export const buildOpenRouterBody = (
   model: string,
-  messages: ReadonlyArray<{ role: string; content: string }>,
+  messages: ReadonlyArray<Record<string, unknown>>,
   options?: {
     readonly temperature?: number;
     readonly maxTokens?: number;

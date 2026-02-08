@@ -13,7 +13,16 @@ import {
   buildOpenAiOverrides,
   buildOpenRouterBody,
 } from "../lib/llmOverrides.js";
-import { ExitDebate, OpenAiExitDebateTool } from "../lib/tools.js";
+import {
+  ExitDebate,
+  MemoryAdd,
+  MemorySearch,
+  OpenAiExitDebateTool,
+  OpenAiMemoryAddTool,
+  OpenAiMemorySearchTool,
+  OpenAiThreadReadTool,
+  ThreadRead,
+} from "../lib/tools.js";
 import { Settings } from "./Settings.js";
 
 export const LlmProviderSchema = Schema.Literal("openai", "anthropic", "gemini", "openrouter");
@@ -36,6 +45,12 @@ export class LlmContentError extends Schema.TaggedError<LlmContentError>()("LlmC
 
 export type LlmRouterError = MissingLlmApiKey | LlmCallFailed | LlmContentError;
 
+export type ToolCall = {
+  readonly id: string;
+  readonly name: string;
+  readonly arguments: Record<string, unknown>;
+};
+
 export type LlmResult = {
   /**
    * Generated assistant text.
@@ -52,6 +67,11 @@ export type LlmResult = {
    * When not null, the model requested to end the debate.
    */
   readonly exitSummary: string | null;
+
+  /**
+   * Tool calls requested by the model.
+   */
+  readonly toolCalls: ReadonlyArray<ToolCall>;
 };
 
 export class LlmRouter extends Context.Tag("@agon/LlmRouter")<
@@ -65,6 +85,11 @@ export class LlmRouter extends Context.Tag("@agon/LlmRouter")<
       readonly maxTokens?: number;
       readonly thinkingLevel?: string;
       readonly thinkingBudgetTokens?: number;
+      readonly toolResults?: ReadonlyArray<{
+        readonly toolCallId: string;
+        readonly name: string;
+        readonly result: string;
+      }>;
     }) => Effect.Effect<LlmResult, LlmRouterError>;
   }
 >() {
@@ -119,44 +144,165 @@ export class LlmRouter extends Context.Tag("@agon/LlmRouter")<
         }
       };
 
-      // Convert Prompt.RawInput to OpenAI chat messages format
-      const promptToMessages = (prompt: Prompt.RawInput) => {
-        const messages: Array<{ role: string; content: string }> = [];
+      type OpenAiToolCall = {
+        readonly id: string;
+        readonly type: "function";
+        readonly function: { readonly name: string; readonly arguments: string };
+      };
 
-        // Handle string input
+      type OpenAiMessage =
+        | { readonly role: "system" | "user"; readonly content: string }
+        | {
+            readonly role: "assistant";
+            readonly content: string | null;
+            readonly tool_calls?: ReadonlyArray<OpenAiToolCall>;
+          }
+        | {
+            readonly role: "tool";
+            readonly tool_call_id: string;
+            readonly content: string;
+          };
+
+      const safeJsonStringify = (u: unknown): string => {
+        if (typeof u === "string") return u;
+        try {
+          return JSON.stringify(u);
+        } catch {
+          return String(u);
+        }
+      };
+
+      const parseToolArguments = (raw: unknown): Record<string, unknown> => {
+        if (typeof raw === "string") {
+          try {
+            const parsed = JSON.parse(raw) as unknown;
+            return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+              ? (parsed as Record<string, unknown>)
+              : {};
+          } catch {
+            return {};
+          }
+        }
+
+        return raw && typeof raw === "object" && !Array.isArray(raw)
+          ? (raw as Record<string, unknown>)
+          : {};
+      };
+
+      const extractTextFromParts = (content: unknown): string => {
+        if (typeof content === "string") return content;
+        if (!Array.isArray(content)) return content === undefined ? "" : String(content);
+
+        return content
+          .map((part: unknown) => {
+            if (typeof part === "string") return part;
+            if (!part || typeof part !== "object") return "";
+            if ("text" in part && typeof (part as { text?: unknown }).text === "string") {
+              return (part as { text: string }).text;
+            }
+            return "";
+          })
+          .join("");
+      };
+
+      const promptToOpenAiMessages = (
+        prompt: Prompt.RawInput,
+        toolResults?: ReadonlyArray<{ toolCallId: string; name: string; result: string }>,
+      ): Array<OpenAiMessage> => {
+        const out: Array<OpenAiMessage> = [];
+
         if (typeof prompt === "string") {
-          messages.push({ role: "user", content: prompt });
-          return messages;
+          out.push({ role: "user", content: prompt });
+        } else {
+          const items: Iterable<Prompt.MessageEncoded> =
+            (prompt as { content?: ReadonlyArray<Prompt.MessageEncoded> }).content ??
+            (prompt as Iterable<Prompt.MessageEncoded>);
+
+          for (const item of items) {
+            if (typeof item === "string") {
+              out.push({ role: "user", content: item });
+              continue;
+            }
+
+            if (!item || typeof item !== "object" || !("role" in item)) continue;
+
+            const role = (item as { role?: unknown }).role;
+            const content = (item as { content?: unknown }).content;
+
+            if (role === "system") {
+              out.push({ role: "system", content: extractTextFromParts(content) });
+              continue;
+            }
+
+            if (role === "user") {
+              out.push({ role: "user", content: extractTextFromParts(content) });
+              continue;
+            }
+
+            if (role === "assistant") {
+              const parts = Array.isArray(content) ? content : [];
+
+              const text = extractTextFromParts(content).trim();
+
+              const toolCalls: Array<OpenAiToolCall> = [];
+              for (const part of parts) {
+                if (!part || typeof part !== "object") continue;
+                if ((part as { type?: unknown }).type !== "tool-call") continue;
+
+                const id = (part as { id?: unknown }).id;
+                const name = (part as { name?: unknown }).name;
+                const params = (part as { params?: unknown }).params;
+
+                if (typeof id !== "string" || typeof name !== "string") continue;
+
+                toolCalls.push({
+                  id,
+                  type: "function",
+                  function: {
+                    name,
+                    arguments: safeJsonStringify(params ?? {}),
+                  },
+                });
+              }
+
+              out.push({
+                role: "assistant",
+                content: text.length > 0 ? text : null,
+                ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}),
+              });
+
+              continue;
+            }
+
+            if (role === "tool") {
+              const parts = Array.isArray(content) ? content : [];
+
+              for (const part of parts) {
+                if (!part || typeof part !== "object") continue;
+                if ((part as { type?: unknown }).type !== "tool-result") continue;
+
+                const id = (part as { id?: unknown }).id;
+                const result = (part as { result?: unknown }).result;
+                if (typeof id !== "string") continue;
+
+                out.push({
+                  role: "tool",
+                  tool_call_id: id,
+                  content: safeJsonStringify(result),
+                });
+              }
+              continue;
+            }
+          }
         }
 
-        // Handle Prompt object (has content array)
-        const items = "content" in prompt ? prompt.content : prompt;
-
-        for (const item of items) {
-          if (typeof item === "string") {
-            messages.push({ role: "user", content: item });
-            continue;
-          }
-
-          if (item.role === "system") {
-            messages.push({ role: "system", content: item.content as string });
-          } else if (item.role === "user" || item.role === "assistant") {
-            // Extract text from content parts
-            const content = item.content;
-            const text = Array.isArray(content)
-              ? content
-                  .map((part: unknown) => {
-                    if (typeof part === "string") return part;
-                    if (part && typeof part === "object" && "text" in part)
-                      return (part as { text: string }).text;
-                    return "";
-                  })
-                  .join("")
-              : String(content);
-            messages.push({ role: item.role, content: text });
+        if (toolResults && toolResults.length > 0) {
+          for (const r of toolResults) {
+            out.push({ role: "tool", tool_call_id: r.toolCallId, content: r.result });
           }
         }
-        return messages;
+
+        return out;
       };
 
       // Direct OpenRouter chat completions call (bypasses @effect/ai-openai Responses API)
@@ -169,9 +315,10 @@ export class LlmRouter extends Context.Tag("@agon/LlmRouter")<
           readonly maxTokens?: number;
           readonly reasoningEffort?: string;
         },
+        toolResults?: ReadonlyArray<{ toolCallId: string; name: string; result: string }>,
       ) =>
         Effect.gen(function* () {
-          const messages = promptToMessages(prompt);
+          const messages = promptToOpenAiMessages(prompt, toolResults);
           const headers: Record<string, string> = {
             Authorization: `Bearer ${Redacted.value(apiKey)}`,
             "Content-Type": "application/json",
@@ -187,7 +334,12 @@ export class LlmRouter extends Context.Tag("@agon/LlmRouter")<
             try: () =>
               JSON.stringify({
                 ...buildOpenRouterBody(model, messages, options),
-                tools: [OpenAiExitDebateTool],
+                tools: [
+                  OpenAiExitDebateTool,
+                  OpenAiMemoryAddTool,
+                  OpenAiMemorySearchTool,
+                  OpenAiThreadReadTool,
+                ],
                 tool_choice: "auto",
               }),
             catch: (cause) => LlmCallFailed.make({ provider: "openrouter", cause }),
@@ -236,53 +388,39 @@ export class LlmRouter extends Context.Tag("@agon/LlmRouter")<
 
           const message = data.choices?.[0]?.message;
 
-          // Tool calls (Chat Completions function calling format)
-          const toolCalls = message?.tool_calls;
-          let exitSummary: string | null = null;
+          const toolCallsRaw = message?.tool_calls;
+          const toolCalls: Array<ToolCall> = [];
 
-          if (Array.isArray(toolCalls)) {
-            for (const call of toolCalls) {
-              const fn =
-                call && typeof call === "object" && call !== null && "function" in call
-                  ? (call as { function?: unknown }).function
-                  : undefined;
+          if (Array.isArray(toolCallsRaw)) {
+            for (const call of toolCallsRaw) {
+              if (!call || typeof call !== "object") continue;
 
-              if (!fn || typeof fn !== "object" || fn === null) continue;
+              const id = typeof call.id === "string" ? call.id : crypto.randomUUID();
+              const fn = (call as { function?: unknown }).function;
+
+              if (!fn || typeof fn !== "object") continue;
               const name = (fn as { name?: unknown }).name;
-              if (name !== "exit_debate") continue;
+
+              if (typeof name !== "string" || name.trim().length === 0) continue;
 
               const argsRaw = (fn as { arguments?: unknown }).arguments;
-              if (typeof argsRaw === "string") {
-                try {
-                  const parsed = JSON.parse(argsRaw) as unknown;
-                  if (
-                    parsed &&
-                    typeof parsed === "object" &&
-                    "summary" in parsed &&
-                    typeof (parsed as { summary?: unknown }).summary === "string"
-                  ) {
-                    exitSummary = (parsed as { summary: string }).summary;
-                  }
-                } catch {
-                  // ignore malformed args
-                }
-              } else if (
-                argsRaw &&
-                typeof argsRaw === "object" &&
-                "summary" in argsRaw &&
-                typeof (argsRaw as { summary?: unknown }).summary === "string"
-              ) {
-                exitSummary = (argsRaw as { summary: string }).summary;
-              }
+              const args = parseToolArguments(argsRaw);
+
+              toolCalls.push({ id, name, arguments: args });
             }
           }
 
+          const exitCall = toolCalls.find((c) => c.name === "exit_debate");
+          const exitSummary =
+            exitCall && typeof exitCall.arguments.summary === "string"
+              ? exitCall.arguments.summary.trim()
+              : null;
+
           const contentRaw = message?.content;
           const contentText = typeof contentRaw === "string" ? contentRaw.trim() : "";
-          const exitSummaryText = typeof exitSummary === "string" ? exitSummary.trim() : null;
 
-          // If the model used the tool, it may not produce regular text.
-          if (exitSummaryText === null && contentText.length === 0) {
+          // If the model produced neither text nor tool calls, it's invalid.
+          if (contentText.length === 0 && toolCalls.length === 0) {
             return yield* LlmContentError.make({ provider: "openrouter", model });
           }
 
@@ -294,12 +432,13 @@ export class LlmRouter extends Context.Tag("@agon/LlmRouter")<
             typeof data.usage?.completion_tokens === "number" ? data.usage.completion_tokens : null;
 
           return {
-            text: exitSummaryText ?? contentText,
+            text: exitSummary ?? contentText,
             reasoningText: typeof reasoningRaw === "string" ? reasoningRaw.trim() : null,
             inputTokens,
             outputTokens,
-            exitSummary: exitSummaryText,
-          };
+            exitSummary,
+            toolCalls,
+          } satisfies LlmResult;
         });
 
       const makeLanguageModelLayer = (
@@ -329,11 +468,63 @@ export class LlmRouter extends Context.Tag("@agon/LlmRouter")<
         }
       };
 
-      // Tooling: allow models to explicitly end a debate.
-      const exitToolkit = Toolkit.make(ExitDebate);
-      const exitToolkitLayer = exitToolkit.toLayer({
+      const toolKit = Toolkit.make(ExitDebate, MemoryAdd, MemorySearch, ThreadRead);
+
+      // NOTE: @effect/ai toolkits built with `Tool.make` require handlers in the environment,
+      // even when tool call resolution is disabled.
+      //
+      // We provide no-op handlers here so `LlmRouter.generate` has no extra context requirements.
+      // Tool execution is handled at the workflow level.
+      const toolKitLayer = toolKit.toLayer({
         exit_debate: ({ summary }) => Effect.succeed(summary),
+        memory_add: () => Effect.succeed({ ok: false as const, inserted: 0 }),
+        memory_search: () => Effect.succeed([]),
+        thread_read: () =>
+          Effect.succeed({ title: "", topic: "", summary: null, status: "" } as const),
       });
+
+      const normalizePromptWithToolResults = (args: {
+        readonly prompt: Prompt.RawInput;
+        readonly toolResults?: ReadonlyArray<{ toolCallId: string; name: string; result: string }>;
+      }): Prompt.RawInput => {
+        if (!args.toolResults || args.toolResults.length === 0) return args.prompt;
+
+        const messages: Array<Prompt.MessageEncoded> =
+          typeof args.prompt === "string"
+            ? ([
+                {
+                  role: "user",
+                  content: [{ type: "text", text: args.prompt }],
+                },
+              ] satisfies Array<Prompt.MessageEncoded>)
+            : Array.from(
+                (args.prompt as { content?: ReadonlyArray<Prompt.MessageEncoded> }).content ??
+                  (args.prompt as Iterable<Prompt.MessageEncoded>),
+              );
+
+        const toolMessage: Prompt.ToolMessageEncoded = {
+          role: "tool",
+          content: args.toolResults.map((r) => {
+            let parsed: unknown = r.result;
+            try {
+              parsed = JSON.parse(r.result) as unknown;
+            } catch {
+              // keep raw string
+            }
+
+            return {
+              type: "tool-result",
+              id: r.toolCallId,
+              name: r.name,
+              isFailure: false,
+              result: parsed,
+              providerExecuted: false,
+            } satisfies Prompt.ToolResultPartEncoded;
+          }),
+        };
+
+        return [...messages, toolMessage];
+      };
 
       const generate = Effect.fn("LlmRouter.generate")(function* (args: {
         readonly provider: LlmProvider;
@@ -343,16 +534,27 @@ export class LlmRouter extends Context.Tag("@agon/LlmRouter")<
         readonly maxTokens?: number;
         readonly thinkingLevel?: string;
         readonly thinkingBudgetTokens?: number;
+        readonly toolResults?: ReadonlyArray<{
+          readonly toolCallId: string;
+          readonly name: string;
+          readonly result: string;
+        }>;
       }) {
         const apiKey = yield* requireApiKey(args.provider);
 
         // OpenRouter: use direct chat completions API
         if (args.provider === "openrouter") {
-          return yield* openRouterGenerate(args.model, args.prompt, apiKey, {
-            ...(args.temperature !== undefined ? { temperature: args.temperature } : {}),
-            ...(args.maxTokens !== undefined ? { maxTokens: args.maxTokens } : {}),
-            ...(args.thinkingLevel !== undefined ? { reasoningEffort: args.thinkingLevel } : {}),
-          }).pipe(
+          return yield* openRouterGenerate(
+            args.model,
+            args.prompt,
+            apiKey,
+            {
+              ...(args.temperature !== undefined ? { temperature: args.temperature } : {}),
+              ...(args.maxTokens !== undefined ? { maxTokens: args.maxTokens } : {}),
+              ...(args.thinkingLevel !== undefined ? { reasoningEffort: args.thinkingLevel } : {}),
+            },
+            args.toolResults,
+          ).pipe(
             Effect.timeout("10 minutes"),
             Effect.mapError((cause) => {
               const tag =
@@ -367,6 +569,10 @@ export class LlmRouter extends Context.Tag("@agon/LlmRouter")<
           );
         }
 
+        const prompt = args.toolResults
+          ? normalizePromptWithToolResults({ prompt: args.prompt, toolResults: args.toolResults })
+          : args.prompt;
+
         // Other providers: use @effect/ai layers
         const languageModelLayer = makeLanguageModelLayer(args.provider, args.model, apiKey).pipe(
           Layer.provide(FetchHttpClient.layer),
@@ -374,9 +580,10 @@ export class LlmRouter extends Context.Tag("@agon/LlmRouter")<
         const modelLayer = Model.make(args.provider, languageModelLayer);
 
         const base = LanguageModel.generateText({
-          prompt: args.prompt,
-          toolkit: exitToolkit,
+          prompt,
+          toolkit: toolKit,
           toolChoice: "auto",
+          disableToolCallResolution: true,
         });
 
         const isGoogleThinkingLevel = Schema.is(GoogleGenerated.ThinkingConfigThinkingLevel);
@@ -458,10 +665,22 @@ export class LlmRouter extends Context.Tag("@agon/LlmRouter")<
 
         return yield* withOverrides.pipe(
           Effect.provide(modelLayer),
-          Effect.provide(exitToolkitLayer),
+          Effect.provide(toolKitLayer),
           Effect.map((r) => {
-            const exitCall = r.toolCalls.find((c) => c.name === "exit_debate");
-            const exitSummary = exitCall ? exitCall.params.summary.trim() : null;
+            const toolCalls = r.toolCalls.map((c) => ({
+              id: c.id,
+              name: c.name,
+              arguments:
+                c.params && typeof c.params === "object" && !Array.isArray(c.params)
+                  ? (c.params as Record<string, unknown>)
+                  : {},
+            }));
+
+            const exitCall = toolCalls.find((c) => c.name === "exit_debate");
+            const exitSummary =
+              exitCall && typeof exitCall.arguments.summary === "string"
+                ? exitCall.arguments.summary.trim()
+                : null;
 
             const textRaw = r.text.trim();
             const text = textRaw.length > 0 ? textRaw : (exitSummary ?? "");
@@ -472,6 +691,7 @@ export class LlmRouter extends Context.Tag("@agon/LlmRouter")<
               inputTokens: typeof r.usage?.inputTokens === "number" ? r.usage.inputTokens : null,
               outputTokens: typeof r.usage?.outputTokens === "number" ? r.usage.outputTokens : null,
               exitSummary,
+              toolCalls,
             } satisfies LlmResult;
           }),
           Effect.timeout("10 minutes"),

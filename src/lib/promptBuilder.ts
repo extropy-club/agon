@@ -69,6 +69,14 @@ You are posting in a Discord thread.
 - No HTML. No LaTeX. No embeds.
 </format>`;
 
+const knowledgeBase = `<knowledge_base>
+You have a personal knowledge base with tools to manage it:
+- memory_search: Search for facts and insights from past debates
+- memory_add: Save important knowledge facts for future reference
+- thread_read: Read summaries of past debate rooms
+Use these tools when relevant context from past debates would improve your response.
+</knowledge_base>`;
+
 const buildIdentity = (agent: PromptBuilderAgent): string => `<identity>
 Your name is ${agent.name}. Your id is ${agent.id}.
 Messages from other participants are tagged with an author attribute — use it to know who is speaking.
@@ -78,7 +86,7 @@ You are one of several participants in a structured debate.
 </identity>`;
 
 const buildSystemPrompt = (agent: PromptBuilderAgent): string =>
-  `${buildIdentity(agent)}\n\n${agent.systemPrompt}\n\n${houseRules}\n\n${discordFormat}`;
+  `${buildIdentity(agent)}\n\n${agent.systemPrompt}\n\n${knowledgeBase}\n\n${houseRules}\n\n${discordFormat}`;
 
 const buildModeratorContent = (room: PromptBuilderRoom): string =>
   `Room title: ${room.title}\nTopic: ${room.topic}`;
