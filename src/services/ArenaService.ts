@@ -34,7 +34,12 @@ export type CloseAudienceSlotJob = {
   readonly delaySeconds: number;
 };
 
-export type RoomTurnJob = TurnJob | CloseAudienceSlotJob;
+export type FinalizeRoomJob = {
+  readonly type: "finalize_room";
+  readonly roomId: number;
+};
+
+export type RoomTurnJob = TurnJob | CloseAudienceSlotJob | FinalizeRoomJob;
 
 export class RoomNotFound extends Schema.TaggedError<RoomNotFound>()("RoomNotFound", {
   roomId: Schema.Int.pipe(Schema.nonNegative(), Schema.finite(), Schema.nonNaN()),

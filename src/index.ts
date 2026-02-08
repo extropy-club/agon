@@ -5,6 +5,9 @@ import { makeRuntime } from "./runtime.js";
 
 export { TurnAgent } from "./do/TurnAgent.js";
 export { TurnWorkflow } from "./do/TurnWorkflow.js";
+
+import { finalizeRoom } from "./do/FinalizeRoom.js";
+
 import {
   agents,
   discordChannels,
@@ -18,7 +21,6 @@ import { ModelsDev } from "./services/ModelsDev.js";
 import {
   ArenaService,
   RoomDbError,
-  type ArenaError,
   type RoomTurnJob,
   type TurnJob,
 } from "./services/ArenaService.js";
@@ -76,6 +78,10 @@ export interface Env {
 
   ARENA_MAX_TURNS?: string;
   ARENA_HISTORY_LIMIT?: string;
+
+  // Post-debate pipeline
+  MEMORY_EXTRACTION_PROVIDER?: string;
+  MEMORY_EXTRACTION_MODEL?: string;
 
   // Optional logging / LLM defaults (mostly for local dev / future use)
   LOG_LEVEL?: string;
@@ -2347,20 +2353,19 @@ export default {
       try {
         const job = normalizeJob(message.body);
 
+        const turnNumber =
+          job.type === "turn" || job.type === "close_audience_slot" ? job.turnNumber : null;
+
         const annotations = {
           queue: batch.queue,
           queueMessageId: message.id,
           attempts: message.attempts,
           jobType: job.type,
           roomId: job.roomId,
-          turnNumber: job.turnNumber,
+          turnNumber,
         };
 
-        const program: Effect.Effect<
-          RoomTurnJob | null,
-          ArenaError,
-          ArenaService | Db | Discord | TurnEventService
-        > =
+        const program =
           job.type === "close_audience_slot"
             ? Effect.gen(function* () {
                 yield* Effect.logInfo("queue.audience_slot.close");
@@ -2494,27 +2499,35 @@ export default {
                 Effect.annotateLogs(annotations),
                 Effect.withLogSpan("queue.audience_slot.close"),
               )
-            : Effect.gen(function* () {
-                // For 'turn' jobs: dispatch to TurnAgent DO (async durable workflow)
-                yield* Effect.logInfo("queue.turn.dispatch");
+            : job.type === "finalize_room"
+              ? Effect.gen(function* () {
+                  yield* Effect.logInfo("queue.room.finalize");
 
-                yield* Effect.tryPromise({
-                  try: async () => {
-                    const id = env.TURN_AGENT.idFromName(`room-${job.roomId}`);
-                    const stub = env.TURN_AGENT.get(id) as unknown as {
-                      startTurn: (params: {
-                        readonly roomId: number;
-                        readonly turnNumber: number;
-                      }) => Promise<string>;
-                    };
+                  yield* finalizeRoom({ roomId: job.roomId });
 
-                    await stub.startTurn({ roomId: job.roomId, turnNumber: job.turnNumber });
-                  },
-                  catch: (cause) => RoomDbError.make({ cause }),
-                });
+                  return null;
+                }).pipe(Effect.annotateLogs(annotations), Effect.withLogSpan("queue.room.finalize"))
+              : Effect.gen(function* () {
+                  // For 'turn' jobs: dispatch to TurnAgent DO (async durable workflow)
+                  yield* Effect.logInfo("queue.turn.dispatch");
 
-                return null;
-              }).pipe(Effect.annotateLogs(annotations), Effect.withLogSpan("queue.turn"));
+                  yield* Effect.tryPromise({
+                    try: async () => {
+                      const id = env.TURN_AGENT.idFromName(`room-${job.roomId}`);
+                      const stub = env.TURN_AGENT.get(id) as unknown as {
+                        startTurn: (params: {
+                          readonly roomId: number;
+                          readonly turnNumber: number;
+                        }) => Promise<string>;
+                      };
+
+                      await stub.startTurn({ roomId: job.roomId, turnNumber: job.turnNumber });
+                    },
+                    catch: (cause) => RoomDbError.make({ cause }),
+                  });
+
+                  return null;
+                }).pipe(Effect.annotateLogs(annotations), Effect.withLogSpan("queue.turn"));
 
         const next = await runtime.runPromise(program);
         if (next) {

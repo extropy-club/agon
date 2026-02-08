@@ -262,7 +262,7 @@ export class TurnWorkflow extends AgentWorkflow<TurnAgent, TurnParams, DefaultPr
 
     // Redelivery path: just re-enqueue what we need (if any) and exit.
     if (loadRoom.kind === "redelivery") {
-      await this.enqueueNext(step, runtime, params.roomId, loadRoom.nextJob);
+      await this.enqueueNext(step, runtime, params.roomId, loadRoom.nextJob, false);
       return;
     }
 
@@ -1446,7 +1446,10 @@ export class TurnWorkflow extends AgentWorkflow<TurnAgent, TurnParams, DefaultPr
       () => false,
     );
 
-    await this.enqueueNext(step, runtime, ctx.room.id, advance.nextJob);
+    const debateEnded =
+      llmResult.ok && (llmResult.isAgentExit || params.turnNumber >= ctx.room.maxTurns);
+
+    await this.enqueueNext(step, runtime, ctx.room.id, advance.nextJob, debateEnded);
   }
 
   private async enqueueNext(
@@ -1454,10 +1457,14 @@ export class TurnWorkflow extends AgentWorkflow<TurnAgent, TurnParams, DefaultPr
     runtime: ReturnType<typeof makeRuntime>,
     roomId: number,
     nextJob: RoomTurnJob | null,
+    debateEnded: boolean,
   ): Promise<void> {
-    if (!nextJob) return;
-
     const env = this.env;
+
+    const job: RoomTurnJob | null =
+      nextJob ?? (debateEnded ? ({ type: "finalize_room", roomId } as const) : null);
+
+    if (!job) return;
 
     await stepEffect(
       runtime,
@@ -1467,18 +1474,18 @@ export class TurnWorkflow extends AgentWorkflow<TurnAgent, TurnParams, DefaultPr
       Effect.gen(function* () {
         const { db } = yield* Db;
 
-        if (nextJob.type === "turn") {
+        if (job.type === "turn") {
           const room = yield* dbTry(() =>
             db.select().from(rooms).where(eq(rooms.id, roomId)).get(),
           );
 
           if (!room) return { enqueued: false } as const;
-          if (room.lastEnqueuedTurnNumber >= nextJob.turnNumber) {
+          if (room.lastEnqueuedTurnNumber >= job.turnNumber) {
             return { enqueued: false } as const;
           }
 
           yield* Effect.tryPromise({
-            try: () => env.ARENA_QUEUE.send(nextJob),
+            try: () => env.ARENA_QUEUE.send(job),
             catch: (cause) => RoomDbError.make({ cause }),
           });
 
@@ -1486,7 +1493,7 @@ export class TurnWorkflow extends AgentWorkflow<TurnAgent, TurnParams, DefaultPr
             db
               .update(rooms)
               .set({
-                lastEnqueuedTurnNumber: sql`max(${rooms.lastEnqueuedTurnNumber}, ${nextJob.turnNumber})`,
+                lastEnqueuedTurnNumber: sql`max(${rooms.lastEnqueuedTurnNumber}, ${job.turnNumber})`,
               })
               .where(eq(rooms.id, roomId))
               .run(),
@@ -1495,8 +1502,18 @@ export class TurnWorkflow extends AgentWorkflow<TurnAgent, TurnParams, DefaultPr
           return { enqueued: true } as const;
         }
 
+        if (job.type === "close_audience_slot") {
+          yield* Effect.tryPromise({
+            try: () => env.ARENA_QUEUE.send(job, { delaySeconds: job.delaySeconds }),
+            catch: (cause) => RoomDbError.make({ cause }),
+          });
+
+          return { enqueued: true } as const;
+        }
+
+        // finalize_room (and any future immediate jobs)
         yield* Effect.tryPromise({
-          try: () => env.ARENA_QUEUE.send(nextJob, { delaySeconds: nextJob.delaySeconds }),
+          try: () => env.ARENA_QUEUE.send(job),
           catch: (cause) => RoomDbError.make({ cause }),
         });
 

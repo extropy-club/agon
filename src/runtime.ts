@@ -42,6 +42,8 @@ export const makeConfigLayer = (env: Env) => {
     "LOG_FORMAT",
     "LLM_PROVIDER",
     "LLM_MODEL",
+    "MEMORY_EXTRACTION_PROVIDER",
+    "MEMORY_EXTRACTION_MODEL",
     "ARENA_MAX_TURNS",
     "ARENA_HISTORY_LIMIT",
     "CF_ACCOUNT_ID",
