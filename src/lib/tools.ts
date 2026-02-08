@@ -139,10 +139,10 @@ export const OpenAiMemorySearchTool = {
         },
         limit: {
           type: "integer",
-          description: "Maximum number of results to return",
+          description: "Maximum number of results to return (default: 5)",
         },
       },
-      required: ["query"],
+      required: ["query", "limit"],
       additionalProperties: false,
     },
   },

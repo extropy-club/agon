@@ -1,7 +1,7 @@
 name = "agon"
 account_id = "2c42f4960f9c28a9235cac01483bd626"
 main = "src/index.ts"
-compatibility_date = "2025-01-29"
+compatibility_date = "2025-09-08"
 compatibility_flags = ["nodejs_compat"]
 
 [[d1_databases]]

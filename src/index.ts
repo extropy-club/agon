@@ -1,5 +1,6 @@
 import { and, asc, desc, eq, inArray, or, sql } from "drizzle-orm";
 import { Config, Effect, Option, Redacted, Schema } from "effect";
+import { getAgentByName } from "agents";
 import { Db, nowMs } from "./d1/db.js";
 import { makeRuntime } from "./runtime.js";
 
@@ -98,7 +99,7 @@ export interface Env {
   JWT_SECRET?: string;
 
   // Cloudflare Agents SDK
-  TURN_AGENT: DurableObjectNamespace;
+  TURN_AGENT: DurableObjectNamespace<import("./do/TurnAgent.js").TurnAgent>;
   TURN_WORKFLOW: Workflow;
 
   // Cloudflare Workers static assets binding (admin UI)
@@ -2513,8 +2514,8 @@ export default {
 
                   yield* Effect.tryPromise({
                     try: async () => {
-                      const id = env.TURN_AGENT.idFromName(`room-${job.roomId}`);
-                      const stub = env.TURN_AGENT.get(id) as unknown as {
+                      const agentName = `room-${job.roomId}`;
+                      const stub = (await getAgentByName(env.TURN_AGENT, agentName)) as unknown as {
                         startTurn: (params: {
                           readonly roomId: number;
                           readonly turnNumber: number;
@@ -2523,7 +2524,16 @@ export default {
 
                       await stub.startTurn({ roomId: job.roomId, turnNumber: job.turnNumber });
                     },
-                    catch: (cause) => RoomDbError.make({ cause }),
+                    catch: (cause) => {
+                      console.error("queue.turn.do_dispatch_failed", {
+                        roomId: job.roomId,
+                        turnNumber: job.turnNumber,
+                        error: cause instanceof Error ? cause.message : String(cause),
+                        stack: cause instanceof Error ? cause.stack : undefined,
+                        raw: cause,
+                      });
+                      return RoomDbError.make({ cause });
+                    },
                   });
 
                   return null;
