@@ -10,6 +10,7 @@ import { ModelsDev } from "./services/ModelsDev.js";
 import { Observability } from "./services/Observability.js";
 import { Settings } from "./services/Settings.js";
 import { TurnEventService } from "./services/TurnEventService.js";
+import { MemoryService } from "./services/MemoryService.js";
 import type { Env } from "./index.js";
 
 export const makeConfigLayer = (env: Env) => {
@@ -73,6 +74,7 @@ export const makeRuntime = (env: Env) => {
     llmRouterLayer,
     discordLayer,
     TurnEventService.layer.pipe(Layer.provide(dbLayer)),
+    MemoryService.layer.pipe(Layer.provide(dbLayer)),
     modelsDevLayer,
   );
 
