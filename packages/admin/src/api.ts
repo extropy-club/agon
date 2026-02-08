@@ -67,9 +67,16 @@ export type MemoryItem = {
   readonly id: string;
   readonly content: string;
   readonly roomId: number;
+  readonly roomTitle: string;
   readonly createdBy: "agent" | "auto" | (string & {});
   readonly createdAtMs: number;
   readonly score?: number;
+};
+
+export type AgentMemoriesResponse = {
+  readonly items: readonly MemoryItem[];
+  readonly totalCount: number;
+  readonly hasMore: boolean;
 };
 
 export type GetMemoriesParams = {
@@ -139,7 +146,7 @@ export const agentsApi = {
   getMemories: async (
     id: string,
     params: GetMemoriesParams = {},
-  ): Promise<readonly MemoryItem[]> => {
+  ): Promise<AgentMemoriesResponse> => {
     const qs = new URLSearchParams();
     if (params.q) qs.set("q", params.q);
     if (params.limit != null) qs.set("limit", String(params.limit));
@@ -149,9 +156,9 @@ export const agentsApi = {
     const query = qs.toString();
     const res = (await apiFetch(
       `/agents/${encodeURIComponent(id)}/memories${query.length > 0 ? `?${query}` : ""}`,
-    )) as { memories: readonly MemoryItem[] };
+    )) as AgentMemoriesResponse;
 
-    return res.memories;
+    return res;
   },
   create: async (data: unknown): Promise<Agent> => {
     const res = (await apiFetch("/agents", {

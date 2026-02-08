@@ -2,6 +2,7 @@ import { A, useLocation, useParams } from "@solidjs/router";
 import { Show, createMemo, createResource } from "solid-js";
 import { API_BASE, type Agent } from "../api";
 import AgentOverview from "../components/AgentOverview";
+import AgentMemories from "../components/AgentMemories";
 
 type Tab = "overview" | "memories";
 
@@ -137,15 +138,7 @@ export default function AgentDetail() {
                   </A>
                 </nav>
 
-                <Show
-                  when={tab() === "overview"}
-                  fallback={
-                    <section class="card">
-                      <h3>Memories</h3>
-                      <p style={{ margin: 0 }}>Coming soon.</p>
-                    </section>
-                  }
-                >
+                <Show when={tab() === "overview"} fallback={<AgentMemories agentId={a().id} />}>
                   <AgentOverview agent={a()} />
                 </Show>
               </div>

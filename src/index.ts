@@ -653,6 +653,13 @@ export default {
         Schema.nonNaN(),
       );
 
+      const NonNegativeIntFromStringSchema = Schema.NumberFromString.pipe(
+        Schema.int(),
+        Schema.nonNegative(),
+        Schema.finite(),
+        Schema.nonNaN(),
+      );
+
       const DiscordSnowflakeSchema = Schema.NonEmptyString.pipe(Schema.pattern(/^[0-9]{17,20}$/));
 
       const AgentCreateSchema = Schema.Struct({
@@ -1151,6 +1158,122 @@ export default {
           }
 
           return json(405, { error: "Method not allowed" });
+        }
+
+        // /admin/agents/:id/memories
+        if (segments.length === 4 && segments[1] === "agents" && segments[3] === "memories") {
+          if (request.method !== "GET") {
+            return json(405, { error: "Method not allowed" });
+          }
+
+          const agentId = segments[2];
+
+          const MemorySourceSchema = Schema.Literal("auto", "agent");
+
+          const AdminAgentMemoriesQuerySchema = Schema.Struct({
+            q: Schema.optional(Schema.String),
+            source: Schema.optional(MemorySourceSchema),
+            limit: Schema.optional(
+              NonNegativeIntFromStringSchema.pipe(Schema.lessThanOrEqualTo(100)),
+            ),
+            offset: Schema.optional(NonNegativeIntFromStringSchema),
+          });
+
+          const query = yield* Schema.decodeUnknown(AdminAgentMemoriesQuerySchema)({
+            q: url.searchParams.get("q") ?? undefined,
+            source: url.searchParams.get("source") ?? undefined,
+            limit: url.searchParams.get("limit") ?? undefined,
+            offset: url.searchParams.get("offset") ?? undefined,
+          }).pipe(Effect.mapError(() => AdminBadRequest.make({ message: "Invalid query params" })));
+
+          const sanitizeFtsQuery = (raw: string): string => {
+            // Extract word tokens (unicode-aware)
+            const tokens = raw.match(/[\p{L}\p{N}]+/gu) ?? [];
+            // Cap at 8 terms, add prefix match
+            return tokens
+              .slice(0, 8)
+              .map((t) => `"${t}"*`)
+              .join(" ");
+          };
+
+          const qRaw = query.q?.trim();
+          const ftsQuery = qRaw && qRaw.length > 0 ? sanitizeFtsQuery(qRaw) : undefined;
+          const ftsQueryOrUndefined = ftsQuery && ftsQuery.length > 0 ? ftsQuery : undefined;
+
+          const source = query.source;
+          const limit = query.limit ?? 20;
+          const offset = query.offset ?? 0;
+
+          const agent = yield* dbTry(() =>
+            db.select({ id: agents.id }).from(agents).where(eq(agents.id, agentId)).get(),
+          );
+
+          if (!agent) {
+            return yield* AdminNotFound.make({ resource: "agent", id: agentId });
+          }
+
+          const ftsJoin = ftsQueryOrUndefined
+            ? sql`JOIN memories_fts f ON m.rowid = f.rowid`
+            : sql``;
+
+          const ftsWhere = ftsQueryOrUndefined
+            ? sql`AND f.content MATCH ${ftsQueryOrUndefined}`
+            : sql``;
+
+          const sourceWhere = source ? sql`AND m.created_by = ${source}` : sql``;
+
+          const [rows, countRows] = yield* Effect.all([
+            dbTry(() =>
+              db.all<{
+                id: string;
+                content: string;
+                roomId: number;
+                roomTitle: string;
+                createdBy: "auto" | "agent";
+                createdAtMs: number;
+              }>(sql`
+                SELECT m.id as id,
+                       m.content as content,
+                       m.room_id as roomId,
+                       r.title as roomTitle,
+                       m.created_by as createdBy,
+                       m.created_at_ms as createdAtMs
+                FROM memories m
+                JOIN rooms r ON m.room_id = r.id
+                ${ftsJoin}
+                WHERE m.agent_id = ${agentId}
+                ${ftsWhere}
+                ${sourceWhere}
+                ORDER BY m.created_at_ms DESC
+                LIMIT ${limit} OFFSET ${offset}
+              `),
+            ),
+            dbTry(() =>
+              db.all<{ c: number }>(sql`
+                SELECT count(*) as c
+                FROM memories m
+                ${ftsJoin}
+                WHERE m.agent_id = ${agentId}
+                ${ftsWhere}
+                ${sourceWhere}
+              `),
+            ),
+          ] as const);
+
+          const totalCount = countRows[0] ? Number(countRows[0].c) : 0;
+
+          return json(200, {
+            items: rows.map((r) => ({
+              id: String(r.id),
+              content: String(r.content),
+              roomId: Number(r.roomId),
+              roomTitle: String(r.roomTitle),
+              createdBy: r.createdBy,
+              createdAtMs: Number(r.createdAtMs),
+            })),
+            totalCount,
+            hasMore: offset + rows.length < totalCount,
+          });
         }
 
         // /admin/rooms
