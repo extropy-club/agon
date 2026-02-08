@@ -61,7 +61,7 @@ export const MemorySearch = Tool.make("memory_search", {
     "Search your personal knowledge base for facts and insights from past debates. Use keywords related to what you want to recall.",
   parameters: {
     query: Schema.String,
-    limit: Schema.optional(Schema.Int),
+    limit: Schema.Int.annotations({ description: "Maximum number of results to return" }),
   },
   success: Schema.Array(
     Schema.Struct({
