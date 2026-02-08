@@ -56,6 +56,29 @@ export type Agent = {
   readonly thinkingBudgetTokens: number | null;
 };
 
+// Agent + extra computed fields from some admin endpoints (e.g. memory counts)
+export type AgentWithCount = Agent & {
+  readonly _count: {
+    readonly memories: number;
+  };
+};
+
+export type MemoryItem = {
+  readonly id: string;
+  readonly content: string;
+  readonly roomId: number;
+  readonly createdBy: "agent" | "auto" | (string & {});
+  readonly createdAtMs: number;
+  readonly score?: number;
+};
+
+export type GetMemoriesParams = {
+  readonly q?: string;
+  readonly limit?: number;
+  readonly offset?: number;
+  readonly source?: "auto" | "agent";
+};
+
 export type Room = {
   readonly id: number;
   readonly status: "active" | "paused" | "audience_slot";
@@ -109,9 +132,26 @@ export const agentsApi = {
     const res = (await apiFetch("/agents")) as { agents: readonly Agent[] };
     return res.agents;
   },
-  get: async (id: string): Promise<Agent> => {
-    const res = (await apiFetch(`/agents/${id}`)) as { agent: Agent };
+  get: async (id: string): Promise<AgentWithCount> => {
+    const res = (await apiFetch(`/agents/${encodeURIComponent(id)}`)) as { agent: AgentWithCount };
     return res.agent;
+  },
+  getMemories: async (
+    id: string,
+    params: GetMemoriesParams = {},
+  ): Promise<readonly MemoryItem[]> => {
+    const qs = new URLSearchParams();
+    if (params.q) qs.set("q", params.q);
+    if (params.limit != null) qs.set("limit", String(params.limit));
+    if (params.offset != null) qs.set("offset", String(params.offset));
+    if (params.source) qs.set("source", params.source);
+
+    const query = qs.toString();
+    const res = (await apiFetch(
+      `/agents/${encodeURIComponent(id)}/memories${query.length > 0 ? `?${query}` : ""}`,
+    )) as { memories: readonly MemoryItem[] };
+
+    return res.memories;
   },
   create: async (data: unknown): Promise<Agent> => {
     const res = (await apiFetch("/agents", {
@@ -121,14 +161,14 @@ export const agentsApi = {
     return res.agent;
   },
   update: async (id: string, data: unknown): Promise<Agent> => {
-    const res = (await apiFetch(`/agents/${id}`, {
+    const res = (await apiFetch(`/agents/${encodeURIComponent(id)}`, {
       method: "PUT",
       body: JSON.stringify(data),
     })) as { agent: Agent };
     return res.agent;
   },
   remove: async (id: string): Promise<void> => {
-    await apiFetch(`/agents/${id}`, { method: "DELETE" });
+    await apiFetch(`/agents/${encodeURIComponent(id)}`, { method: "DELETE" });
   },
 };
 

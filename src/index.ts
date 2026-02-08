@@ -12,6 +12,7 @@ import { finalizeRoom } from "./do/FinalizeRoom.js";
 import {
   agents,
   discordChannels,
+  memories,
   messages,
   roomAgents,
   rooms,
@@ -1015,13 +1016,27 @@ export default {
           const agentId = segments[2];
 
           if (request.method === "GET") {
-            const agent = yield* dbTry(() =>
-              db.select().from(agents).where(eq(agents.id, agentId)).get(),
+            const { agent, memoryCountRow } = yield* Effect.all(
+              {
+                agent: dbTry(() => db.select().from(agents).where(eq(agents.id, agentId)).get()),
+                memoryCountRow: dbTry(() =>
+                  db
+                    .select({ c: sql<number>`count(*)` })
+                    .from(memories)
+                    .where(eq(memories.agentId, agentId))
+                    .get(),
+                ),
+              },
+              { concurrency: "unbounded" },
             );
+
             if (!agent) {
               return yield* AdminNotFound.make({ resource: "agent", id: agentId });
             }
-            return json(200, { agent });
+
+            const memoriesCount = memoryCountRow ? Number(memoryCountRow.c) : 0;
+
+            return json(200, { agent: { ...agent, _count: { memories: memoriesCount } } });
           }
 
           if (request.method === "PUT") {

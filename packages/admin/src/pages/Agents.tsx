@@ -1,3 +1,4 @@
+import { A, useNavigate } from "@solidjs/router";
 import { createResource, For, Show, createSignal } from "solid-js";
 import { agentsApi, type Agent } from "../api";
 
@@ -6,6 +7,7 @@ type EditingAgent = Partial<Agent>;
 type Provider = Agent["llmProvider"];
 
 export default function Agents() {
+  const navigate = useNavigate();
   const [agents, { refetch }] = createResource(agentsApi.list);
   const [editingAgent, setEditingAgent] = createSignal<EditingAgent | null>(null);
   const [selectedProvider, setSelectedProvider] = createSignal<Provider>("openai");
@@ -321,11 +323,19 @@ export default function Agents() {
                 {(agent) => (
                   <tr>
                     <td>{agent.id}</td>
-                    <td>{agent.name}</td>
+                    <td>
+                      <A href={`/agents/${encodeURIComponent(agent.id)}`}>{agent.name}</A>
+                    </td>
                     <td>{agent.llmProvider}</td>
                     <td>{agent.llmModel}</td>
                     <td>
                       <div style={{ display: "flex", gap: "0.5rem" }}>
+                        <button
+                          class="btn"
+                          onClick={() => navigate(`/agents/${encodeURIComponent(agent.id)}`)}
+                        >
+                          View
+                        </button>
                         <button class="btn" onClick={() => startEdit(agent)}>
                           Edit
                         </button>

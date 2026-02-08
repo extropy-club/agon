@@ -4,6 +4,7 @@ import { authMe, authLogout } from "./api";
 import Login from "./pages/Login";
 
 const Agents = lazy(() => import("./pages/Agents"));
+const AgentDetail = lazy(() => import("./pages/AgentDetail"));
 const Rooms = lazy(() => import("./pages/Rooms"));
 const RoomDetail = lazy(() => import("./pages/RoomDetail"));
 const RoomComposer = lazy(() => import("./pages/RoomComposer"));
@@ -64,6 +65,7 @@ export default function AppRouter() {
       <Route path="/rooms/new" component={RoomComposer} />
       <Route path="/rooms/:id" component={RoomDetail} />
       <Route path="/agents" component={Agents} />
+      <Route path="/agents/:id" component={AgentDetail} />
       <Route path="/metrics" component={Metrics} />
       <Route path="/settings" component={Settings} />
       <Route path="/guilds" component={Guilds} />
