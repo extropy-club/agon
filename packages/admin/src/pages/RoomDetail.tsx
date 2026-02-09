@@ -170,7 +170,7 @@ function MessageItem(props: { msg: Message; onResize?: () => void }) {
 function VirtualTurnTimeline(props: {
   eventsByTurn: {
     turnNumber: number;
-    events: { createdAtMs: number; phase: string; status: string; dataJson?: string }[];
+    events: { createdAtMs: number; phase: string; status: string; dataJson?: string | null }[];
   }[];
   onRefresh: () => void;
 }) {
