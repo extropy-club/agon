@@ -1,7 +1,7 @@
 import { createMemo, createResource, For, Show, createSignal, onMount } from "solid-js";
 import { useNavigate, useParams } from "@solidjs/router";
 import { createVirtualizer } from "@tanstack/solid-virtual";
-import { SolidMarkdown } from "solid-markdown";
+import { SolidMarkdown, type Components } from "solid-markdown";
 import remarkMath from "remark-math";
 import katex from "katex";
 import "katex/dist/katex.min.css";
@@ -197,10 +197,12 @@ function MessageItem(props: { msg: Message; onResize?: () => void }) {
         <SolidMarkdown
           children={props.msg.content}
           remarkPlugins={[remarkMath]}
-          components={{
-            math: (props) => <Math value={String(props.value)} inline={false} />,
-            inlineMath: (props) => <Math value={String(props.value)} inline={true} />,
-          }}
+          components={
+            {
+              math: (p: { value: string }) => <Math value={p.value} inline={false} />,
+              inlineMath: (p: { value: string }) => <Math value={p.value} inline={true} />,
+            } as Components
+          }
         />
       </div>
     </div>
