@@ -2,7 +2,36 @@ import { createMemo, createResource, For, Show, createSignal, onMount } from "so
 import { useNavigate, useParams } from "@solidjs/router";
 import { createVirtualizer } from "@tanstack/solid-virtual";
 import { SolidMarkdown } from "solid-markdown";
+import remarkMath from "remark-math";
+import katex from "katex";
+import "katex/dist/katex.min.css";
 import { roomsApi, type Message } from "../api";
+
+// ---------------------------------------------------------------------------
+// Math rendering component
+// ---------------------------------------------------------------------------
+
+function Math(props: { value: string; inline?: boolean }) {
+  const [containerRef, setContainerRef] = createSignal<
+    HTMLSpanElement | HTMLDivElement | undefined
+  >();
+
+  onMount(() => {
+    const el = containerRef();
+    if (el) {
+      katex.render(props.value, el, {
+        throwOnError: false,
+        displayMode: !props.inline,
+      });
+    }
+  });
+
+  return props.inline ? (
+    <span ref={setContainerRef} style={{ display: "inline-block" }} />
+  ) : (
+    <div ref={setContainerRef} style={{ overflow: "auto", margin: "0.75rem 0" }} />
+  );
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -165,7 +194,14 @@ function MessageItem(props: { msg: Message; onResize?: () => void }) {
 
       {/* Message content */}
       <div class="markdown-content">
-        <SolidMarkdown children={props.msg.content} />
+        <SolidMarkdown
+          children={props.msg.content}
+          remarkPlugins={[remarkMath]}
+          components={{
+            math: (props) => <Math value={String(props.value)} inline={false} />,
+            inlineMath: (props) => <Math value={String(props.value)} inline={true} />,
+          }}
+        />
       </div>
     </div>
   );
