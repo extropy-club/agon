@@ -164,6 +164,145 @@ function MessageItem(props: { msg: Message; onResize?: () => void }) {
 }
 
 // ---------------------------------------------------------------------------
+// VirtualTurnTimeline component
+// ---------------------------------------------------------------------------
+
+function VirtualTurnTimeline(props: {
+  eventsByTurn: {
+    turnNumber: number;
+    events: { createdAtMs: number; phase: string; status: string; dataJson?: string }[];
+  }[];
+  onRefresh: () => void;
+}) {
+  // eslint-disable-next-line no-unassigned-vars -- assigned via JSX ref
+  let scrollRef!: HTMLDivElement;
+
+  const virtualizer = createVirtualizer({
+    get count() {
+      return props.eventsByTurn.length;
+    },
+    getScrollElement: () => scrollRef,
+    estimateSize: () => 150,
+    overscan: 3,
+  });
+
+  return (
+    <div>
+      <div
+        style={{
+          display: "flex",
+          "justify-content": "space-between",
+          "align-items": "center",
+          "margin-bottom": "0.75rem",
+        }}
+      >
+        <h3 style={{ margin: 0 }}>Turn Timeline</h3>
+        <button class="btn" onClick={() => props.onRefresh()}>
+          Refresh
+        </button>
+      </div>
+
+      <div
+        ref={scrollRef}
+        style={{
+          height: "600px",
+          overflow: "auto",
+          position: "relative",
+          "-webkit-overflow-scrolling": "touch",
+        }}
+      >
+        <div
+          style={{
+            height: `${virtualizer.getTotalSize()}px`,
+            width: "100%",
+            position: "relative",
+          }}
+        >
+          <For each={virtualizer.getVirtualItems()}>
+            {(vItem) => {
+              const turn = () => props.eventsByTurn[vItem.index];
+              return (
+                <div
+                  data-index={vItem.index}
+                  ref={(el) => {
+                    queueMicrotask(() => virtualizer.measureElement(el));
+                  }}
+                  style={{
+                    position: "absolute",
+                    top: 0,
+                    left: 0,
+                    width: "100%",
+                    transform: `translateY(${vItem.start}px)`,
+                  }}
+                >
+                  <Show when={turn()}>
+                    {(t) => (
+                      <div style={{ "margin-bottom": "1.5rem", padding: "0 0.5rem" }}>
+                        <div style={{ "font-weight": 600, "margin-bottom": "0.5rem" }}>
+                          Turn {t().turnNumber}
+                        </div>
+
+                        <div
+                          style={{
+                            display: "flex",
+                            "flex-direction": "column",
+                            gap: "0.35rem",
+                          }}
+                        >
+                          <For each={t().events}>
+                            {(e) => (
+                              <div>
+                                <div
+                                  style={{
+                                    display: "flex",
+                                    gap: "0.5rem",
+                                    "align-items": "center",
+                                    "flex-wrap": "wrap",
+                                  }}
+                                >
+                                  <span
+                                    style={{
+                                      "font-size": "0.75rem",
+                                      color: "var(--text-muted)",
+                                      "min-width": "160px",
+                                    }}
+                                  >
+                                    {new Date(e.createdAtMs).toLocaleString()}
+                                  </span>
+                                  <span style={{ "font-family": "monospace" }}>{e.phase}</span>
+                                  <span class={`badge badge-${e.status}`}>{e.status}</span>
+                                </div>
+                                <Show when={e.dataJson}>
+                                  <div
+                                    style={{
+                                      "margin-left": "1.25rem",
+                                      "margin-top": "0.25rem",
+                                      "font-size": "0.75rem",
+                                      color: "var(--text-muted)",
+                                      "white-space": "pre-wrap",
+                                    }}
+                                  >
+                                    {e.dataJson}
+                                  </div>
+                                </Show>
+                              </div>
+                            )}
+                          </For>
+                        </div>
+                      </div>
+                    )}
+                  </Show>
+                </div>
+              );
+            }}
+          </For>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // VirtualMessageList component
 // ---------------------------------------------------------------------------
 
@@ -394,153 +533,91 @@ export default function RoomDetail() {
             </div>
           </Show>
 
-          <div style={{ display: "grid", "grid-template-columns": "2fr 1fr", gap: "2rem" }}>
-            <div>
-              <section class="card">
-                <h3>Details</h3>
-                <p>
-                  <strong>ID:</strong> {d().room.id}
-                </p>
-                <p>
-                  <strong>Status:</strong>{" "}
-                  <span class={`badge badge-${d().room.status}`}>{d().room.status}</span>
-                </p>
-                <p>
-                  <strong>Parent Channel ID:</strong> {d().room.parentChannelId}
-                </p>
-                <p>
-                  <strong>Thread ID:</strong> {d().room.threadId}
-                </p>
-                <p>
-                  <strong>Current Turn:</strong> {d().room.currentTurnNumber} (Agent:{" "}
-                  {d().room.currentTurnAgentId})
-                </p>
-                <p>
-                  <strong>Last Enqueued Turn:</strong> {d().room.lastEnqueuedTurnNumber}
-                </p>
-              </section>
+          <div style={{ display: "grid", "grid-template-columns": "1fr 1fr", gap: "2rem" }}>
+            {/* LEFT COLUMN - Recent Messages */}
+            <section class="card">
+              <VirtualMessageList messages={d().recentMessages} roomId={d().room.id} />
+            </section>
 
-              <section class="card">
-                <VirtualMessageList messages={d().recentMessages} roomId={d().room.id} />
-              </section>
+            {/* RIGHT COLUMN - Turn Timeline */}
+            <section class="card">
+              <Show when={events()} fallback={<p>Loading events...</p>}>
+                {(evs) => (
+                  <Show when={evs().length > 0} fallback={<p>No turn events yet.</p>}>
+                    <VirtualTurnTimeline eventsByTurn={eventsByTurn()} onRefresh={refetchEvents} />
+                  </Show>
+                )}
+              </Show>
+            </section>
+          </div>
 
-              <section class="card">
-                <div
-                  style={{
-                    display: "flex",
-                    "justify-content": "space-between",
-                    "align-items": "center",
-                    gap: "1rem",
-                  }}
-                >
-                  <h3>Turn Timeline</h3>
-                  <button class="btn" onClick={() => refetchEvents()}>
-                    Refresh
-                  </button>
-                </div>
+          {/* Details and Agents row */}
+          <div
+            style={{
+              display: "grid",
+              "grid-template-columns": "2fr 1fr",
+              gap: "2rem",
+              "margin-top": "2rem",
+            }}
+          >
+            <section class="card">
+              <h3>Details</h3>
+              <p>
+                <strong>ID:</strong> {d().room.id}
+              </p>
+              <p>
+                <strong>Status:</strong>{" "}
+                <span class={`badge badge-${d().room.status}`}>{d().room.status}</span>
+              </p>
+              <p>
+                <strong>Parent Channel ID:</strong> {d().room.parentChannelId}
+              </p>
+              <p>
+                <strong>Thread ID:</strong> {d().room.threadId}
+              </p>
+              <p>
+                <strong>Current Turn:</strong> {d().room.currentTurnNumber} (Agent:{" "}
+                {d().room.currentTurnAgentId})
+              </p>
+              <p>
+                <strong>Last Enqueued Turn:</strong> {d().room.lastEnqueuedTurnNumber}
+              </p>
+            </section>
 
-                <Show when={events()} fallback={<p>Loading events...</p>}>
-                  {(evs) => (
-                    <Show when={evs().length > 0} fallback={<p>No turn events yet.</p>}>
-                      <For each={eventsByTurn()}>
-                        {(t) => (
-                          <div style={{ "margin-bottom": "1.5rem" }}>
-                            <div style={{ "font-weight": 600, "margin-bottom": "0.5rem" }}>
-                              Turn {t.turnNumber}
-                            </div>
-
-                            <div
-                              style={{
-                                display: "flex",
-                                "flex-direction": "column",
-                                gap: "0.35rem",
-                              }}
-                            >
-                              <For each={t.events}>
-                                {(e) => (
-                                  <div>
-                                    <div
-                                      style={{
-                                        display: "flex",
-                                        gap: "0.5rem",
-                                        "align-items": "center",
-                                        "flex-wrap": "wrap",
-                                      }}
-                                    >
-                                      <span
-                                        style={{
-                                          "font-size": "0.75rem",
-                                          color: "var(--text-muted)",
-                                          "min-width": "160px",
-                                        }}
-                                      >
-                                        {new Date(e.createdAtMs).toLocaleString()}
-                                      </span>
-                                      <span style={{ "font-family": "monospace" }}>{e.phase}</span>
-                                      <span class={`badge badge-${e.status}`}>{e.status}</span>
-                                    </div>
-                                    <Show when={e.dataJson}>
-                                      <div
-                                        style={{
-                                          "margin-left": "1.25rem",
-                                          "margin-top": "0.25rem",
-                                          "font-size": "0.75rem",
-                                          color: "var(--text-muted)",
-                                          "white-space": "pre-wrap",
-                                        }}
-                                      >
-                                        {e.dataJson}
-                                      </div>
-                                    </Show>
-                                  </div>
-                                )}
-                              </For>
-                            </div>
-                          </div>
-                        )}
-                      </For>
-                    </Show>
-                  )}
-                </Show>
-              </section>
-            </div>
-
-            <div>
-              <section class="card">
-                <h3>Agents</h3>
-                <For each={d().participants}>
-                  {(p) => (
+            <section class="card">
+              <h3>Agents</h3>
+              <For each={d().participants}>
+                {(p) => (
+                  <div
+                    style={{
+                      display: "flex",
+                      "align-items": "center",
+                      gap: "0.5rem",
+                      "margin-bottom": "0.5rem",
+                    }}
+                  >
                     <div
                       style={{
+                        width: "32px",
+                        height: "32px",
+                        "border-radius": "50%",
+                        "background-color": "#e2e8f0",
                         display: "flex",
                         "align-items": "center",
-                        gap: "0.5rem",
-                        "margin-bottom": "0.5rem",
+                        "justify-content": "center",
+                        "font-size": "0.75rem",
                       }}
                     >
-                      <div
-                        style={{
-                          width: "32px",
-                          height: "32px",
-                          "border-radius": "50%",
-                          "background-color": "#e2e8f0",
-                          display: "flex",
-                          "align-items": "center",
-                          "justify-content": "center",
-                          "font-size": "0.75rem",
-                        }}
-                      >
-                        {p.agent.name[0]}
-                      </div>
-                      <span>{p.agent.name}</span>
-                      <span style={{ "font-size": "0.75rem", color: "var(--text-muted)" }}>
-                        (Order: {p.turnOrder})
-                      </span>
+                      {p.agent.name[0]}
                     </div>
-                  )}
-                </For>
-              </section>
-            </div>
+                    <span>{p.agent.name}</span>
+                    <span style={{ "font-size": "0.75rem", color: "var(--text-muted)" }}>
+                      (Order: {p.turnOrder})
+                    </span>
+                  </div>
+                )}
+              </For>
+            </section>
           </div>
         </div>
       )}

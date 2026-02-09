@@ -37,7 +37,7 @@ export default function AgentDetail() {
   });
 
   const hrefForTab = (t: Tab) => {
-    const id = params.id;
+    const id = params.id ?? "";
     if (t === "memories") return `/agents/${encodeURIComponent(id)}?tab=memories`;
     return `/agents/${encodeURIComponent(id)}`;
   };
