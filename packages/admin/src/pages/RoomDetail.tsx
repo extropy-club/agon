@@ -1,6 +1,7 @@
 import { createMemo, createResource, For, Show, createSignal, onMount } from "solid-js";
 import { useNavigate, useParams } from "@solidjs/router";
 import { createVirtualizer } from "@tanstack/solid-virtual";
+import SolidMarkdown from "solid-markdown";
 import { roomsApi, type Message } from "../api";
 
 // ---------------------------------------------------------------------------
@@ -83,6 +84,11 @@ function MessageItem(props: { msg: Message; onResize?: () => void }) {
     requestAnimationFrame(() => props.onResize?.());
   };
 
+  // Re-measure after markdown renders
+  onMount(() => {
+    requestAnimationFrame(() => props.onResize?.());
+  });
+
   return (
     <div
       style={{
@@ -158,7 +164,45 @@ function MessageItem(props: { msg: Message; onResize?: () => void }) {
       </Show>
 
       {/* Message content */}
-      <div style={{ "white-space": "pre-wrap" }}>{props.msg.content}</div>
+      <div class="markdown-content">
+        <SolidMarkdown
+          children={props.msg.content}
+          rehypePlugins={[]}
+          components={{
+            // Override code blocks for better styling
+            code: (props) => {
+              const isInline = !props.class;
+              return isInline ? (
+                <code
+                  style={{
+                    background: "#f1f5f9",
+                    padding: "0.125rem 0.25rem",
+                    "border-radius": "0.25rem",
+                    "font-size": "0.875em",
+                    "font-family": "monospace",
+                  }}
+                >
+                  {props.children}
+                </code>
+              ) : (
+                <pre
+                  style={{
+                    background: "#1e293b",
+                    color: "#e2e8f0",
+                    padding: "0.75rem",
+                    "border-radius": "0.375rem",
+                    overflow: "auto",
+                    "font-size": "0.875rem",
+                    "line-height": "1.5",
+                  }}
+                >
+                  <code style={{ "font-family": "monospace" }}>{props.children}</code>
+                </pre>
+              );
+            },
+          }}
+        />
+      </div>
     </div>
   );
 }
