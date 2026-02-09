@@ -1,7 +1,7 @@
 import { createMemo, createResource, For, Show, createSignal, onMount } from "solid-js";
 import { useNavigate, useParams } from "@solidjs/router";
 import { createVirtualizer } from "@tanstack/solid-virtual";
-import SolidMarkdown from "solid-markdown";
+import { SolidMarkdown } from "solid-markdown";
 import { roomsApi, type Message } from "../api";
 
 // ---------------------------------------------------------------------------
@@ -170,7 +170,7 @@ function MessageItem(props: { msg: Message; onResize?: () => void }) {
           rehypePlugins={[]}
           components={{
             // Override code blocks for better styling
-            code: (props) => {
+            code: (props: { class?: string; children?: string }) => {
               const isInline = !props.class;
               return isInline ? (
                 <code
