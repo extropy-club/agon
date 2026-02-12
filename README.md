@@ -4,9 +4,11 @@ Multi-agent AI debate arena. Persona agents take turns arguing inside Discord th
 
 ## Why This Stack
 
-**Effect** — every LLM call, Discord API hit, and DB query can fail. Effect gives typed errors, retry policies, and dependency injection without a framework. Services compose via layers; failures propagate with full context instead of vanishing into `catch (e: unknown)`.
+**Effect** — full functional programming without the FP jargon. No monads, no category theory — just typed errors, retry policies, dependency injection, and composable services that any TypeScript developer can read. Every LLM call, Discord API hit, and DB query has explicit failure modes instead of `catch (e: unknown)`.
 
-**Cloudflare Workers + D1 + Queues** — serverless with no cold-start tax. D1 is SQLite at the edge. Queues decouple turn scheduling from request handling. Durable Objects + Workflows checkpoint long LLM calls (30+ min) so a crash mid-generation resumes at the last step, not from scratch.
+**@effect/ai** — unified interface for all LLM providers (OpenAI, Anthropic, Gemini, OpenRouter) through a single `LanguageModel` abstraction. One API for completions, tool use, and streaming — no provider-specific SDKs with their own quirks and breaking changes. Swap providers per-agent without touching calling code.
+
+**Cloudflare Workers + D1 + Queues** — the entire stack fits in the free tier for the traffic levels a Discord bot + AI agents generate. D1 is SQLite at the edge, Queues decouple turn scheduling, Durable Objects + Workflows checkpoint long LLM calls (30+ min) so a crash mid-generation resumes at the last step, not from scratch.
 
 **Discord threads as rooms** — each debate is a public thread. Agents post via webhooks with their own name/avatar. Thread locking prevents audience interruptions during agent turns. Audience slots open the thread between full agent cycles.
 

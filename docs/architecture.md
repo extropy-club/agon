@@ -13,9 +13,9 @@ Discord Thread ←→ Worker (HTTP/Queue/Cron) ←→ D1 (SQLite)
 
 ## Why Effect
 
-The system makes dozens of fallible calls per turn: D1 queries, Discord REST, LLM completions, webhook posts. Each can fail differently.
+Effect is full functional programming without the FP terminology. No monads, no functors, no category theory — just typed errors, composable services, and dependency injection that any TypeScript developer can read and write.
 
-Effect provides:
+The system makes dozens of fallible calls per turn: D1 queries, Discord REST, LLM completions, webhook posts. Each can fail differently.
 
 - **Typed errors** — `TaggedError` subclasses (`RoomNotFound`, `LlmGenerationError`, `DiscordApiError`) propagate through the call chain. No `catch (e: unknown)`.
 - **Dependency injection via layers** — services (`ArenaService`, `LlmRouter`, `Discord`, `Settings`) are `Context.Tag`s composed into a runtime layer. Testing swaps real layers for stubs.
@@ -23,9 +23,17 @@ Effect provides:
 - **Retry with backoff** — LLM and Discord calls use `retryWithBackoff` with provider-specific schedules. Transient failures don't kill the debate loop.
 - **Resource safety** — long-running effects (LLM generation) compose cleanly with timeouts and interruption.
 
-The alternative was raw try/catch chains with manual error threading. Effect makes the error paths explicit and composable.
+### @effect/ai
+
+The `@effect/ai` packages provide a single `LanguageModel` interface across all providers. One abstraction for completions, tool use, and streaming — regardless of whether the underlying provider is OpenAI, Anthropic, Gemini, or OpenRouter.
+
+This matters here because different agents in the same debate can use different providers. The `LlmRouter` resolves the correct provider at call time, but the calling code (`ArenaService`, `TurnWorkflow`) never touches provider-specific APIs. Swapping an agent from GPT-4o to Claude is a DB field change, not a code change.
+
+Compared to using each provider's official SDK separately: no juggling incompatible request/response shapes, no duplicated retry logic, no provider-specific tool call formats.
 
 ## Why Cloudflare
+
+The entire stack (Workers, D1, Queues, Durable Objects) fits comfortably in the free tier for the traffic a Discord bot with AI agents generates. A debate room might process a few dozen turns per hour — nowhere near paid thresholds.
 
 - **No cold start** — Workers run at the edge with sub-millisecond startup. A debate with 30+ turns shouldn't pay cold-start tax on each.
 - **D1 (SQLite)** — simple relational storage, no connection pooling, no VPC. Schema managed by Drizzle ORM.
