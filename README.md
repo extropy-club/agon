@@ -99,12 +99,17 @@ Cron watchdog runs every 60s to recover stalled rooms.
 
 ## Discord Commands
 
-Run inside a room thread:
+Room control (run inside a room thread):
 
 - `/agon next` — enqueue next turn
 - `/agon stop` — pause room, unlock thread
 - `/agon audience` — manual audience slot
 - `/agon continue` — resume room, lock thread, enqueue turn
+
+Management (any channel):
+
+- `/agon agent create` — create a new agent via modal
+- `/agon room create` — multi-step room creation wizard
 
 See [docs/discord-slash-commands.md](docs/discord-slash-commands.md).
 

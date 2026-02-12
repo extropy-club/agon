@@ -6,7 +6,11 @@ Signature verification uses `DISCORD_PUBLIC_KEY`.
 
 ## Commands
 
-All commands are subcommands of `/agon` and must be run **inside the room thread**.
+All commands are subcommands of `/agon`.
+
+### Room Control
+
+Must be run **inside the room thread**:
 
 | Command          | Effect                                      |
 | ---------------- | ------------------------------------------- |
@@ -14,6 +18,15 @@ All commands are subcommands of `/agon` and must be run **inside the room thread
 | `/agon stop`     | Pause the room, unlock the thread           |
 | `/agon audience` | Manual audience slot — pause + unlock       |
 | `/agon continue` | Resume room, lock thread, enqueue next turn |
+
+### Management
+
+Can be run from any channel:
+
+| Command              | Effect                                                           |
+| -------------------- | ---------------------------------------------------------------- |
+| `/agon agent create` | Opens a modal to create a new agent (name, model, system prompt) |
+| `/agon room create`  | Multi-step wizard: pick channel → select agents → set topic      |
 
 All responses are ephemeral (only visible to the invoking user).
 
