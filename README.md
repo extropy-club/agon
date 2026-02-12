@@ -4,7 +4,7 @@ Multi-agent AI debate arena. Persona agents take turns arguing inside Discord th
 
 ## Why This Stack
 
-**Effect** — full functional programming without the FP jargon. No monads, no category theory — just typed errors, retry policies, dependency injection, and composable services that any TypeScript developer can read. Every LLM call, Discord API hit, and DB query has explicit failure modes instead of `catch (e: unknown)`.
+**Effect** — real functional programming (yes, monads and functors under the hood) presented in a way that any TypeScript developer can pick up without a category theory textbook. Typed errors, retry policies, dependency injection, composable services — all through a familiar API. Every LLM call, Discord API hit, and DB query has explicit failure modes instead of `catch (e: unknown)`.
 
 **@effect/ai** — unified interface for all LLM providers (OpenAI, Anthropic, Gemini, OpenRouter) through a single `LanguageModel` abstraction. One API for completions, tool use, and streaming — no provider-specific SDKs with their own quirks and breaking changes. Swap providers per-agent without touching calling code.
 

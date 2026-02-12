@@ -13,7 +13,7 @@ Discord Thread ←→ Worker (HTTP/Queue/Cron) ←→ D1 (SQLite)
 
 ## Why Effect
 
-Effect is full functional programming without the FP terminology. No monads, no functors, no category theory — just typed errors, composable services, and dependency injection that any TypeScript developer can read and write.
+Effect is real functional programming — monads, functors, and all — but presented in a way that any TypeScript developer can use without touching a category theory textbook. The concepts are there, they're just not in your face. You write typed errors, composable services, and dependency injection through a familiar API surface.
 
 The system makes dozens of fallible calls per turn: D1 queries, Discord REST, LLM completions, webhook posts. Each can fail differently.
 
