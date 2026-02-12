@@ -1,34 +1,27 @@
-# Discord Slash Commands (manual room control)
+# Discord Slash Commands
 
-Agon exposes a Discord interactions endpoint at:
+Interactions endpoint: `POST /discord/interactions`
 
-- `POST /discord/interactions`
-
-This endpoint verifies request signatures using `DISCORD_PUBLIC_KEY`.
+Signature verification uses `DISCORD_PUBLIC_KEY`.
 
 ## Commands
 
-All commands must be invoked **inside the room thread** (the Discord thread bound to a room).
+All commands are subcommands of `/agon` and must be run **inside the room thread**.
 
-- `/next` — enqueue the next turn (only when the room is active)
-- `/stop` — pause the room and unlock the thread
-- `/audience` — pause the room and unlock the thread (manual audience slot)
-- `/continue` — set room to active, lock the thread, and enqueue the next turn
+| Command          | Effect                                      |
+| ---------------- | ------------------------------------------- |
+| `/agon next`     | Enqueue the next turn (room must be active) |
+| `/agon stop`     | Pause the room, unlock the thread           |
+| `/agon audience` | Manual audience slot — pause + unlock       |
+| `/agon continue` | Resume room, lock thread, enqueue next turn |
 
-All responses are **ephemeral**.
+All responses are ephemeral (only visible to the invoking user).
 
-## Registering commands
+## Registering Commands
 
-Discord supports registering commands via:
+Uses `PUT /applications/{app_id}/commands` to bulk-overwrite all commands.
 
-- `POST /applications/{app_id}/commands` (create one command)
-- `PUT /applications/{app_id}/commands` (bulk overwrite all commands)
-
-This repo includes a helper script that uses **PUT** to register all Agon commands at once.
-
-### Recommended (dev): register guild commands
-
-Guild commands update instantly.
+### Guild commands (instant, recommended for dev)
 
 ```bash
 DISCORD_GUILD_ID=... \
@@ -37,9 +30,7 @@ DISCORD_BOT_TOKEN=... \
 node scripts/discord/registerCommands.mjs
 ```
 
-### Global commands
-
-Global commands can take a while to propagate.
+### Global commands (up to 1 hour propagation)
 
 ```bash
 DISCORD_APP_ID=... \
@@ -47,7 +38,13 @@ DISCORD_BOT_TOKEN=... \
 node scripts/discord/registerCommands.mjs
 ```
 
-## Notes
+Omitting `DISCORD_GUILD_ID` registers globally.
 
-- `DISCORD_BOT_TOKEN` must have permission to manage threads in the relevant channels for lock/unlock to work.
-- Commands are registered as **chat input commands** (type `1`) with no options.
+## Bot Permissions
+
+The bot token needs:
+
+- `Send Messages` + `Send Messages in Threads`
+- `Manage Threads` (lock/unlock)
+- `Manage Webhooks` (per-channel webhook creation)
+- `Read Message History`
